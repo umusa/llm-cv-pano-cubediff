@@ -439,14 +439,14 @@ def load_sd_components(model_id="runwayml/stable-diffusion-v1-5", use_sync_gn=Tr
     print(f"Loading model components from {model_id}...")
     
     # Load VAE
-    vae = AutoencoderKL.from_pretrained(model_id, subfolder="vae").to(device)
+    vae = AutoencoderKL.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float16).to(device)
     
     # Load text encoder and tokenizer
-    text_encoder = CLIPTextModel.from_pretrained(model_id, subfolder="text_encoder").to(device)
-    tokenizer = CLIPTokenizer.from_pretrained(model_id, subfolder="tokenizer")
+    text_encoder = CLIPTextModel.from_pretrained(model_id, subfolder="text_encoder", torch_dtype=torch.float16).to(device)
+    tokenizer = CLIPTokenizer.from_pretrained(model_id, subfolder="tokenizer", torch_dtype=torch.float16)
     
     # Load UNet
-    unet = UNet2DConditionModel.from_pretrained(model_id, subfolder="unet").to(device)
+    unet = UNet2DConditionModel.from_pretrained(model_id, subfolder="unet", torch_dtype=torch.float16).to(device)
     
     if use_sync_gn:
         print("Converting VAE GroupNorm layers to SynchronizedGroupNorm...")
