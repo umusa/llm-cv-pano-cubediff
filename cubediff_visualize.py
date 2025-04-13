@@ -1,315 +1,312 @@
-"""
-Visualization utilities for CubeDiff panorama generation results.
-This module provides functions to display individual cubemap faces,
-create panoramic views, and visualize 3D cube representations.
-"""
-
-import matplotlib.pyplot as plt
 import numpy as np
-import torch
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+import cv2
 
-# Try to import optional dependencies
-try:
-    import cv2
-    CV2_AVAILABLE = True
-except ImportError:
-    CV2_AVAILABLE = False
-
-try:
-    from mpl_toolkits.mplot3d import Axes3D
-    MPLOT3D_AVAILABLE = True
-except ImportError:
-    MPLOT3D_AVAILABLE = False
-
-
-def display_faces_with_titles(result, prompt):
+def visualize_equirectangular(equirect_img, title="Equirectangular Panorama"):
     """
-    Display individual cubemap faces with descriptive titles.
+    Visualize an equirectangular panorama.
     
     Args:
-        result: Tensor or numpy array of shape [batch_size, 6, channels, height, width]
-               or [6, channels, height, width] containing the 6 cubemap faces.
-        prompt: The text prompt used to generate the images.
-    """
-    # Create a figure for the individual faces
-    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-    
-    # Flatten axes for easier indexing
-    axes = axes.flatten()
-    
-    # Define descriptive titles for each face
-    face_titles = [
-        "Front View - Primary Perspective",
-        "Right View - Sunset Illumination",
-        "Left View - Lake Extension",
-        "Back View - Mountain Range",
-        "Top View - Sky and Clouds",
-        "Bottom View - Ground and Terrain"
-    ]
-    
-    # Get the tensor if not already a numpy array
-    if isinstance(result, torch.Tensor):
-        result_np = result.detach().cpu().numpy()
-    else:
-        result_np = result
-    
-    # Handle different dimensions
-    if result_np.ndim == 5:  # [batch, faces, channels, height, width]
-        result_np = result_np[0]  # Take first batch
-    
-    # Display each face with its detailed title
-    for i in range(6):
-        # Get face from result
-        face = result_np[i]
+        equirect_img: Equirectangular image as numpy array
+        title: Title for the plot
         
-        # Convert from [C, H, W] to [H, W, C] for plotting
-        face = np.transpose(face, (1, 2, 0))
-        
-        # Ensure values are in [0, 1] range for imshow
-        if face.max() > 1.0:
-            face = face / 255.0
-        
-        # Plot with enhanced title
-        axes[i].imshow(face)
-        axes[i].set_title(f"{face_titles[i]}", fontsize=12)
-        axes[i].axis('off')
-    
-    plt.suptitle(f"Generated Cubemap for: '{prompt}'", fontsize=16)
-    plt.tight_layout()
-    plt.subplots_adjust(top=0.9)  # Adjust to make room for suptitle
-    plt.show()
-
-
-def create_and_display_panorama(result, prompt):
-    """
-    Create and display a panoramic view from cubemap faces.
-    
-    Args:
-        result: Tensor or numpy array of shape [batch_size, 6, channels, height, width]
-               or [6, channels, height, width] containing the 6 cubemap faces.
-        prompt: The text prompt used to generate the images.
-    
     Returns:
-        Numpy array of the panorama if successful, None otherwise.
+        fig: Matplotlib figure
     """
-    if not CV2_AVAILABLE:
-        print("OpenCV (cv2) not available. Install with: pip install opencv-python")
-        return None
+    fig, ax = plt.subplots(figsize=(10, 5))
     
-    # Get the numpy array if it's a tensor
-    if isinstance(result, torch.Tensor):
-        result_np = result.detach().cpu().numpy()
+    if len(equirect_img.shape) > 2:
+        ax.imshow(equirect_img)
     else:
-        result_np = result
+        ax.imshow(equirect_img, cmap='gray')
     
-    # Handle different dimensions
-    if result_np.ndim == 5:  # [batch, faces, channels, height, width]
-        result_np = result_np[0]  # Take first batch
+    ax.set_title(title)
+    ax.set_xlabel('Longitude')
+    ax.set_ylabel('Latitude')
+    ax.grid(linestyle='--', alpha=0.3)
     
-    # Extract faces and ensure they are in the right format
-    faces = []
-    for i in range(6):
-        face = result_np[i]
-        
-        # Convert from [C, H, W] to [H, W, C] for processing
-        face = np.transpose(face, (1, 2, 0))
-        
-        # Ensure values are in [0, 1] range
-        if face.max() <= 1.0:
-            face = (face * 255).astype(np.uint8)
-        else:
-            face = face.astype(np.uint8)
-        
-        faces.append(face)
+    # Add longitude/latitude grid lines
+    h, w = equirect_img.shape[:2]
     
-    # Create a simple panorama by stitching horizontally
-    # For a proper panorama, we would need more complex conversion from cubemap to equirectangular
+    # Longitude lines (vertical)
+    for lon in range(0, 361, 45):
+        x = w * lon / 360
+        ax.axvline(x=x, color='white', linestyle='--', alpha=0.3)
+        ax.text(x, h-20, f"{lon-180}°", color='white', ha='center')
+    
+    # Latitude lines (horizontal)
+    for lat in range(0, 181, 30):
+        y = h * lat / 180
+        ax.axhline(y=y, color='white', linestyle='--', alpha=0.3)
+        ax.text(10, y, f"{90-lat}°", color='white', va='center')
+    
+    plt.tight_layout()
+    return fig
+
+def create_cubemap_layout(cube_faces, with_labels=True):
+    """
+    Create a visual layout of the cubemap faces.
+    
+    Args:
+        cube_faces: List of 6 cubemap faces in order [Front, Right, Back, Left, Top, Bottom]
+        with_labels: Whether to add face labels
+        
+    Returns:
+        layout: Combined image showing the cubemap layout
+    """
+    if len(cube_faces) != 6:
+        raise ValueError(f"Expected 6 cube faces, got {len(cube_faces)}")
     
     # Get face dimensions
-    h, w = faces[0].shape[:2]
+    face_h, face_w = cube_faces[0].shape[:2]
     
-    # Order: Front, Right, Back, Left
-    panorama = np.hstack([faces[0], faces[1], faces[3], faces[2]])
+    # Determine number of channels
+    if len(cube_faces[0].shape) > 2:
+        channels = cube_faces[0].shape[2]
+    else:
+        channels = 1
     
-    # Add top and bottom faces to the right side
-    side_panel = np.vstack([faces[4], faces[5]])
+    # Create the layout
+    # +---+---+---+
+    # |   | T |   |
+    # +---+---+---+
+    # | L | F | R |
+    # +---+---+---+
+    # |   | Bo| Ba|
+    # +---+---+---+
     
-    # Resize side panel to match height of the panorama
-    side_panel_resized = cv2.resize(side_panel, (w, panorama.shape[0]))
+    # Create a 3x3 grid
+    if channels == 1:
+        layout = np.zeros((face_h * 3, face_w * 3), dtype=cube_faces[0].dtype)
+    else:
+        layout = np.zeros((face_h * 3, face_w * 3, channels), dtype=cube_faces[0].dtype)
     
-    # Combine main panorama with side panel
-    full_panorama = np.hstack([panorama, side_panel_resized])
+    # Position each face in the grid
+    # Front (center)
+    layout[face_h:face_h*2, face_w:face_w*2] = cube_faces[0]
     
-    # Display the panorama
-    plt.figure(figsize=(20, 5))
-    plt.imshow(full_panorama)
-    plt.title(f"Simplified Panoramic View: '{prompt}'", fontsize=14)
-    plt.axis('off')
-    plt.tight_layout()
-    plt.show()
+    # Right
+    layout[face_h:face_h*2, face_w*2:face_w*3] = cube_faces[1]
     
-    return full_panorama
+    # Back
+    layout[face_h*2:face_h*3, face_w*2:face_w*3] = cube_faces[2]
+    
+    # Left
+    layout[face_h:face_h*2, 0:face_w] = cube_faces[3]
+    
+    # Top
+    layout[0:face_h, face_w:face_w*2] = cube_faces[4]
+    
+    # Bottom
+    layout[face_h*2:face_h*3, face_w:face_w*2] = cube_faces[5]
+    
+    # Add labels if requested
+    if with_labels:
+        # Create a copy for drawing text
+        if channels == 3:
+            layout_with_labels = layout.copy()
+        else:
+            # Convert to color for drawing text
+            layout_with_labels = cv2.cvtColor(layout, cv2.COLOR_GRAY2BGR)
+        
+        # Add labels
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        face_names = ['Front', 'Right', 'Back', 'Left', 'Top', 'Bottom']
+        positions = [
+            (face_w*1.5, face_h*1.5),  # Front
+            (face_w*2.5, face_h*1.5),  # Right
+            (face_w*2.5, face_h*2.5),  # Back
+            (face_w*0.5, face_h*1.5),  # Left
+            (face_w*1.5, face_h*0.5),  # Top
+            (face_w*1.5, face_h*2.5),  # Bottom
+        ]
+        
+        for name, pos in zip(face_names, positions):
+            cv2.putText(layout_with_labels, name, 
+                        (int(pos[0] - 30), int(pos[1])), 
+                        font, 0.7, (255, 255, 255), 2)
+        
+        return layout_with_labels
+    
+    return layout
 
-
-def display_3d_cube(result, prompt):
+def create_enhanced_cube_visualization(cube_faces, scale=1.0):
     """
-    Display a 3D cube representation with face textures.
+    Create an enhanced 3D visualization of a cubemap with proper texture mapping.
     
     Args:
-        result: Tensor or numpy array of shape [batch_size, 6, channels, height, width]
-               or [6, channels, height, width] containing the 6 cubemap faces.
-        prompt: The text prompt used to generate the images.
+        cube_faces: List of 6 cubemap faces in order [Front, Right, Back, Left, Top, Bottom]
+        scale: Scaling factor for the visualization (default: 1.0)
+        
+    Returns:
+        fig: Matplotlib 3D figure
     """
-    if not MPLOT3D_AVAILABLE:
-        print("3D plotting not available. Check that mplot3d is properly installed.")
-        return
+    # Verify we have exactly 6 faces
+    if len(cube_faces) != 6:
+        raise ValueError(f"Expected 6 cube faces, got {len(cube_faces)}")
     
-    # Create a figure for 3D visualization
-    fig = plt.figure(figsize=(10, 10))
+    # Create figure and 3D axes
+    fig = plt.figure(figsize=(6, 6))
     ax = fig.add_subplot(111, projection='3d')
     
-    # Define the vertices of the cube
-    r = 1  # Cube radius
-    vertices = [
-        [-r, -r, -r], [r, -r, -r], [r, r, -r], [-r, r, -r],
-        [-r, -r, r], [r, -r, r], [r, r, r], [-r, r, r]
+    # Define vertices of the cube
+    vertices = np.array([
+        [-1, -1, -1],  # 0: front-bottom-left
+        [1, -1, -1],   # 1: front-bottom-right
+        [1, 1, -1],    # 2: front-top-right
+        [-1, 1, -1],   # 3: front-top-left
+        [-1, -1, 1],   # 4: back-bottom-left
+        [1, -1, 1],    # 5: back-bottom-right
+        [1, 1, 1],     # 6: back-top-right
+        [-1, 1, 1]     # 7: back-top-left
+    ]) * scale
+    
+    # Define the six faces of the cube using vertex indices
+    # Order: Front, Right, Back, Left, Top, Bottom
+    face_indices = [
+        [0, 1, 2, 3],  # Front (negative Z)
+        [1, 5, 6, 2],  # Right (positive X)
+        [5, 4, 7, 6],  # Back (positive Z)
+        [4, 0, 3, 7],  # Left (negative X)
+        [3, 2, 6, 7],  # Top (positive Y)
+        [0, 4, 5, 1]   # Bottom (negative Y)
     ]
     
-    # Define the faces of the cube by indices to vertices
-    faces = [
-        [0, 1, 2, 3],  # Bottom face (negative z)
-        [4, 5, 6, 7],  # Top face (positive z)
-        [0, 1, 5, 4],  # Front face (negative y)
-        [2, 3, 7, 6],  # Back face (positive y)
-        [0, 3, 7, 4],  # Left face (negative x)
-        [1, 2, 6, 5]   # Right face (positive x)
-    ]
+    # Face labels and colors
+    face_labels = ['Front', 'Right', 'Back', 'Left', 'Top', 'Bottom']
+    face_colors = ['red', 'green', 'blue', 'yellow', 'cyan', 'magenta']
     
-    # Plot each face
-    for i, face in enumerate(faces):
+    # Add extra points to ensure at least 3 unique values per axis
+    # This prevents the "x and y arrays must consist of at least 3 unique points" error
+    extra_points = np.array([
+        [-0.8, -0.8, -0.8],
+        [-0.4, -0.4, -0.4],
+        [0.0, 0.0, 0.0],
+        [0.4, 0.4, 0.4],
+        [0.8, 0.8, 0.8],
+        [-0.6, 0.6, 0.0],
+        [0.6, -0.6, 0.0],
+        [0.0, 0.6, -0.6],
+        [0.0, -0.6, 0.6],
+        [0.6, 0.0, 0.6],
+        [0.6, 0.0, -0.6]
+    ]) * scale
+    
+    # Add these points with zero size so they're invisible but contribute to axes ranges
+    ax.scatter(extra_points[:, 0], extra_points[:, 1], extra_points[:, 2], s=0)
+    
+    # Draw each face with its label
+    for i, (face_idx, face_img, label, color) in enumerate(zip(face_indices, cube_faces, face_labels, face_colors)):
         # Extract vertices for this face
-        x = [vertices[j][0] for j in face]
-        y = [vertices[j][1] for j in face]
-        z = [vertices[j][2] for j in face]
+        verts = [vertices[idx] for idx in face_idx]
         
-        # Create a polygon for this face
-        ax.plot_trisurf(x, y, z, color='white', alpha=0.8)
+        # Create a polygon
+        poly = Poly3DCollection([verts], alpha=0.9)
         
-        # Calculate center of this face for labeling
-        center_x = sum(x) / 4
-        center_y = sum(y) / 4
-        center_z = sum(z) / 4
+        # Set face color
+        poly.set_facecolor(color)
+        poly.set_edgecolor('black')
         
-        # Add a label
-        ax.text(center_x*1.2, center_y*1.2, center_z*1.2, f"Face {i+1}", ha='center')
+        # Add to axes
+        ax.add_collection3d(poly)
+        
+        # Add face label at the center of the face
+        face_center = np.mean(verts, axis=0)
+        ax.text(face_center[0], face_center[1], face_center[2], label, 
+                horizontalalignment='center', verticalalignment='center', 
+                fontsize=12, color='white', fontweight='bold')
     
-    # Set plot parameters
+    # Set equal aspect ratio
+    ax.set_box_aspect([1, 1, 1])
+    
+    # Set labels
     ax.set_xlabel('X')
     ax.set_ylabel('Y')
     ax.set_zlabel('Z')
-    ax.set_title(f"3D Cubemap Representation: '{prompt}'", fontsize=14)
     
-    # Set viewing angle
-    ax.view_init(elev=30, azim=30)
+    # Set title and limits
+    ax.set_title('3D Cubemap Visualization', fontsize=16)
     
-    plt.tight_layout()
-    plt.show()
+    # Set limits to ensure the entire cube is visible
+    limit = scale * 1.2
+    ax.set_xlim(-limit, limit)
+    ax.set_ylim(-limit, limit)
+    ax.set_zlim(-limit, limit)
+    
+    return fig
 
-
-def equirectangular_from_cubemap(result, target_width=1024):
+def compare_cubemaps(cubemap1, cubemap2, titles=None):
     """
-    Convert cubemap faces to equirectangular panorama (more advanced method).
+    Compare two sets of cubemap faces side by side.
     
     Args:
-        result: Tensor or numpy array of shape [batch_size, 6, channels, height, width]
-               or [6, channels, height, width] containing the 6 cubemap faces.
-        target_width: Width of the output equirectangular panorama.
+        cubemap1: First set of 6 cubemap faces
+        cubemap2: Second set of 6 cubemap faces
+        titles: Optional pair of titles for the two cubemaps
         
     Returns:
-        Numpy array of the equirectangular panorama if successful, None otherwise.
+        fig: Matplotlib figure
     """
-    if not CV2_AVAILABLE:
-        print("OpenCV (cv2) not available. Install with: pip install opencv-python")
-        return None
+    if titles is None:
+        titles = ['Cubemap 1', 'Cubemap 2']
     
-    # Get the numpy array if it's a tensor
-    if isinstance(result, torch.Tensor):
-        result_np = result.detach().cpu().numpy()
-    else:
-        result_np = result
+    face_names = ['Front', 'Right', 'Back', 'Left', 'Top', 'Bottom']
+    fig, axes = plt.subplots(6, 2, figsize=(12, 18))
     
-    # Handle different dimensions
-    if result_np.ndim == 5:  # [batch, faces, channels, height, width]
-        result_np = result_np[0]  # Take first batch
-    
-    # Extract faces and ensure they are in the right format
-    faces = []
     for i in range(6):
-        face = result_np[i]
-        
-        # Convert from [C, H, W] to [H, W, C] for processing
-        face = np.transpose(face, (1, 2, 0))
-        
-        # Ensure values are in [0, 1] range
-        if face.max() <= 1.0:
-            face = (face * 255).astype(np.uint8)
+        # First cubemap
+        if len(cubemap1[i].shape) > 2:
+            axes[i, 0].imshow(cubemap1[i])
         else:
-            face = face.astype(np.uint8)
+            axes[i, 0].imshow(cubemap1[i], cmap='gray')
+        axes[i, 0].set_title(f"{face_names[i]} - {titles[0]}")
+        axes[i, 0].axis('off')
         
-        faces.append(face)
+        # Second cubemap
+        if len(cubemap2[i].shape) > 2:
+            axes[i, 1].imshow(cubemap2[i])
+        else:
+            axes[i, 1].imshow(cubemap2[i], cmap='gray')
+        axes[i, 1].set_title(f"{face_names[i]} - {titles[1]}")
+        axes[i, 1].axis('off')
     
-    # Create equirectangular panorama
-    # This is a simplified placeholder implementation
-    # For a proper implementation, you would:
-    # 1. Create an equirectangular grid of sample points
-    # 2. For each point, compute the 3D ray from the center of the view
-    # 3. Determine which face of the cube this ray intersects
-    # 4. Sample the corresponding pixel from that face
-    
-    # For now, we'll use the simpler stitching approach as a placeholder
-    return create_and_display_panorama(result, "Advanced Equirectangular Panorama")
+    plt.tight_layout()
+    return fig
 
-
-def visualize_all(result, prompt):
+def compare_equirectangular(equirect1, equirect2, titles=None):
     """
-    Run all visualization methods on the result.
+    Compare two equirectangular images side by side.
     
     Args:
-        result: Tensor or numpy array of shape [batch_size, 6, channels, height, width]
-               or [6, channels, height, width] containing the 6 cubemap faces.
-        prompt: The text prompt used to generate the images.
+        equirect1: First equirectangular image
+        equirect2: Second equirectangular image
+        titles: Optional pair of titles for the two images
+        
+    Returns:
+        fig: Matplotlib figure
     """
-    print(f"Visualizing results for prompt: '{prompt}'")
+    if titles is None:
+        titles = ['Equirectangular 1', 'Equirectangular 2']
     
-    # Display individual faces with titles
-    display_faces_with_titles(result, prompt)
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
     
-    # Attempt to create panorama
-    try:
-        if CV2_AVAILABLE:
-            create_and_display_panorama(result, prompt)
-        else:
-            print("OpenCV (cv2) not available. Install with: pip install opencv-python")
-    except Exception as e:
-        print(f"Could not create panorama visualization: {e}")
+    # First equirectangular
+    if len(equirect1.shape) > 2:
+        axes[0].imshow(equirect1)
+    else:
+        axes[0].imshow(equirect1, cmap='gray')
+    axes[0].set_title(titles[0])
+    axes[0].axis('off')
     
-    # Attempt to create 3D cube visualization
-    try:
-        if MPLOT3D_AVAILABLE:
-            display_3d_cube(result, prompt)
-        else:
-            print("3D plotting not available. Check that mplot3d is properly installed.")
-    except Exception as e:
-        print(f"Could not create 3D cube visualization: {e}")
+    # Second equirectangular
+    if len(equirect2.shape) > 2:
+        axes[1].imshow(equirect2)
+    else:
+        axes[1].imshow(equirect2, cmap='gray')
+    axes[1].set_title(titles[1])
+    axes[1].axis('off')
     
-    print("Visualization complete.")
-
-
-# Export main functions
-__all__ = [
-    'display_faces_with_titles',
-    'create_and_display_panorama',
-    'display_3d_cube',
-    'equirectangular_from_cubemap',
-    'visualize_all'
-]
+    plt.tight_layout()
+    return fig
