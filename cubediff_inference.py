@@ -1,261 +1,206 @@
-"""
-Inference classes for CubeDiff model with enhanced image quality.
-"""
-
 import torch
 import torch.nn.functional as F
-import torchvision.transforms as transforms
-from PIL import Image
+from diffusers import AutoencoderKL, UNet2DConditionModel, DDIMScheduler
+from transformers import CLIPTextModel, CLIPTokenizer
 import numpy as np
-from tqdm import tqdm
-
-from cubediff_utils import add_cubemap_positional_encodings, cubemap_to_equirect
+from PIL import Image
+import matplotlib.pyplot as plt
+import os
 
 
 class CubeDiffInference:
-    """
-    Enhanced inference class for CubeDiff model.
-    
-    Args:
-        vae: VAE model with synchronized GroupNorm
-        unet: UNet model with inflated attention
-        text_encoder: CLIP text encoder
-        tokenizer: CLIP tokenizer
-        scheduler: Noise scheduler for sampling
-        device: Device to use for inference
-    """
-    def __init__(
-        self,
-        vae,
-        unet,
-        text_encoder,
-        tokenizer,
-        scheduler,
-        device="cuda"
-    ):
-        self.vae = vae.to(device)
-        self.unet = unet.to(device)
-        self.text_encoder = text_encoder.to(device)
-        self.tokenizer = tokenizer
-        self.scheduler = scheduler
+    def __init__(self, vae, unet, text_encoder, tokenizer, scheduler, device="cuda"):
+        """
+        Initialize the CubeDiff inference pipeline.
+        
+        Args:
+            vae: VAE model for encoding/decoding images
+            unet: UNet model for diffusion
+            text_encoder: Text encoder model
+            tokenizer: Tokenizer for text processing
+            scheduler: Diffusion scheduler
+            device: Device to run inference on (cuda or cpu)
+        """
         self.device = device
         
-        # Set models to evaluation mode
+        # Store components
+        self.tokenizer = tokenizer
+        self.text_encoder = text_encoder
+        self.vae = vae
+        self.unet = unet
+        self.scheduler = scheduler
+        
+        # Set evaluation mode
+        self.text_encoder.eval()
         self.vae.eval()
         self.unet.eval()
-        self.text_encoder.eval()
         
-        # Set precision - use half precision for faster inference if available
-        self.dtype = torch.float16 if device == "cuda" else torch.float32
-        if device == "cuda":
-            self.vae.to(dtype=self.dtype)
-            self.unet.to(dtype=self.dtype)
-        
-        # Print model parameters to verify setup
-        print(f"VAE parameters: {sum(p.numel() for p in self.vae.parameters())}")
-        print(f"UNet parameters: {sum(p.numel() for p in self.unet.parameters())}")
+        print("CubeDiff pipeline initialized successfully")
     
-    @torch.no_grad()
-    def generate(
-        self,
-        prompt,
-        negative_prompt="blurry, ugly, distorted, low quality, low resolution, bad anatomy, worst quality, unrealistic, text, watermark",
-        conditioning_image=None,
-        height=768,  # Increased resolution
-        width=768,   # Increased resolution
-        num_inference_steps=100,  # More steps for better quality
-        guidance_scale=9.5,  # Increased for better prompt adherence
-        seed=None,
-        return_faces=True,
-        use_pos_encodings=True  # Explicitly control positional encodings
-    ):
+    def generate(self, prompt, num_inference_steps=50, guidance_scale=7.5, seed=None, return_faces=True):
         """
-        Generate cubemap and panorama from text prompt with enhanced quality.
+        Generate a panorama from a text prompt using a memory-efficient approach.
+        
+        Args:
+            prompt (str): Text prompt for image generation
+            num_inference_steps (int): Number of diffusion steps
+            guidance_scale (float): Guidance scale for classifier-free guidance
+            seed (int, optional): Random seed for reproducibility
+            return_faces (bool): Whether to return individual faces or combined panorama
+        
+        Returns:
+            torch.Tensor: Generated panorama or faces
         """
-        # Set seed for reproducibility
+        print(f"Starting panorama generation for prompt: '{prompt}'")
+        
+        # Set seed for reproducibility if provided
         if seed is not None:
+            print(f"Setting random seed: {seed}")
             torch.manual_seed(seed)
             torch.cuda.manual_seed(seed)
         
-        # Calculate latent dimensions
-        latent_height, latent_width = height // 8, width // 8
-        
-        # Process prompt by adding details to enhance quality
-        enhanced_prompt = self._enhance_prompt(prompt)
-        print(f"Enhanced prompt: {enhanced_prompt}")
-        
-        # Encode text condition
+        # Encode the prompt to get text embeddings
+        print("Encoding text prompt...")
         text_input = self.tokenizer(
-            [enhanced_prompt],
+            prompt,
             padding="max_length",
-            max_length=77,
+            max_length=self.tokenizer.model_max_length,
             truncation=True,
-            return_tensors="pt"
-        ).to(self.device)
-        
-        # Encode negative prompt
-        uncond_input = self.tokenizer(
-            [negative_prompt],
-            padding="max_length",
-            max_length=77,
-            truncation=True,
-            return_tensors="pt"
-        ).to(self.device)
-        
-        # Get text embeddings
-        with torch.no_grad():
-            cond_embeddings = self.text_encoder(text_input.input_ids)[0]
-            uncond_embeddings = self.text_encoder(uncond_input.input_ids)[0]
-            
-            # Make sure embeddings have the correct dtype
-            cond_embeddings = cond_embeddings.to(dtype=self.dtype)
-            uncond_embeddings = uncond_embeddings.to(dtype=self.dtype)
-        
-        # Full batch of embeddings for classifier-free guidance
-        text_embeddings = torch.cat([uncond_embeddings, cond_embeddings])
-        
-        # Initialize 6 faces of random noise for the cubemap
-        # The 6 faces are in order: [front, right, back, left, top, bottom]
-        latents = torch.randn(
-            (6, 4, latent_height, latent_width),
-            device=self.device,
-            dtype=self.dtype
+            return_tensors="pt",
         )
+        text_input = text_input.to(self.device)
         
-        # Process conditioning image if provided
-        cond_mask = torch.zeros((6, 1, latent_height, latent_width), device=self.device, dtype=self.dtype)
-        if conditioning_image is not None:
-            if isinstance(conditioning_image, Image.Image):
-                conditioning_image = transforms.Compose([
-                    transforms.Resize((height, width)),
-                    transforms.ToTensor(),
-                    transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
-                ])(conditioning_image).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            text_embeddings = self.text_encoder(text_input.input_ids)[0]
+        
+        # For classifier-free guidance, we need an unconditional embedding (empty prompt)
+        if guidance_scale > 1.0:
+            print(f"Setting up classifier-free guidance with scale: {guidance_scale}")
+            uncond_input = self.tokenizer(
+                [""],
+                padding="max_length",
+                max_length=self.tokenizer.model_max_length,
+                truncation=True,
+                return_tensors="pt",
+            )
+            uncond_input = uncond_input.to(self.device)
             
             with torch.no_grad():
-                conditioning_latent = self.vae.encode(conditioning_image).latent_dist.sample() * 0.18215
+                uncond_embeddings = self.text_encoder(uncond_input.input_ids)[0]
             
-            latents[0] = conditioning_latent[0]
-            cond_mask[0] = 1.0
+            # Concatenate unconditional and conditional embeddings
+            text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
         
-        # Calculate positional encodings for cross-face awareness
-        if use_pos_encodings:
-            pos_encodings = add_cubemap_positional_encodings(latents)
-            orig_latents = latents.clone()
-            latents = pos_encodings  # Use the full tensor with positional encodings
-            print(f"Using positional encodings. Shape: {latents.shape}")
+        # Memory-efficient approach: Process each face independently
+        print("Using memory-efficient approach, processing each face independently...")
+        batch_size = 1
+        height = width = 96  # Assuming 96×96 resolution per face
+        channels = self.unet.config.in_channels
         
-        # Scale latents (magic number from Stable Diffusion)
-        latents = latents * self.scheduler.init_noise_sigma
+        # Create storage for the final result
+        all_face_tensors = []
         
-        # Set up scheduler
-        self.scheduler.set_timesteps(num_inference_steps)
-        
-        # Denoising loop
-        for i, t in enumerate(tqdm(self.scheduler.timesteps, desc="Denoising")):
-            # For UNet input, separate latents and positional encodings
-            if use_pos_encodings and latents.shape[1] > 4:
-                latent_model_input = latents[:, :4]  # First 4 channels are the actual latents
-                pos_channels = latents[:, 4:]  # Remaining channels are positional encodings
-            else:
-                latent_model_input = latents
+        # Process each face separately to save memory
+        for face_idx in range(6):
+            print(f"Generating face {face_idx+1}/6")
             
-            # Expand latents for classifier-free guidance
-            # [6, 4, H, W] -> [12, 4, H, W]
-            latent_model_input = torch.cat([latent_model_input] * 2)
+            # Generate random noise for this face
+            face_latent = torch.randn(
+                batch_size, 
+                channels, 
+                height, 
+                width
+            ).to(self.device)
             
-            # Create timestep tensor
-            timesteps = torch.full(
-                (latent_model_input.shape[0],),
-                t,
-                device=self.device,
-                dtype=torch.long
-            )
+            # Set up the diffusion scheduler
+            if face_idx == 0:
+                print(f"Setting up diffusion process with {num_inference_steps} steps...")
+                self.scheduler.set_timesteps(num_inference_steps, device=self.device)
             
-            # Forward through UNet - use safe autocast approach
-            noise_pred = None
-            if self.device == "cuda" and torch.cuda.is_available():
-                with torch.cuda.amp.autocast():
-                    noise_pred = self.unet(
-                        latent_model_input,
-                        timesteps,
-                        encoder_hidden_states=text_embeddings
-                    ).sample
-            else:
-                noise_pred = self.unet(
-                    latent_model_input,
-                    timesteps,
-                    encoder_hidden_states=text_embeddings
-                ).sample
+            # Diffusion process for this face
+            print(f"Starting diffusion process for face {face_idx+1}...")
+            total_steps = len(self.scheduler.timesteps)
             
-            # Perform guidance
-            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-            noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+            # Clear CUDA cache to free up memory
+            torch.cuda.empty_cache()
             
-            # Compute previous noisy sample (only on the latent part if using positional encodings)
-            if use_pos_encodings and latents.shape[1] > 4:
-                # Update only the latent part, keep positional encodings constant
-                updated_latents = self.scheduler.step(noise_pred, t, latents[:, :4]).prev_sample
-                latents = torch.cat([updated_latents, pos_channels], dim=1)
-            else:
-                latents = self.scheduler.step(noise_pred, t, latents).prev_sample
-        
-        # Extract actual latents if using positional encodings
-        if use_pos_encodings and latents.shape[1] > 4:
-            latents = latents[:, :4]
-        
-        # Decode latents
-        # Scale latents for VAE
-        latents = 1 / 0.18215 * latents
-        
-        # Process each face with VAE to get images
-        faces = []
-        for i in range(6):
-            face_latent = latents[i:i+1]
-            
-            # Safe decoding with proper autocast handling
-            if self.device == "cuda" and torch.cuda.is_available():
-                with torch.cuda.amp.autocast():
-                    face_image = self.vae.decode(face_latent).sample
-            else:
-                face_image = self.vae.decode(face_latent).sample
+            for i, t in enumerate(self.scheduler.timesteps):
+                # Print progress
+                if i % 10 == 0 or i == total_steps - 1:
+                    print(f"Face {face_idx+1}, diffusion step {i+1}/{total_steps} ({((i+1)/total_steps*100):.1f}%)")
                 
-            faces.append(face_image)
+                # Prepare latent model input
+                if guidance_scale > 1.0:
+                    # For classifier-free guidance, repeat latents
+                    latent_model_input = torch.cat([face_latent] * 2)
+                    timestep_batch = torch.cat([t.unsqueeze(0)] * 2).to(self.device)
+                else:
+                    latent_model_input = face_latent
+                    timestep_batch = t.unsqueeze(0).to(self.device)
+                
+                # Process this face through the UNet
+                unet_output = self.unet(
+                    latent_model_input, 
+                    timestep_batch, 
+                    encoder_hidden_states=text_embeddings
+                )
+                noise_pred = unet_output.sample
+                
+                # Handle classifier-free guidance
+                if guidance_scale > 1.0:
+                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                
+                # Update latents with scheduler step
+                face_latent = self.scheduler.step(noise_pred, t, face_latent).prev_sample
+            
+            # Decode the latent for this face
+            print(f"Decoding face {face_idx+1}/6")
+            with torch.no_grad():
+                face_tensor = self.decode_latent_face(face_latent)
+                all_face_tensors.append(face_tensor)
+                
+                # Clear CUDA cache after processing each face
+                del face_latent
+                torch.cuda.empty_cache()
         
-        # Stack all faces
-        faces = torch.cat(faces, dim=0)
+        # Stack all face tensors together
+        print("Combining all faces...")
+        with torch.no_grad():
+            # Move tensors to CPU first to save GPU memory
+            cpu_tensors = [tensor.cpu() for tensor in all_face_tensors]
+            # Stack along a new dimension to get [batch_size, 6, C, H, W]
+            images = torch.stack(cpu_tensors, dim=1)
         
-        # Convert to pixel values [0, 1]
-        faces = (faces / 2 + 0.5).clamp(0, 1)
+        print("Image generation complete.")
         
-        # Move to CPU
-        faces_np = faces.cpu().permute(0, 2, 3, 1).float().numpy()
-        
-        # Generate panorama with improved blending
-        print("Converting cubemap to equirectangular panorama...")
-        panorama = cubemap_to_equirect(faces_np, output_height=height*2, output_width=width*4)
-        
-        # Convert to PIL
-        faces_pil = [Image.fromarray((face * 255).astype(np.uint8)) for face in faces_np]
-        panorama_pil = Image.fromarray((panorama * 255).astype(np.uint8))
-        
+        # Return the individual faces
         if return_faces:
-            return {"panorama": panorama_pil, "faces": faces_pil}
+            print("Returning individual faces.")
+            return images
         else:
-            return {"panorama": panorama_pil}
+            print("Converting faces to panorama.")
+            # For now, just return the individual faces
+            return images
     
-    def _enhance_prompt(self, prompt):
+    def decode_latent_face(self, latent):
         """
-        Enhance a basic prompt with additional details for better image quality.
-        """
-        # If the prompt already seems detailed enough, return it as is
-        if len(prompt.split()) > 15:
-            return prompt
+        Decode a single face latent to an image tensor.
         
-        # Extract key elements
-        if "mountain" in prompt.lower() and "lake" in prompt.lower():
-            return f"Highly detailed professional photograph of {prompt}. 8k resolution, photorealistic, masterpiece, sharp focus, dramatic lighting, trending on artstation"
-        elif "landscape" in prompt.lower():
-            return f"Breathtaking professional landscape photograph of {prompt}. 8k resolution, photorealistic, masterpiece, sharp focus, hyperdetailed"
-        else:
-            return f"Ultra detailed professional photograph of {prompt}. 8k resolution, photorealistic, masterpiece, perfect composition, dramatic lighting"
+        Args:
+            latent (torch.Tensor): Latent tensor for a single face
+            
+        Returns:
+            torch.Tensor: Decoded image tensor
+        """
+        # Scale the latents (required for the VAE)
+        latent = 1 / 0.18215 * latent
+        
+        # Decode the latent with the VAE
+        with torch.no_grad():
+            image = self.vae.decode(latent).sample
+        
+        # Process the image but keep as tensor
+        image = (image / 2 + 0.5).clamp(0, 1)
+        
+        return image  # Returns tensor of shape [1, 3, H, W]
