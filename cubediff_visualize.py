@@ -6,131 +6,138 @@ import cv2
 
 def visualize_equirectangular(equirect_img, title="Equirectangular Panorama"):
     """
-    Visualize an equirectangular panorama.
+    Visualize an equirectangular panorama image.
     
     Args:
-        equirect_img: Equirectangular image as numpy array
+        equirect_img: Equirectangular panorama image
         title: Title for the plot
-        
-    Returns:
-        fig: Matplotlib figure
     """
-    fig, ax = plt.subplots(figsize=(10, 5))
+    plt.figure(figsize=(10, 5))
+    plt.imshow(equirect_img)
+    plt.title(title)
+    plt.axis('off')
+    plt.tight_layout()
+    plt.show()
+
+
+def visualize_cubemap_faces(cube_faces, titles=None):
+    """
+    Visualize the 6 faces of a cubemap.
     
-    if len(equirect_img.shape) > 2:
-        ax.imshow(equirect_img)
+    Args:
+        cube_faces: Dictionary or array of 6 cubemap faces
+        titles: Optional list of custom titles for each face
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    
+    # Default face names/titles
+    if titles is None:
+        titles = ['Front', 'Right', 'Back', 'Left', 'Top', 'Bottom']
+    
+    # Extract faces based on input type
+    if isinstance(cube_faces, dict):
+        # For dictionary input, extract the faces in the correct order
+        face_names = ['front', 'right', 'back', 'left', 'top', 'bottom']
+        faces = [cube_faces[name] for name in face_names]
     else:
-        ax.imshow(equirect_img, cmap='gray')
+        # For array/list input, assume they're already in the correct order
+        faces = cube_faces
     
-    ax.set_title(title)
-    ax.set_xlabel('Longitude')
-    ax.set_ylabel('Latitude')
-    ax.grid(linestyle='--', alpha=0.3)
+    # Create the figure and axes
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    axes = axes.flatten()
     
-    # Add longitude/latitude grid lines
-    h, w = equirect_img.shape[:2]
-    
-    # Longitude lines (vertical)
-    for lon in range(0, 361, 45):
-        x = w * lon / 360
-        ax.axvline(x=x, color='white', linestyle='--', alpha=0.3)
-        ax.text(x, h-20, f"{lon-180}°", color='white', ha='center')
-    
-    # Latitude lines (horizontal)
-    for lat in range(0, 181, 30):
-        y = h * lat / 180
-        ax.axhline(y=y, color='white', linestyle='--', alpha=0.3)
-        ax.text(10, y, f"{90-lat}°", color='white', va='center')
+    # Plot each face with its title
+    for i, (face, title) in enumerate(zip(faces, titles)):
+        axes[i].imshow(face)
+        axes[i].set_title(title)
+        axes[i].axis('off')
     
     plt.tight_layout()
-    return fig
+    plt.show()
 
-def create_cubemap_layout(cube_faces, with_labels=True):
+
+def visualize_cubemap_layout(cube_faces):
     """
-    Create a visual layout of the cubemap faces.
+    Visualize cubemap faces in the correct layout.
     
     Args:
-        cube_faces: List of 6 cubemap faces in order [Front, Right, Back, Left, Top, Bottom]
-        with_labels: Whether to add face labels
-        
-    Returns:
-        layout: Combined image showing the cubemap layout
+        cube_faces: Dictionary or array of 6 cubemap faces
     """
-    if len(cube_faces) != 6:
-        raise ValueError(f"Expected 6 cube faces, got {len(cube_faces)}")
+    from cubediff_utils import create_cubemap_layout
     
-    # Get face dimensions
-    face_h, face_w = cube_faces[0].shape[:2]
+    layout = create_cubemap_layout(cube_faces)
     
-    # Determine number of channels
-    if len(cube_faces[0].shape) > 2:
-        channels = cube_faces[0].shape[2]
-    else:
-        channels = 1
+    plt.figure(figsize=(10, 5))
+    plt.imshow(layout)
+    plt.title("Cubemap Layout")
+    plt.axis('off')
+    plt.tight_layout()
+    plt.show()
+
+
+# Fix for the IndexError in the visualization code
+# Use this version instead of the problematic code:
+
+# Original problematic code:
+# pos_enc = latents_with_pos[0:6, channels:, :, :].cpu()
+
+# Safe version:
+def visualize_positional_encodings(latents_with_pos):
+    """Safe version that handles different tensor shapes"""
+    import matplotlib.pyplot as plt
     
-    # Create the layout
-    # +---+---+---+
-    # |   | T |   |
-    # +---+---+---+
-    # | L | F | R |
-    # +---+---+---+
-    # |   | Bo| Ba|
-    # +---+---+---+
+    # Print the shape to debug
+    print(f"Shape of latents_with_pos: {latents_with_pos.shape}")
     
-    # Create a 3x3 grid
-    if channels == 1:
-        layout = np.zeros((face_h * 3, face_w * 3), dtype=cube_faces[0].dtype)
-    else:
-        layout = np.zeros((face_h * 3, face_w * 3, channels), dtype=cube_faces[0].dtype)
+    # Check if tensor has the required dimensions
+    if len(latents_with_pos.shape) < 4:
+        print("Error: Tensor must have 4 dimensions [batch, channels, height, width]")
+        return
     
-    # Position each face in the grid
-    # Front (center)
-    layout[face_h:face_h*2, face_w:face_w*2] = cube_faces[0]
+    # Check if the channels dimension exists
+    if latents_with_pos.shape[1] == 0:
+        print("Warning: Channels dimension is empty")
+        return
     
-    # Right
-    layout[face_h:face_h*2, face_w*2:face_w*3] = cube_faces[1]
+    # Extract the positional encodings safely
+    try:
+        pos_enc = latents_with_pos[0:6].cpu() if hasattr(latents_with_pos, 'cpu') else latents_with_pos[0:6]
+    except IndexError:
+        print("Error: Cannot extract 6 faces from tensor")
+        return
     
-    # Back
-    layout[face_h*2:face_h*3, face_w*2:face_w*3] = cube_faces[2]
+    plt.figure(figsize=(15, 10))
     
-    # Left
-    layout[face_h:face_h*2, 0:face_w] = cube_faces[3]
+    face_names = ['Front', 'Right', 'Back', 'Left', 'Top', 'Bottom']
+    num_faces = min(6, pos_enc.shape[0])
+    num_channels = min(2, pos_enc.shape[1])
     
-    # Top
-    layout[0:face_h, face_w:face_w*2] = cube_faces[4]
+    if num_channels == 0:
+        print("Error: No channels available")
+        return
     
-    # Bottom
-    layout[face_h*2:face_h*3, face_w:face_w*2] = cube_faces[5]
+    for i in range(num_faces):
+        for c in range(num_channels):
+            plt.subplot(num_channels, num_faces, c * num_faces + i + 1)
+            
+            # Convert to numpy safely
+            try:
+                if hasattr(pos_enc[i, c], 'numpy'):
+                    img = pos_enc[i, c].numpy()
+                else:
+                    img = pos_enc[i, c]
+                
+                plt.imshow(img, cmap='viridis')
+                plt.title(f"{face_names[i]} ({['U', 'V'][c]})")
+                plt.axis('off')
+            except Exception as e:
+                print(f"Error plotting face {i}, channel {c}: {e}")
     
-    # Add labels if requested
-    if with_labels:
-        # Create a copy for drawing text
-        if channels == 3:
-            layout_with_labels = layout.copy()
-        else:
-            # Convert to color for drawing text
-            layout_with_labels = cv2.cvtColor(layout, cv2.COLOR_GRAY2BGR)
-        
-        # Add labels
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        face_names = ['Front', 'Right', 'Back', 'Left', 'Top', 'Bottom']
-        positions = [
-            (face_w*1.5, face_h*1.5),  # Front
-            (face_w*2.5, face_h*1.5),  # Right
-            (face_w*2.5, face_h*2.5),  # Back
-            (face_w*0.5, face_h*1.5),  # Left
-            (face_w*1.5, face_h*0.5),  # Top
-            (face_w*1.5, face_h*2.5),  # Bottom
-        ]
-        
-        for name, pos in zip(face_names, positions):
-            cv2.putText(layout_with_labels, name, 
-                        (int(pos[0] - 30), int(pos[1])), 
-                        font, 0.7, (255, 255, 255), 2)
-        
-        return layout_with_labels
-    
-    return layout
+    plt.tight_layout()
+    plt.show()
+
 
 def create_enhanced_cube_visualization(cube_faces, scale=1.0):
     """

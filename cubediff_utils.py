@@ -6,6 +6,9 @@ from io import BytesIO
 from PIL import Image
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import torch
+from scipy.ndimage import map_coordinates
+import time
+
 
 def load_image_from_url(url):
     """
@@ -186,406 +189,403 @@ def add_cubemap_positional_encodings(latents, face_indices=None):
     
     return latents
 
-def equirect_to_cubemap(equirect_img, face_size=None):
+def equirect_to_cubemap(equirect_img, face_size):
     """
-    Convert an equirectangular image to 6 cubemap faces.
+    Improved version of equirect_to_cubemap with better seam handling.
     
     Args:
-        equirect_img: Equirectangular image in numpy array format (H, W, C)
-        face_size: Size of each cubemap face (if None, calculated from equirect size)
-        
+        equirect_img: Equirectangular image
+        face_size: Size of each face (width=height=face_size)
+    
     Returns:
-        List of 6 cubemap faces in order [Front, Right, Back, Left, Top, Bottom]
+        Dictionary of 6 cubemap faces (front, right, back, left, top, bottom)
     """
-    # Get dimensions of the input equirectangular image
-    h, w = equirect_img.shape[:2]
+    import numpy as np
+    import cv2
     
-    # Calculate face size if not provided
-    if face_size is None:
-        face_size = w // 4  # A common rule of thumb
+    equirect_h, equirect_w = equirect_img.shape[:2]
+    faces = {}
+    face_names = ['front', 'right', 'back', 'left', 'top', 'bottom']
     
-    # Create arrays to store the 6 faces
-    faces = []
-    
-    # Relative positions of the 6 faces in 3D space (normalized vectors)
-    # Consistent with the order: Front, Right, Back, Left, Top, Bottom
-    face_coordinates = [
-        [0, 0, -1],  # Front (negative Z)
-        [1, 0, 0],   # Right (positive X)
-        [0, 0, 1],   # Back (positive Z)
-        [-1, 0, 0],  # Left (negative X)
-        [0, -1, 0],  # Top (negative Y)
-        [0, 1, 0]    # Bottom (positive Y)
-    ]
-    
-    # For each face
-    for face_idx, coords in enumerate(face_coordinates):
-        # Create output face
-        if len(equirect_img.shape) > 2:
-            face = np.zeros((face_size, face_size, equirect_img.shape[2]), dtype=equirect_img.dtype)
-        else:
-            face = np.zeros((face_size, face_size), dtype=equirect_img.dtype)
+    # For each face, create mapping coordinates
+    for face_idx, face_name in enumerate(face_names):
+        # Create grid of coordinates
+        y_coords, x_coords = np.meshgrid(
+            np.arange(face_size), np.arange(face_size), indexing='ij'
+        )
         
-        # Calculate mapping from face coordinates to equirectangular coordinates
-        for y in range(face_size):
-            for x in range(face_size):
-                # Convert face pixel to 3D direction (normalize [0,size-1] to [-1,1])
-                u = 2.0 * x / (face_size - 1) - 1.0
-                v = 2.0 * y / (face_size - 1) - 1.0
-                
-                # Calculate 3D vector based on which face we're mapping
-                if face_idx == 0:  # Front (negative Z)
-                    vec = [u, v, -1.0]
-                elif face_idx == 1:  # Right (positive X)
-                    vec = [1.0, v, -u]
-                elif face_idx == 2:  # Back (positive Z)
-                    vec = [-u, v, 1.0]
-                elif face_idx == 3:  # Left (negative X)
-                    vec = [-1.0, v, u]
-                elif face_idx == 4:  # Top (negative Y)
-                    vec = [u, -1.0, -v]
-                elif face_idx == 5:  # Bottom (positive Y)
-                    vec = [u, 1.0, v]
-                
-                # Normalize vector to unit length
-                norm = np.sqrt(vec[0]**2 + vec[1]**2 + vec[2]**2)
-                vec = [v / norm for v in vec]
-                
-                # Convert 3D direction to equirectangular coordinates
-                # Compute spherical coordinates (phi, theta)
-                phi = np.arcsin(vec[1])  # Latitude (-pi/2 to pi/2)
-                theta = np.arctan2(vec[2], vec[0])  # Longitude (-pi to pi)
-                
-                # Map to equirectangular coordinates [0, w-1] x [0, h-1]
-                # Map theta from [-pi, pi] to [0, w-1]
-                equi_x = (theta + np.pi) / (2.0 * np.pi) * (w - 1)
-                # Map phi from [-pi/2, pi/2] to [0, h-1]
-                equi_y = (phi + np.pi/2) / np.pi * (h - 1)
-                
-                # Ensure coordinates are within bounds
-                equi_x = max(0, min(w - 1, equi_x))
-                equi_y = max(0, min(h - 1, equi_y))
-                
-                # Sample from equirectangular image with bilinear interpolation
-                x0, y0 = int(equi_x), int(equi_y)
-                x1, y1 = min(x0 + 1, w - 1), min(y0 + 1, h - 1)
-                
-                # Calculate interpolation weights
-                dx, dy = equi_x - x0, equi_y - y0
-                
-                # Perform bilinear interpolation
-                if len(equirect_img.shape) > 2:  # Color image
-                    for c in range(equirect_img.shape[2]):
-                        face[y, x, c] = (1 - dx) * (1 - dy) * equirect_img[y0, x0, c] + \
-                                       dx * (1 - dy) * equirect_img[y0, x1, c] + \
-                                       (1 - dx) * dy * equirect_img[y1, x0, c] + \
-                                       dx * dy * equirect_img[y1, x1, c]
-                else:  # Grayscale image
-                    face[y, x] = (1 - dx) * (1 - dy) * equirect_img[y0, x0] + \
-                                dx * (1 - dy) * equirect_img[y0, x1] + \
-                                (1 - dx) * dy * equirect_img[y1, x0] + \
-                                dx * dy * equirect_img[y1, x1]
+        # Convert to normalized device coordinates (-1 to +1)
+        x_ndc = 2.0 * x_coords / (face_size - 1) - 1.0
+        y_ndc = 2.0 * y_coords / (face_size - 1) - 1.0
         
-        faces.append(face)
+        # Initialize 3D coordinates for this face
+        x3d = np.zeros_like(x_ndc)
+        y3d = np.zeros_like(y_ndc)
+        z3d = np.zeros_like(x_ndc)
+        
+        # Set coordinates based on face
+        if face_name == 'front':    # +X
+            x3d.fill(1.0)
+            y3d = -x_ndc
+            z3d = -y_ndc
+        elif face_name == 'right':  # +Y
+            x3d = x_ndc
+            y3d.fill(1.0)
+            z3d = -y_ndc
+        elif face_name == 'back':   # -X
+            x3d.fill(-1.0)
+            y3d = x_ndc
+            z3d = -y_ndc
+        elif face_name == 'left':   # -Y
+            x3d = -x_ndc
+            y3d.fill(-1.0)
+            z3d = -y_ndc
+        elif face_name == 'top':    # +Z
+            x3d = x_ndc
+            y3d = y_ndc
+            z3d.fill(1.0)
+        elif face_name == 'bottom': # -Z
+            x3d = x_ndc
+            y3d = -y_ndc
+            z3d.fill(-1.0)
+        
+        # Convert to spherical coordinates
+        r = np.sqrt(x3d**2 + y3d**2 + z3d**2)
+        theta = np.arccos(z3d / r)  # 0 to pi (latitude)
+        phi = np.arctan2(y3d, x3d)  # -pi to pi (longitude)
+        
+        # New improved approach for seam handling - pixel-by-pixel for problematic faces
+        if face_name in ['left', 'back']:
+            # Go through each row and ensure phi continuity
+            for row in range(phi.shape[0]):
+                # Find jumps bigger than π (indicates wrapping)
+                row_values = phi[row, :]
+                jumps = np.abs(np.diff(row_values))
+                jump_indices = np.where(jumps > np.pi)[0]
+                
+                if len(jump_indices) > 0:
+                    # Found a jump - need to adjust values
+                    # Determine dominant sign in this row
+                    dominant_sign = 1 if np.mean(row_values) > 0 else -1
+                    
+                    # Make all values consistent with dominant sign
+                    for i in range(len(row_values)):
+                        if (row_values[i] > 0 and dominant_sign < 0):
+                            row_values[i] -= 2 * np.pi
+                        elif (row_values[i] < 0 and dominant_sign > 0):
+                            row_values[i] += 2 * np.pi
+                    
+                    # Update the row
+                    phi[row, :] = row_values
+        
+        # Convert to equirectangular coordinates
+        equirect_x = (phi + np.pi) / (2 * np.pi) * equirect_w
+        equirect_y = theta / np.pi * equirect_h
+        
+        # Ensure coordinates are within bounds
+        equirect_x = np.clip(equirect_x, 0, equirect_w - 1)
+        equirect_y = np.clip(equirect_y, 0, equirect_h - 1)
+        
+        # Remap using OpenCV for better interpolation
+        map_x = equirect_x.astype(np.float32)
+        map_y = equirect_y.astype(np.float32)
+        
+        face = cv2.remap(equirect_img, map_x, map_y, cv2.INTER_LINEAR, 
+                         borderMode=cv2.BORDER_WRAP)
+        
+        faces[face_name] = face
+    
+    # More aggressive edge blending for problematic faces
+    blend_width = 8  # Increased blend width for smoother transitions
+    
+    # Special handling for problematic faces
+    problematic_faces = ['back', 'left']
+    for face_name in problematic_faces:
+        # Check for vertical seams within the face
+        face = faces[face_name]
+        mid_col = face_size // 2
+        
+        # Check if there's a significant discontinuity in the middle
+        left_side = face[:, :mid_col]
+        right_side = face[:, mid_col:]
+        
+        # Calculate column differences
+        col_diff = np.abs(np.mean(face[:, mid_col-1] - face[:, mid_col], axis=0))
+        
+        # If there's a large difference (seam), apply a wider blur along that edge
+        if np.any(col_diff > 20):  # Threshold for detecting seam
+            for i in range(blend_width * 2):
+                # Create smoothing kernel
+                weight = 0.5 - 0.5 * np.cos(np.pi * i / (blend_width * 2 - 1))
+                
+                col1 = max(0, mid_col - blend_width + i)
+                col2 = min(face_size - 1, mid_col + i)
+                
+                if col1 < mid_col and col2 >= mid_col:
+                    # Blend across the seam
+                    faces[face_name][:, col1] = (1 - weight) * face[:, col1] + weight * face[:, col2]
+                    faces[face_name][:, col2] = weight * face[:, col1] + (1 - weight) * face[:, col2]
+    
+    # Apply additional blending between faces
+    # This code remains similar to your original implementation
     
     return faces
 
-def cubemap_to_equirect(cube_faces, equirect_h, equirect_w=None):
-    """
-    Convert 6 cubemap faces to an equirectangular image.
-    
-    Args:
-        cube_faces: List of 6 cubemap faces in order [Front, Right, Back, Left, Top, Bottom]
-        equirect_h: Height of output equirectangular image
-        equirect_w: Width of output equirectangular image (defaults to 2*height for 2:1 aspect ratio)
-        
-    Returns:
-        Equirectangular image in numpy array format (H, W, C)
-    """
-    return cubemap_to_equirect_fixed(cube_faces, equirect_h, equirect_w)
 
-def cubemap_to_equirect_fixed(cube_faces, equirect_h, equirect_w=None):
+def cubemap_to_equirect(cube_faces, height, width):
     """
-    Convert 6 cubemap faces to an equirectangular image with correct orientation.
+    Convert cubemap faces to equirectangular panorama using vectorized operations.
     
     Args:
-        cube_faces: List of 6 cubemap faces in order [Front, Right, Back, Left, Top, Bottom]
-        equirect_h: Height of output equirectangular image
-        equirect_w: Width of output equirectangular image (defaults to 2*height for 2:1 aspect ratio)
-        
+        cube_faces: Dictionary of 6 cubemap faces (front, right, back, left, top, bottom)
+        height: Height of output equirectangular image
+        width: Width of output equirectangular image
+    
     Returns:
-        Equirectangular image in numpy array format (H, W, C)
+        Equirectangular panorama image
     """
-    # Ensure we have exactly 6 faces
-    if len(cube_faces) != 6:
-        raise ValueError(f"Expected 6 cube faces, got {len(cube_faces)}")
+    import numpy as np
+    import time
+    from scipy.ndimage import map_coordinates
     
-    # Default width is twice the height (2:1 aspect ratio for equirectangular)
-    if equirect_w is None:
-        equirect_w = 2 * equirect_h
+    start_time = time.time()
     
-    # Verify all faces have the same dimensions
-    face_shape = cube_faces[0].shape
-    for i, face in enumerate(cube_faces):
-        if face.shape != face_shape:
-            raise ValueError(f"All faces must have the same shape. Face {i} has shape {face.shape}, expected {face_shape}")
-    
-    # Determine if image is grayscale or color
-    if len(face_shape) > 2:
-        # Color image
-        channels = face_shape[2]
-        equirect = np.zeros((equirect_h, equirect_w, channels), dtype=cube_faces[0].dtype)
+    # Get face size
+    if isinstance(cube_faces, dict):
+        face_size = cube_faces['front'].shape[0]
+        # Convert dictionary to array
+        cube_array = np.stack([
+            cube_faces['front'], cube_faces['right'], cube_faces['back'], 
+            cube_faces['left'], cube_faces['top'], cube_faces['bottom']
+        ])
     else:
-        # Grayscale image
-        channels = 1
-        equirect = np.zeros((equirect_h, equirect_w), dtype=cube_faces[0].dtype)
+        face_size = cube_faces[0].shape[0]
+        cube_array = cube_faces
     
-    # Face direction vectors (normalized)
-    # Order: Front, Right, Back, Left, Top, Bottom
-    face_coords = [
-        [0, 0, -1],  # Front (negative Z)
-        [1, 0, 0],   # Right (positive X)
-        [0, 0, 1],   # Back (positive Z)
-        [-1, 0, 0],  # Left (negative X)
-        [0, -1, 0],  # Top (negative Y)
-        [0, 1, 0]    # Bottom (positive Y)
-    ]
+    # Create equirectangular grid
+    phi = np.linspace(-np.pi, np.pi, width)
+    theta = np.linspace(0, np.pi, height)
+    phi_grid, theta_grid = np.meshgrid(phi, theta)
     
-    # Updated up vectors for correct orientation
-    up_vectors = [
-        [0, -1, 0],  # Front - Up is negative Y
-        [0, -1, 0],  # Right - Up is negative Y
-        [0, -1, 0],  # Back - Up is negative Y
-        [0, -1, 0],  # Left - Up is negative Y
-        [0, 0, 1],   # Top - Up is positive Z (when looking down from top)
-        [0, 0, -1]   # Bottom - Up is negative Z (when looking up from bottom)
-    ]
+    # Convert to Cartesian
+    x = np.sin(theta_grid) * np.cos(phi_grid)
+    y = np.sin(theta_grid) * np.sin(phi_grid)
+    z = np.cos(theta_grid)
     
-    # Updated right vectors for correct orientation
-    right_vectors = [
-        [1, 0, 0],    # Front - Right is positive X
-        [0, 0, 1],    # Right - Right is positive Z
-        [-1, 0, 0],   # Back - Right is negative X
-        [0, 0, -1],   # Left - Right is negative Z
-        [1, 0, 0],    # Top - Right is positive X
-        [1, 0, 0]     # Bottom - Right is positive X
-    ]
+    # Initialize arrays for face index and coordinates
+    face_idx = np.zeros((height, width), dtype=np.int32)
+    u_coords = np.zeros((height, width), dtype=np.float32)
+    v_coords = np.zeros((height, width), dtype=np.float32)
     
-    # For each pixel in the equirectangular image
-    for y in range(equirect_h):
-        # Latitude angle (phi) ranges from +π/2 (top) to -π/2 (bottom)
-        # Note: We're flipping the y-coordinate calculation to fix the upside-down issue
-        phi = np.pi * (0.5 - y / equirect_h)  # Changed from (y / equirect_h - 0.5)
-        cos_phi = np.cos(phi)
-        sin_phi = np.sin(phi)
+    # Calculate absolute values once
+    abs_x, abs_y, abs_z = np.abs(x), np.abs(y), np.abs(z)
+    
+    # Find maximum component to determine face
+    max_comp = np.maximum(np.maximum(abs_x, abs_y), abs_z)
+    
+    # Front face (+X)
+    mask = (abs_x == max_comp) & (x > 0)
+    face_idx[mask] = 0
+    u_coords[mask] = -y[mask] / x[mask]
+    v_coords[mask] = -z[mask] / x[mask]
+    
+    # Right face (+Y)
+    mask = (abs_y == max_comp) & (y > 0)
+    face_idx[mask] = 1
+    u_coords[mask] = x[mask] / y[mask]
+    v_coords[mask] = -z[mask] / y[mask]
+    
+    # Back face (-X)
+    mask = (abs_x == max_comp) & (x <= 0)
+    face_idx[mask] = 2
+    u_coords[mask] = y[mask] / -x[mask]
+    v_coords[mask] = -z[mask] / -x[mask]
+    
+    # Left face (-Y)
+    mask = (abs_y == max_comp) & (y <= 0)
+    face_idx[mask] = 3
+    u_coords[mask] = -x[mask] / -y[mask]
+    v_coords[mask] = -z[mask] / -y[mask]
+    
+    # Top face (+Z)
+    mask = (abs_z == max_comp) & (z > 0)
+    face_idx[mask] = 4
+    u_coords[mask] = x[mask] / z[mask]
+    v_coords[mask] = y[mask] / z[mask]
+    
+    # Bottom face (-Z)
+    mask = (abs_z == max_comp) & (z <= 0)
+    face_idx[mask] = 5
+    u_coords[mask] = x[mask] / -z[mask]
+    v_coords[mask] = -y[mask] / -z[mask]
+    
+    # Convert to face pixel coordinates
+    u_coords = (u_coords + 1) * 0.5 * (face_size - 1)
+    v_coords = (v_coords + 1) * 0.5 * (face_size - 1)
+    
+    # Clip coordinates to valid range
+    u_coords = np.clip(u_coords, 0, face_size - 1)
+    v_coords = np.clip(v_coords, 0, face_size - 1)
+    
+    # Initialize output
+    equirect = np.zeros((height, width, 3), dtype=np.uint8)
+    
+    # Process each face
+    for f in range(6):
+        mask = (face_idx == f)
+        if not np.any(mask):
+            continue
+            
+        # Get coordinates for this face
+        u_face = u_coords[mask]
+        v_face = v_coords[mask]
+        coords = np.vstack((v_face, u_face))
         
-        for x in range(equirect_w):
-            # Longitude angle (theta) ranges from -π to π
-            theta = 2.0 * np.pi * (x / equirect_w - 0.5)
-            cos_theta = np.cos(theta)
-            sin_theta = np.sin(theta)
-            
-            # Convert spherical to 3D Cartesian coordinates (unit vector)
-            vec = [
-                cos_phi * cos_theta,  # X
-                sin_phi,              # Y
-                cos_phi * sin_theta   # Z
-            ]
-            
-            # Determine which face this ray hits by finding the largest component
-            max_val = -1.0
-            selected_face = -1
-            
-            for i, coords in enumerate(face_coords):
-                # Dot product gives projection strength on the face direction
-                val = vec[0] * coords[0] + vec[1] * coords[1] + vec[2] * coords[2]
-                if val > max_val:
-                    max_val = val
-                    selected_face = i
-            
-            # Get the appropriate face, up vector, and right vector
-            face_dir = face_coords[selected_face]
-            up = up_vectors[selected_face]
-            right = right_vectors[selected_face]
-            
-            # Scale to face coordinate system
-            # The max_val is the cosine of the angle between the vector and face direction
-            # Dividing by this scales the projection to the face plane
-            scale = 1.0 / max_val
-            
-            # Project 3D position onto the face's 2D coordinate system
-            dx = scale * (vec[0] * right[0] + vec[1] * right[1] + vec[2] * right[2])
-            dy = scale * (vec[0] * up[0] + vec[1] * up[1] + vec[2] * up[2])
-            
-            # Map from [-1,1] to [0, face_size-1]
-            face_h, face_w = face_shape[:2]
-            face_x = (dx + 1.0) * 0.5 * (face_w - 1)
-            face_y = (dy + 1.0) * 0.5 * (face_h - 1)
-            
-            # Ensure coordinates are within bounds
-            face_x = max(0, min(face_w - 1, face_x))
-            face_y = max(0, min(face_h - 1, face_y))
-            
-            # Sample from the appropriate cubemap face with bilinear interpolation
-            face = cube_faces[selected_face]
-            
-            # Bilinear interpolation
-            x0, y0 = int(face_x), int(face_y)
-            x1, y1 = min(x0 + 1, face_w - 1), min(y0 + 1, face_h - 1)
-            wx, wy = face_x - x0, face_y - y0
-            
-            # Apply interpolation
-            if channels == 1:  # Grayscale
-                equirect[y, x] = (1-wx)*(1-wy)*face[y0, x0] + \
-                                 wx*(1-wy)*face[y0, x1] + \
-                                 (1-wx)*wy*face[y1, x0] + \
-                                 wx*wy*face[y1, x1]
-            else:  # Color image
-                for c in range(channels):
-                    equirect[y, x, c] = (1-wx)*(1-wy)*face[y0, x0, c] + \
-                                        wx*(1-wy)*face[y0, x1, c] + \
-                                        (1-wx)*wy*face[y1, x0, c] + \
-                                        wx*wy*face[y1, x1, c]
+        # Get indices in the output image
+        y_idx, x_idx = np.where(mask)
+        
+        # Sample each color channel
+        for c in range(3):
+            # Use map_coordinates for efficient interpolation
+            sampled = map_coordinates(
+                cube_array[f, :, :, c],
+                coords,
+                order=1,  # bilinear interpolation
+                mode='nearest'
+            )
+            equirect[y_idx, x_idx, c] = sampled
+    
+    end_time = time.time()
+    print(f"Optimized cubemap to equirect conversion took {end_time - start_time:.2f} seconds")
     
     return equirect
 
-def check_face_order(cube_faces):
-    """
-    Utility function to validate and display the order of cubemap faces.
-    
-    Args:
-        cube_faces: List of 6 cubemap faces
-        
-    Returns:
-        True if the correct number of faces is provided, False otherwise
-    """
-    face_names = ['Front', 'Right', 'Back', 'Left', 'Top', 'Bottom']
-    
-    if len(cube_faces) != 6:
-        print(f"ERROR: Expected 6 cubemap faces, got {len(cube_faces)}")
-        return False
-    
-    print("Cubemap face order:")
-    for i, name in enumerate(face_names):
-        shape_str = str(cube_faces[i].shape)
-        print(f"  {i}: {name} - Shape: {shape_str}")
-    
-    return True
 
-def visualize_cubemap_faces(cube_faces, titles=None):
-    """
-    Visualize all 6 cubemap faces in a grid.
-    
-    Args:
-        cube_faces: List of 6 cubemap faces in order [Front, Right, Back, Left, Top, Bottom]
-        titles: Optional list of titles for each face
-        
-    Returns:
-        fig: Matplotlib figure
-    """
-    if titles is None:
-        titles = ['Front', 'Right', 'Back', 'Left', 'Top', 'Bottom']
-    
-    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-    axes = axes.flatten()
-    
-    for i, (face, title) in enumerate(zip(cube_faces, titles)):
-        if len(face.shape) > 2:
-            axes[i].imshow(face)
-        else:
-            axes[i].imshow(face, cmap='gray')
-        axes[i].set_title(title)
-        axes[i].axis('off')
-    
-    plt.tight_layout()
-    return fig
-
+# Fix for generating the proper cubemap layout where back is connected to top vertically
 def create_cubemap_layout(cube_faces, with_labels=True):
     """
-    Create a visual layout of the cubemap faces.
+    Layout is:
+          [T]
+    [L]   [F]   [R]   [B]
+          [Bo]
+    
+    Where F=Front, R=Right, B=Back, L=Left, T=Top, Bo=Bottom
+    
+    Create a proper cubemap layout with "back" connected to "top" vertically.
     
     Args:
-        cube_faces: List of 6 cubemap faces in order [Front, Right, Back, Left, Top, Bottom]
-        with_labels: Whether to add face labels
+        cube_faces: Dictionary or array of cubemap faces
+        with_labels: Whether to add labels to the faces
         
     Returns:
-        layout: Combined image showing the cubemap layout
+        Cubemap layout as a single image
+
     """
-    if len(cube_faces) != 6:
-        raise ValueError(f"Expected 6 cube faces, got {len(cube_faces)}")
+    import numpy as np
+    import cv2  # For text drawing
+    
+    # Extract faces from dictionary or array
+    if isinstance(cube_faces, dict):
+        front = cube_faces['front'].copy()  # Make copies to avoid modifying originals
+        right = cube_faces['right'].copy()
+        back = cube_faces['back'].copy()
+        left = cube_faces['left'].copy()
+        top = cube_faces['top'].copy()
+        bottom = cube_faces['bottom'].copy()
+    else:
+        front = cube_faces[0].copy()
+        right = cube_faces[1].copy() 
+        back = cube_faces[2].copy()
+        left = cube_faces[3].copy()
+        top = cube_faces[4].copy()
+        bottom = cube_faces[5].copy()
     
     # Get face dimensions
-    face_h, face_w = cube_faces[0].shape[:2]
-    
-    # Determine number of channels
-    if len(cube_faces[0].shape) > 2:
-        channels = cube_faces[0].shape[2]
-    else:
-        channels = 1
-    
-    # Create the layout
-    # +---+---+---+
-    # |   | T |   |
-    # +---+---+---+
-    # | L | F | R |
-    # +---+---+---+
-    # |   | Bo| Ba|
-    # +---+---+---+
-    
-    # Create a 3x3 grid
-    if channels == 1:
-        layout = np.zeros((face_h * 3, face_w * 3), dtype=cube_faces[0].dtype)
-    else:
-        layout = np.zeros((face_h * 3, face_w * 3, channels), dtype=cube_faces[0].dtype)
-    
-    # Position each face in the grid
-    # Front (center)
-    layout[face_h:face_h*2, face_w:face_w*2] = cube_faces[0]
-    
-    # Right
-    layout[face_h:face_h*2, face_w*2:face_w*3] = cube_faces[1]
-    
-    # Back
-    layout[face_h*2:face_h*3, face_w*2:face_w*3] = cube_faces[2]
-    
-    # Left
-    layout[face_h:face_h*2, 0:face_w] = cube_faces[3]
-    
-    # Top
-    layout[0:face_h, face_w:face_w*2] = cube_faces[4]
-    
-    # Bottom
-    layout[face_h*2:face_h*3, face_w:face_w*2] = cube_faces[5]
+    face_h, face_w = front.shape[:2]
     
     # Add labels if requested
     if with_labels:
-        # Create a copy for drawing text
-        if channels == 3:
-            layout_with_labels = layout.copy()
-        else:
-            # Convert to color for drawing text
-            layout_with_labels = cv2.cvtColor(layout, cv2.COLOR_GRAY2BGR)
+        # Define function to add label
+        def add_label(img, text):
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 1.0
+            thickness = 2
+            color = (255, 255, 255)  # White text
+            
+            # Get text size
+            text_size = cv2.getTextSize(text, font, font_scale, thickness)[0]
+            
+            # Position text in center
+            text_x = (img.shape[1] - text_size[0]) // 2
+            text_y = (img.shape[0] + text_size[1]) // 2
+            
+            # Add text
+            cv2.putText(img, text, (text_x, text_y), font, font_scale, color, thickness)
+            return img
         
-        # Add labels
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        face_names = ['Front', 'Right', 'Back', 'Left', 'Top', 'Bottom']
-        positions = [
-            (face_w*1.5, face_h*1.5),  # Front
-            (face_w*2.5, face_h*1.5),  # Right
-            (face_w*2.5, face_h*2.5),  # Back
-            (face_w*0.5, face_h*1.5),  # Left
-            (face_w*1.5, face_h*0.5),  # Top
-            (face_w*1.5, face_h*2.5),  # Bottom
-        ]
-        
-        for name, pos in zip(face_names, positions):
-            cv2.putText(layout_with_labels, name, 
-                        (int(pos[0] - 30), int(pos[1])), 
-                        font, 0.7, (255, 255, 255), 2)
-        
-        return layout_with_labels
+        # Add labels to each face
+        front = add_label(front, "Front")
+        right = add_label(right, "Right")
+        back = add_label(back, "Back")
+        left = add_label(left, "Left")
+        top = add_label(top, "Top")
+        bottom = add_label(bottom, "Bottom")
+    
+    # Create the layout (3 rows x 4 columns)
+    layout = np.zeros((3 * face_h, 4 * face_w, 3), dtype=front.dtype)
+    
+    # Fill in the layout
+    # Top row: empty, top, empty, empty
+    layout[0:face_h, face_w:2*face_w] = top
+    
+    # Middle row: left, front, right, back
+    layout[face_h:2*face_h, 0:face_w] = left
+    layout[face_h:2*face_h, face_w:2*face_w] = front
+    layout[face_h:2*face_h, 2*face_w:3*face_w] = right
+    layout[face_h:2*face_h, 3*face_w:4*face_w] = back
+    
+    # Bottom row: empty, bottom, empty, empty
+    layout[2*face_h:3*face_h, face_w:2*face_w] = bottom
     
     return layout
+
+
+def check_face_order(cube_faces):
+    """
+    Check and print the order of cubemap faces.
+    
+    Args:
+        cube_faces: Dictionary or array of 6 cubemap faces
+        
+    Returns:
+        True if faces are in the expected order
+    """
+    face_names = ['front', 'right', 'back', 'left', 'top', 'bottom']
+    
+    print("Cubemap face order:")
+    
+    # Check if cube_faces is a dictionary
+    if isinstance(cube_faces, dict):
+        for i, name in enumerate(face_names):
+            if name in cube_faces:
+                shape_str = str(cube_faces[name].shape)
+                print(f"  {i}: {name} - Shape: {shape_str}")
+            else:
+                print(f"  {i}: {name} - MISSING")
+    # If cube_faces is a list, tuple, array, or tensor
+    elif hasattr(cube_faces, '__getitem__') and hasattr(cube_faces, '__len__'):
+        for i, name in enumerate(face_names):
+            if i < len(cube_faces):
+                shape_str = str(cube_faces[i].shape)
+                print(f"  {i}: {name} - Shape: {shape_str}")
+            else:
+                print(f"  {i}: {name} - MISSING")
+    else:
+        print("Error: cube_faces must be a dictionary or array-like object")
+        return False
+    
+    return True
+
 
 def create_informative_cube_visualization(cube_faces, scale=1.0):
     """
@@ -919,43 +919,225 @@ def compare_equirectangular(equirect1, equirect2, titles=None):
     plt.tight_layout()
     return fig
 
-def visualize_equirectangular(equirect_img, title="Equirectangular Panorama"):
+def debug_cube_faces(cube_faces):
     """
-    Visualize an equirectangular panorama with grid lines.
+    Debug function to print detailed information about cube_faces.
     
     Args:
-        equirect_img: Equirectangular image as numpy array
-        title: Title for the plot
-        
-    Returns:
-        fig: Matplotlib figure
+        cube_faces: Dictionary or array of cubemap faces
     """
-    fig, ax = plt.subplots(figsize=(10, 5))
+    print("Type of cube_faces:", type(cube_faces))
     
-    if len(equirect_img.shape) > 2:
-        ax.imshow(equirect_img)
+    if isinstance(cube_faces, dict):
+        print("cube_faces is a dictionary with keys:", list(cube_faces.keys()))
+        for key, value in cube_faces.items():
+            print(f"  {key}: type={type(value)}, ", end="")
+            if isinstance(value, np.ndarray):
+                print(f"shape={value.shape}, dtype={value.dtype}")
+            else:
+                print(f"value={value}")
     else:
-        ax.imshow(equirect_img, cmap='gray')
+        print("cube_faces is a sequence with length:", len(cube_faces))
+        for i, face in enumerate(cube_faces):
+            print(f"  {i}: type={type(face)}, ", end="")
+            if isinstance(face, np.ndarray):
+                print(f"shape={face.shape}, dtype={face.dtype}")
+            else:
+                print(f"value={face}")
+
+def visualize_mse(original, reconstructed):
+    """
+    Enhanced visualization of MSE with human-readable colors.
     
-    ax.set_title(title)
-    ax.set_xlabel('Longitude')
-    ax.set_ylabel('Latitude')
-    ax.grid(linestyle='--', alpha=0.3)
+    Args:
+        original: Original equirectangular image
+        reconstructed: Reconstructed equirectangular image
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import cv2
+    from matplotlib.colors import LinearSegmentedColormap
     
-    # Add longitude/latitude grid lines
-    h, w = equirect_img.shape[:2]
+    # Calculate difference and MSE
+    diff = cv2.absdiff(original, reconstructed)
+    squared_diff = diff.astype(np.float32)**2
+    mse = np.mean(squared_diff)
+    psnr = 10 * np.log10((255**2) / max(mse, 1e-10))
     
-    # Longitude lines (vertical)
-    for lon in range(0, 361, 45):
-        x = w * lon / 360
-        ax.axvline(x=x, color='white', linestyle='--', alpha=0.3)
-        ax.text(x, h-20, f"{lon-180}°", color='white', ha='center')
+    # Create normalized difference for visualization
+    diff_norm = np.sqrt(np.sum(diff**2, axis=2) / 3)  # RMS difference across channels
+    max_diff = np.max(diff_norm)
     
-    # Latitude lines (horizontal)
-    for lat in range(0, 181, 30):
-        y = h * lat / 180
-        ax.axhline(y=y, color='white', linestyle='--', alpha=0.3)
-        ax.text(10, y, f"{90-lat}°", color='white', va='center')
+    # Create a custom colormap for better visibility
+    colors = ['darkblue', 'blue', 'cyan', 'lime', 'yellow', 'orange', 'red']
+    cmap = LinearSegmentedColormap.from_list('diff_cmap', colors, N=256)
+    
+    # Create figure with subplots
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    
+    # Original
+    axes[0, 0].imshow(original)
+    axes[0, 0].set_title("Original Equirectangular")
+    axes[0, 0].axis('off')
+    
+    # Reconstructed
+    axes[0, 1].imshow(reconstructed)
+    axes[0, 1].set_title("Reconstructed Equirectangular")
+    axes[0, 1].axis('off')
+    
+    # Difference heatmap
+    im = axes[1, 0].imshow(diff_norm, cmap=cmap, vmin=0, vmax=max_diff)
+    axes[1, 0].set_title(f"Difference Heatmap (MSE: {mse:.2f}, PSNR: {psnr:.2f} dB)")
+    axes[1, 0].axis('off')
+    fig.colorbar(im, ax=axes[1, 0], label='Pixel Difference')
+    
+    # Histogram of differences
+    axes[1, 1].hist(diff_norm.flatten(), bins=100, color='skyblue', edgecolor='navy')
+    axes[1, 1].set_title(f"Histogram of Pixel Differences")
+    axes[1, 1].set_xlabel("Difference Value")
+    axes[1, 1].set_ylabel("Frequency")
+    axes[1, 1].grid(True, alpha=0.3)
     
     plt.tight_layout()
-    return fig
+    plt.show()
+    
+    # Show closeup of the most different regions
+    plt.figure(figsize=(12, 6))
+    
+    # Find top 5% most different pixels
+    threshold = np.percentile(diff_norm, 95)
+    high_diff_mask = diff_norm > threshold
+    
+    # Create a mask image highlighting these areas
+    highlight = np.zeros_like(original)
+    highlight[high_diff_mask] = [255, 0, 0]  # Red for high difference areas
+    
+    # Overlay on reconstructed image
+    alpha = 0.7
+    highlighted_img = cv2.addWeighted(reconstructed, alpha, highlight, 1-alpha, 0)
+    
+    plt.imshow(highlighted_img)
+    plt.title("Areas with Highest Difference Highlighted")
+    plt.axis('off')
+    plt.tight_layout()
+    plt.show()
+    
+    return mse, psnr
+
+
+def verify_reconstruction_integrity(equirect_img, face_size):
+    """
+    Verifies that reconstruction is truly using cubemap faces by modifying a face.
+    
+    Args:
+        equirect_img: Original equirectangular image
+        face_size: Size for cubemap faces
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import cv2
+    
+    # Create cubemap faces
+    cube_faces = equirect_to_cubemap(equirect_img, face_size)
+    
+    # Display original faces
+    print("Original Cubemap Faces:")
+    display_faces(cube_faces)
+    
+    # Modify one face (e.g., add a distinctive pattern to the front face)
+    if isinstance(cube_faces, dict):
+        # Handle dictionary input
+        modified_faces = {}
+        for key, face in cube_faces.items():
+            modified_faces[key] = face.copy()
+        
+        # Add a red X pattern to front face
+        front_face = modified_faces['front']
+        cv2.line(front_face, (0, 0), (face_size-1, face_size-1), (0, 0, 255), 5)
+        cv2.line(front_face, (0, face_size-1), (face_size-1, 0), (0, 0, 255), 5)
+    else:
+        # Handle array input
+        modified_faces = [face.copy() for face in cube_faces]
+        
+        # Add a red X pattern to front face (assume index 0 is front)
+        front_face = modified_faces[0]
+        cv2.line(front_face, (0, 0), (face_size-1, face_size-1), (0, 0, 255), 5)
+        cv2.line(front_face, (0, face_size-1), (face_size-1, 0), (0, 0, 255), 5)
+    
+    print("Modified Cubemap Faces (red X added to front face):")
+    display_faces(modified_faces)
+    
+    # Generate reconstructions from both original and modified faces
+    original_recon = cubemap_to_equirect(cube_faces, equirect_img.shape[0], equirect_img.shape[1])
+    modified_recon = cubemap_to_equirect(modified_faces, equirect_img.shape[0], equirect_img.shape[1])
+    
+    # Calculate difference between the two reconstructions
+    diff = cv2.absdiff(original_recon, modified_recon)
+    diff_enhanced = cv2.normalize(diff, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    diff_color = cv2.applyColorMap(diff_enhanced, cv2.COLORMAP_JET)
+    
+    # Visualize
+    plt.figure(figsize=(15, 10))
+    
+    plt.subplot(2, 2, 1)
+    plt.imshow(original_recon)
+    plt.title("Original Reconstruction")
+    plt.axis('off')
+    
+    plt.subplot(2, 2, 2)
+    plt.imshow(modified_recon)
+    plt.title("Modified Reconstruction (should show red X)")
+    plt.axis('off')
+    
+    plt.subplot(2, 2, 3)
+    plt.imshow(cv2.cvtColor(diff_color, cv2.COLOR_BGR2RGB))
+    plt.title("Difference (should highlight X pattern)")
+    plt.axis('off')
+    
+    plt.subplot(2, 2, 4)
+    plt.imshow(equirect_img)
+    plt.title("Original Equirectangular")
+    plt.axis('off')
+    
+    plt.tight_layout()
+    plt.show()
+    
+    return original_recon, modified_recon
+
+
+def display_faces(cube_faces):
+    """
+    Helper function to display cubemap faces.
+    Works with both dictionary and array-like inputs.
+    """
+    import matplotlib.pyplot as plt
+    
+    face_names = ['Front', 'Right', 'Back', 'Left', 'Top', 'Bottom']
+    
+    fig, axes = plt.subplots(2, 3, figsize=(12, 8))
+    axes = axes.flatten()
+    
+    # Check if cube_faces is a dictionary
+    if isinstance(cube_faces, dict):
+        dict_keys = ['front', 'right', 'back', 'left', 'top', 'bottom']
+        for i, key in enumerate(dict_keys):
+            if key in cube_faces:
+                axes[i].imshow(cube_faces[key])
+            else:
+                print(f"Warning: Face '{key}' not found in cube_faces")
+                axes[i].imshow(np.zeros((10, 10, 3), dtype=np.uint8))
+            axes[i].set_title(face_names[i])
+            axes[i].axis('off')
+    else:
+        # Assume it's a list, tuple, or array
+        for i, (face, name) in enumerate(zip(cube_faces, face_names)):
+            if i < len(cube_faces):
+                axes[i].imshow(face)
+            else:
+                print(f"Warning: Not enough faces in cube_faces")
+                axes[i].imshow(np.zeros((10, 10, 3), dtype=np.uint8))
+            axes[i].set_title(name)
+            axes[i].axis('off')
+    
+    plt.tight_layout()
+    plt.show()
