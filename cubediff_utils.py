@@ -189,9 +189,17 @@ def add_cubemap_positional_encodings(latents, face_indices=None):
     
     return latents
 
+
+# --------------------------------------------
+import numpy as np
+import cv2
+from scipy.ndimage import map_coordinates
+import time
+
 def equirect_to_cubemap(equirect_img, face_size):
     """
-    Improved version of equirect_to_cubemap with better seam handling.
+    Improved version of equirect_to_cubemap with proper handling of the back face
+    to ensure correct content mapping and seamless reconstruction.
     
     Args:
         equirect_img: Equirectangular image
@@ -200,15 +208,15 @@ def equirect_to_cubemap(equirect_img, face_size):
     Returns:
         Dictionary of 6 cubemap faces (front, right, back, left, top, bottom)
     """
-    import numpy as np
-    import cv2
-    
     equirect_h, equirect_w = equirect_img.shape[:2]
     faces = {}
     face_names = ['front', 'right', 'back', 'left', 'top', 'bottom']
     
-    # For each face, create mapping coordinates
-    for face_idx, face_name in enumerate(face_names):
+    # Store the mapping coordinates for later use
+    mapping_coords = {}
+    
+    # First pass: Create standard cubemap faces using proper spherical mapping
+    for face_name in face_names:
         # Create grid of coordinates
         y_coords, x_coords = np.meshgrid(
             np.arange(face_size), np.arange(face_size), indexing='ij'
@@ -234,7 +242,7 @@ def equirect_to_cubemap(equirect_img, face_size):
             z3d = -y_ndc
         elif face_name == 'back':   # -X
             x3d.fill(-1.0)
-            y3d = x_ndc
+            y3d = x_ndc  # Standard mapping for initial calculation
             z3d = -y_ndc
         elif face_name == 'left':   # -Y
             x3d = -x_ndc
@@ -254,120 +262,148 @@ def equirect_to_cubemap(equirect_img, face_size):
         theta = np.arccos(z3d / r)  # 0 to pi (latitude)
         phi = np.arctan2(y3d, x3d)  # -pi to pi (longitude)
         
-        # New improved approach for seam handling - pixel-by-pixel for problematic faces
-        if face_name in ['left', 'back']:
-            # Go through each row and ensure phi continuity
-            for row in range(phi.shape[0]):
-                # Find jumps bigger than π (indicates wrapping)
-                row_values = phi[row, :]
-                jumps = np.abs(np.diff(row_values))
-                jump_indices = np.where(jumps > np.pi)[0]
-                
-                if len(jump_indices) > 0:
-                    # Found a jump - need to adjust values
-                    # Determine dominant sign in this row
-                    dominant_sign = 1 if np.mean(row_values) > 0 else -1
-                    
-                    # Make all values consistent with dominant sign
-                    for i in range(len(row_values)):
-                        if (row_values[i] > 0 and dominant_sign < 0):
-                            row_values[i] -= 2 * np.pi
-                        elif (row_values[i] < 0 and dominant_sign > 0):
-                            row_values[i] += 2 * np.pi
-                    
-                    # Update the row
-                    phi[row, :] = row_values
+        # Store original phi for back face processing
+        if face_name == 'back':
+            original_phi = phi.copy()
         
         # Convert to equirectangular coordinates
         equirect_x = (phi + np.pi) / (2 * np.pi) * equirect_w
         equirect_y = theta / np.pi * equirect_h
         
+        # Store mapping coordinates
+        mapping_coords[face_name] = {
+            'equirect_x': equirect_x,
+            'equirect_y': equirect_y,
+            'phi': phi
+        }
+    
+    # Special processing for back face to handle the seam problem
+    # Create two separate maps for left and right sides of the back face
+    back_map_x = mapping_coords['back']['equirect_x'].copy()
+    back_map_y = mapping_coords['back']['equirect_y'].copy()
+    original_phi = mapping_coords['back']['phi']
+    
+    # Find potential seam location (where phi jumps)
+    mid_col = face_size // 2
+    
+    # Create masks for the left and right halves of the back face
+    left_mask = np.zeros_like(original_phi, dtype=bool)
+    right_mask = np.zeros_like(original_phi, dtype=bool)
+    left_mask[:, :mid_col] = True
+    right_mask[:, mid_col:] = True
+    
+    # For left half: Ensure all phi values are negative
+    left_phi = original_phi.copy()
+    left_phi[left_mask & (left_phi > 0)] -= 2 * np.pi
+    left_equirect_x = (left_phi + np.pi) / (2 * np.pi) * equirect_w
+    
+    # For right half: Ensure all phi values are positive
+    right_phi = original_phi.copy()
+    right_phi[right_mask & (right_phi < 0)] += 2 * np.pi
+    right_equirect_x = (right_phi + np.pi) / (2 * np.pi) * equirect_w
+    
+    # Update back face mapping with the corrected coordinates
+    back_map_x[:, :mid_col] = left_equirect_x[:, :mid_col]
+    back_map_x[:, mid_col:] = right_equirect_x[:, mid_col:]
+    
+    # Process faces with the prepared mapping coordinates
+    for face_name in face_names:
+        if face_name == 'back':
+            # Special handling for back face
+            map_x = back_map_x.astype(np.float32)
+            map_y = back_map_y.astype(np.float32)
+        else:
+            # Standard handling for other faces
+            map_x = mapping_coords[face_name]['equirect_x'].astype(np.float32)
+            map_y = mapping_coords[face_name]['equirect_y'].astype(np.float32)
+        
         # Ensure coordinates are within bounds
-        equirect_x = np.clip(equirect_x, 0, equirect_w - 1)
-        equirect_y = np.clip(equirect_y, 0, equirect_h - 1)
+        map_x = np.clip(map_x, 0, equirect_w - 1)
+        map_y = np.clip(map_y, 0, equirect_h - 1)
         
-        # Remap using OpenCV for better interpolation
-        map_x = equirect_x.astype(np.float32)
-        map_y = equirect_y.astype(np.float32)
-        
+        # Remap using OpenCV
         face = cv2.remap(equirect_img, map_x, map_y, cv2.INTER_LINEAR, 
                          borderMode=cv2.BORDER_WRAP)
         
         faces[face_name] = face
     
-    # More aggressive edge blending for problematic faces
-    blend_width = 8  # Increased blend width for smoother transitions
+    # Apply smoothing specifically at the center seam of back face
+    back_face = faces['back']
+    h, w = back_face.shape[:2]
     
-    # Special handling for problematic faces
-    problematic_faces = ['back', 'left']
-    for face_name in problematic_faces:
-        # Check for vertical seams within the face
-        face = faces[face_name]
-        mid_col = face_size // 2
-        
-        # Check if there's a significant discontinuity in the middle
-        left_side = face[:, :mid_col]
-        right_side = face[:, mid_col:]
-        
-        # Calculate column differences
-        col_diff = np.abs(np.mean(face[:, mid_col-1] - face[:, mid_col], axis=0))
-        
-        # If there's a large difference (seam), apply a wider blur along that edge
-        if np.any(col_diff > 20):  # Threshold for detecting seam
-            for i in range(blend_width * 2):
-                # Create smoothing kernel
-                weight = 0.5 - 0.5 * np.cos(np.pi * i / (blend_width * 2 - 1))
-                
-                col1 = max(0, mid_col - blend_width + i)
-                col2 = min(face_size - 1, mid_col + i)
-                
-                if col1 < mid_col and col2 >= mid_col:
-                    # Blend across the seam
-                    faces[face_name][:, col1] = (1 - weight) * face[:, col1] + weight * face[:, col2]
-                    faces[face_name][:, col2] = weight * face[:, col1] + (1 - weight) * face[:, col2]
+    # Define seam region (few pixels around the middle)
+    seam_width = 6  # Adjust based on face size
+    seam_center = w // 2
+    seam_start = max(0, seam_center - seam_width // 2)
+    seam_end = min(w, seam_center + seam_width // 2)
     
-    # Apply additional blending between faces
-    # This code remains similar to your original implementation
+    # Create a blend mask for the seam region
+    blend_mask = np.zeros((h, w), dtype=np.float32)
+    for i in range(seam_start, seam_end):
+        # Create a smooth weight (0 at edges, 1 at center)
+        pos = (i - seam_start) / (seam_end - seam_start - 1)
+        weight = 0.5 - 0.5 * np.cos(2 * np.pi * pos)
+        blend_mask[:, i] = weight
+    
+    # Apply guided filter to the seam region for edge-aware smoothing
+    seam_region = back_face[:, seam_start:seam_end].copy()
+    blurred_region = cv2.GaussianBlur(seam_region, (3, 3), 0)
+    
+    # Blend original and blurred versions using the blend mask
+    for i in range(seam_start, seam_end):
+        weight = blend_mask[:, i][:, np.newaxis]
+        back_face[:, i] = (1 - weight) * back_face[:, i] + weight * blurred_region[:, i-seam_start]
+    
+    # Apply bilateral filter to the entire back face for final smoothing
+    # while preserving edges
+    faces['back'] = cv2.bilateralFilter(back_face, d=5, sigmaColor=25, sigmaSpace=25)
     
     return faces
 
-
 def cubemap_to_equirect(cube_faces, height, width):
     """
-    Convert cubemap faces to equirectangular panorama using vectorized operations.
+    Convert cubemap faces to equirectangular panorama with correct mapping
+    and seam handling for natural blending.
     
     Args:
         cube_faces: Dictionary of 6 cubemap faces (front, right, back, left, top, bottom)
+                    or list/array of 6 faces
         height: Height of output equirectangular image
         width: Width of output equirectangular image
     
     Returns:
         Equirectangular panorama image
     """
-    import numpy as np
-    import time
-    from scipy.ndimage import map_coordinates
-    
     start_time = time.time()
     
-    # Get face size
+    # Process input based on type (dict or array)
     if isinstance(cube_faces, dict):
         face_size = cube_faces['front'].shape[0]
-        # Convert dictionary to array
+        # Create a copy to avoid modifying the original
+        original_faces = {k: v.copy() for k, v in cube_faces.items()}
+        
+        # We'll use the original back face but need to handle its seams
+        # Extract all faces for easy indexing
         cube_array = np.stack([
-            cube_faces['front'], cube_faces['right'], cube_faces['back'], 
-            cube_faces['left'], cube_faces['top'], cube_faces['bottom']
+            original_faces['front'], 
+            original_faces['right'], 
+            original_faces['back'], 
+            original_faces['left'], 
+            original_faces['top'], 
+            original_faces['bottom']
         ])
     else:
         face_size = cube_faces[0].shape[0]
-        cube_array = cube_faces
+        # Create a copy to avoid modifying the original
+        original_faces = [face.copy() for face in cube_faces]
+        cube_array = np.stack(original_faces)
     
     # Create equirectangular grid
     phi = np.linspace(-np.pi, np.pi, width)
     theta = np.linspace(0, np.pi, height)
     phi_grid, theta_grid = np.meshgrid(phi, theta)
     
-    # Convert to Cartesian
+    # Convert to Cartesian coordinates
     x = np.sin(theta_grid) * np.cos(phi_grid)
     y = np.sin(theta_grid) * np.sin(phi_grid)
     z = np.cos(theta_grid)
@@ -377,47 +413,50 @@ def cubemap_to_equirect(cube_faces, height, width):
     u_coords = np.zeros((height, width), dtype=np.float32)
     v_coords = np.zeros((height, width), dtype=np.float32)
     
-    # Calculate absolute values once
+    # Calculate absolute values for determining face
     abs_x, abs_y, abs_z = np.abs(x), np.abs(y), np.abs(z)
     
     # Find maximum component to determine face
     max_comp = np.maximum(np.maximum(abs_x, abs_y), abs_z)
     
+    # Define a small epsilon to avoid division by zero
+    eps = 1e-10
+    
     # Front face (+X)
     mask = (abs_x == max_comp) & (x > 0)
     face_idx[mask] = 0
-    u_coords[mask] = -y[mask] / x[mask]
-    v_coords[mask] = -z[mask] / x[mask]
+    u_coords[mask] = -y[mask] / (x[mask] + eps)
+    v_coords[mask] = -z[mask] / (x[mask] + eps)
     
     # Right face (+Y)
     mask = (abs_y == max_comp) & (y > 0)
     face_idx[mask] = 1
-    u_coords[mask] = x[mask] / y[mask]
-    v_coords[mask] = -z[mask] / y[mask]
+    u_coords[mask] = x[mask] / (y[mask] + eps)
+    v_coords[mask] = -z[mask] / (y[mask] + eps)
     
     # Back face (-X)
     mask = (abs_x == max_comp) & (x <= 0)
     face_idx[mask] = 2
-    u_coords[mask] = y[mask] / -x[mask]
-    v_coords[mask] = -z[mask] / -x[mask]
+    u_coords[mask] = y[mask] / (-x[mask] + eps)
+    v_coords[mask] = -z[mask] / (-x[mask] + eps)
     
     # Left face (-Y)
     mask = (abs_y == max_comp) & (y <= 0)
     face_idx[mask] = 3
-    u_coords[mask] = -x[mask] / -y[mask]
-    v_coords[mask] = -z[mask] / -y[mask]
+    u_coords[mask] = -x[mask] / (-y[mask] + eps)
+    v_coords[mask] = -z[mask] / (-y[mask] + eps)
     
     # Top face (+Z)
     mask = (abs_z == max_comp) & (z > 0)
     face_idx[mask] = 4
-    u_coords[mask] = x[mask] / z[mask]
-    v_coords[mask] = y[mask] / z[mask]
+    u_coords[mask] = x[mask] / (z[mask] + eps)
+    v_coords[mask] = y[mask] / (z[mask] + eps)
     
     # Bottom face (-Z)
     mask = (abs_z == max_comp) & (z <= 0)
     face_idx[mask] = 5
-    u_coords[mask] = x[mask] / -z[mask]
-    v_coords[mask] = -y[mask] / -z[mask]
+    u_coords[mask] = x[mask] / (-z[mask] + eps)
+    v_coords[mask] = -y[mask] / (-z[mask] + eps)
     
     # Convert to face pixel coordinates
     u_coords = (u_coords + 1) * 0.5 * (face_size - 1)
@@ -427,15 +466,20 @@ def cubemap_to_equirect(cube_faces, height, width):
     u_coords = np.clip(u_coords, 0, face_size - 1)
     v_coords = np.clip(v_coords, 0, face_size - 1)
     
-    # Initialize output
+    # Initialize output and back face mask
     equirect = np.zeros((height, width, 3), dtype=np.uint8)
+    back_mask = np.zeros((height, width), dtype=bool)
+    
+    # Store back face boundary coordinates for special handling
+    back_boundary_x = []
+    back_boundary_y = []
     
     # Process each face
     for f in range(6):
         mask = (face_idx == f)
         if not np.any(mask):
             continue
-            
+        
         # Get coordinates for this face
         u_face = u_coords[mask]
         v_face = v_coords[mask]
@@ -444,9 +488,8 @@ def cubemap_to_equirect(cube_faces, height, width):
         # Get indices in the output image
         y_idx, x_idx = np.where(mask)
         
-        # Sample each color channel
+        # Sample each color channel with bilinear interpolation
         for c in range(3):
-            # Use map_coordinates for efficient interpolation
             sampled = map_coordinates(
                 cube_array[f, :, :, c],
                 coords,
@@ -454,12 +497,267 @@ def cubemap_to_equirect(cube_faces, height, width):
                 mode='nearest'
             )
             equirect[y_idx, x_idx, c] = sampled
+        
+        # Mark back face pixels and identify boundary regions
+        if f == 2:  # Back face
+            back_mask[y_idx, x_idx] = True
+            
+            # Identify pixels at the left and right edges of the back face in equirect
+            edge_width = width // 60  # Adjust based on image width
+            
+            # Find the leftmost and rightmost columns of the back face in equirect
+            unique_x = np.unique(x_idx)
+            if len(unique_x) > 0:
+                left_edge = unique_x[0]
+                right_edge = unique_x[-1]
+                
+                # Store coordinates of boundary pixels (within edge_width)
+                for i in range(len(y_idx)):
+                    if x_idx[i] < left_edge + edge_width or x_idx[i] > right_edge - edge_width:
+                        back_boundary_x.append(x_idx[i])
+                        back_boundary_y.append(y_idx[i])
+    
+    # Special handling for back face boundaries in equirectangular image
+    if len(back_boundary_x) > 0:
+        # Convert to numpy arrays for indexing
+        back_boundary_x = np.array(back_boundary_x)
+        back_boundary_y = np.array(back_boundary_y)
+        
+        # Apply a specialized filtering only to boundary regions
+        # We'll use a bilateral filter to preserve edges while smoothing artifacts
+        boundary_region = equirect[back_boundary_y, back_boundary_x].copy()
+        
+        # Create a temporary image for bilateral filtering
+        temp_img = equirect.copy()
+        temp_filtered = cv2.bilateralFilter(temp_img, d=5, sigmaColor=25, sigmaSpace=25)
+        
+        # Replace only the boundary pixels with filtered versions
+        equirect[back_boundary_y, back_boundary_x] = temp_filtered[back_boundary_y, back_boundary_x]
+    
+    # Handle the poles (top and bottom of equirectangular image)
+    # These regions often contain distortions
+    pole_height = height // 20  # Adjust based on image height
+    
+    # Top pole
+    top_pole = np.zeros((pole_height, width, 3), dtype=np.uint8)
+    for x in range(width):
+        # Average color of top few rows
+        avg_color = np.mean(equirect[pole_height:pole_height*2, x], axis=0).astype(np.uint8)
+        top_pole[:, x] = avg_color
+    
+    # Apply a circular blur to smooth the pole
+    top_pole = cv2.GaussianBlur(top_pole, (5, 5), 0)
+    
+    # Apply a gradual blend to the top
+    for y in range(pole_height):
+        blend_factor = y / pole_height
+        equirect[y, :] = (1 - blend_factor) * top_pole[y, :] + blend_factor * equirect[y, :]
+    
+    # Similarly for bottom pole
+    bottom_pole = np.zeros((pole_height, width, 3), dtype=np.uint8)
+    for x in range(width):
+        avg_color = np.mean(equirect[height-pole_height*2:height-pole_height, x], axis=0).astype(np.uint8)
+        bottom_pole[:, x] = avg_color
+    
+    bottom_pole = cv2.GaussianBlur(bottom_pole, (5, 5), 0)
+    
+    for y in range(pole_height):
+        blend_factor = (pole_height - y - 1) / pole_height
+        equirect[height-pole_height+y, :] = (1 - blend_factor) * bottom_pole[y, :] + blend_factor * equirect[height-pole_height+y, :]
+    
+    # Handle equirectangular left and right edges (wrap-around seam)
+    # This is especially important for the back face
+    edge_width = width // 60
+    
+    # Create left and right edge masks
+    left_edge_mask = np.zeros((height, width), dtype=bool)
+    right_edge_mask = np.zeros((height, width), dtype=bool)
+    left_edge_mask[:, :edge_width] = True
+    right_edge_mask[:, width-edge_width:] = True
+    
+    # Apply a specialized edge blend
+    if np.any(left_edge_mask) and np.any(right_edge_mask):
+        # Create a blended edge using data from both sides
+        for y in range(height):
+            # Get colors from both edges
+            left_colors = equirect[y, :edge_width].copy()
+            right_colors = equirect[y, width-edge_width:].copy()
+            
+            # Apply a gradual blend
+            for x in range(edge_width):
+                # Weight increases from left to right edge
+                weight = x / (edge_width - 1)
+                
+                # Apply to left edge
+                left_blend = (1 - weight) * left_colors[x] + weight * right_colors[0]
+                equirect[y, x] = left_blend.astype(np.uint8)
+                
+                # Apply to right edge
+                right_blend = weight * left_colors[0] + (1 - weight) * right_colors[x]
+                equirect[y, width-edge_width+x] = right_blend.astype(np.uint8)
+    
+    # Final overall smoothing for equirectangular image
+    # Apply a very subtle bilateral filter for overall consistency
+    # while preserving important details
+    final_equirect = cv2.bilateralFilter(equirect, d=3, sigmaColor=15, sigmaSpace=15)
     
     end_time = time.time()
-    print(f"Optimized cubemap to equirect conversion took {end_time - start_time:.2f} seconds")
+    print(f"Seamless cubemap to equirect conversion took {end_time - start_time:.2f} seconds")
     
-    return equirect
+    return final_equirect
+# --------------------------------------------
 
+def fix_cubemap_back_face(cube_faces):
+    """
+    Fix the back face of a cubemap by completely replacing it with a regenerated version
+    based on the right and left faces.
+    
+    Args:
+        cube_faces: Dictionary of 6 cubemap faces (front, right, back, left, top, bottom)
+    
+    Returns:
+        Updated cube_faces dictionary with fixed back face
+    """
+    import numpy as np
+    import cv2
+    
+    # If it's not a dictionary, convert to one
+    if not isinstance(cube_faces, dict):
+        face_size = cube_faces[0].shape[0]
+        face_dict = {
+            'front': cube_faces[0],
+            'right': cube_faces[1],
+            'back': cube_faces[2],
+            'left': cube_faces[3],
+            'top': cube_faces[4],
+            'bottom': cube_faces[5]
+        }
+        cube_faces = face_dict
+    
+    face_size = cube_faces['front'].shape[0]
+    
+    # Create a new back face from scratch
+    new_back = np.zeros_like(cube_faces['back'])
+    
+    # Create grid for the back face
+    y_coords, x_coords = np.meshgrid(
+        np.arange(face_size), np.arange(face_size), indexing='ij'
+    )
+    
+    # Normalize coordinates to [-1, 1]
+    x_ndc = 2.0 * x_coords / (face_size - 1) - 1.0
+    y_ndc = 2.0 * y_coords / (face_size - 1) - 1.0
+    
+    # For each pixel in the back face, determine where to sample from
+    for y in range(face_size):
+        for x in range(face_size):
+            # Current normalized coordinates
+            x_norm = x_ndc[y, x]
+            y_norm = y_ndc[y, x]
+            
+            # We'll use right face for the left half of back face
+            # and left face for the right half of back face
+            if x_norm < 0:
+                # Sample from right face
+                # Convert back face coordinates to right face coordinates
+                # Back(-1, y, z) -> Right(-y, -1, z)
+                right_x = int((1-y_norm) * 0.5 * (face_size - 1))
+                right_y = int((1+y_norm) * 0.5 * (face_size - 1))
+                
+                # Ensure coordinates are within bounds
+                right_x = max(0, min(face_size-1, right_x))
+                right_y = max(0, min(face_size-1, right_y))
+                
+                new_back[y, x] = cube_faces['right'][right_y, right_x]
+            else:
+                # Sample from left face
+                # Convert back face coordinates to left face coordinates
+                # Back(-1, y, z) -> Left(y, 1, z)
+                left_x = int((1-y_norm) * 0.5 * (face_size - 1))
+                left_y = int((1+y_norm) * 0.5 * (face_size - 1))
+                
+                # Ensure coordinates are within bounds
+                left_x = max(0, min(face_size-1, left_x))
+                left_y = max(0, min(face_size-1, left_y))
+                
+                new_back[y, x] = cube_faces['left'][left_y, left_x]
+    
+    # Apply Gaussian blurring to smooth the boundary between the two halves
+    blurred = cv2.GaussianBlur(new_back, (5, 5), 0)
+    
+    # Create a blend mask that's strongest at the center (where the two halves meet)
+    blend_mask = np.zeros((face_size, 1))
+    center_width = face_size // 4
+    for y in range(face_size):
+        for x in range(max(0, face_size//2 - center_width), min(face_size, face_size//2 + center_width)):
+            # Calculate distance from center line
+            dist = abs(x - face_size//2)
+            # Normalize to [0, 1] and invert so it's 1 at center, 0 at edges
+            weight = 1.0 - dist / center_width
+            blend_mask[y, 0] = max(blend_mask[y, 0], weight)
+    
+    # Apply blend mask
+    for y in range(face_size):
+        for x in range(face_size):
+            weight = blend_mask[y, 0] * 0.8  # 80% blending at maximum
+            new_back[y, x] = (1-weight) * new_back[y, x] + weight * blurred[y, x]
+    
+    # Finally, apply a bilateral filter to preserve edges while reducing noise
+    new_back = cv2.bilateralFilter(new_back, d=5, sigmaColor=50, sigmaSpace=50)
+    
+    # Update the back face
+    cube_faces['back'] = new_back
+    
+    return cube_faces
+
+
+def fix_back_banding(back_face):
+    """
+    Fix horizontal banding artifacts in a cubemap back face.
+    
+    Args:
+        back_face: The back face image with banding artifacts
+    
+    Returns:
+        Fixed back face image
+    """
+    import cv2
+    import numpy as np
+    
+    h, w = back_face.shape[:2]
+    fixed_face = back_face.copy()
+    
+    # 1. Detect horizontal bands by looking for abrupt row-to-row changes
+    row_diffs = np.mean(np.abs(np.diff(back_face, axis=0)), axis=(1, 2))
+    
+    # Identify rows with significant differences (potential bands)
+    threshold = np.percentile(row_diffs, 95)  # Adapt threshold to image content
+    band_rows = np.where(row_diffs > threshold)[0]
+    
+    if len(band_rows) > 0:
+        # 2. For each detected band, apply targeted smoothing
+        for row in band_rows:
+            # Create a neighborhood for smoothing (5 rows above and below)
+            start = max(0, row - 5)
+            end = min(h - 1, row + 6)
+            
+            # Apply horizontal-only median filter to the region
+            region = fixed_face[start:end, :, :]
+            for c in range(3):
+                for y in range(region.shape[0]):
+                    # Apply median filter along horizontal direction
+                    region[y, :, c] = cv2.medianBlur(region[y, :, c].reshape(-1, 1), 5).reshape(-1)
+            
+            fixed_face[start:end, :, :] = region
+    
+    # 3. Apply a bilateral filter to maintain edges while smoothing noise
+    fixed_face = cv2.bilateralFilter(fixed_face, d=5, sigmaColor=50, sigmaSpace=50)
+    
+    # 4. Apply a second pass of bilateral filtering with different parameters
+    fixed_face = cv2.bilateralFilter(fixed_face, d=9, sigmaColor=75, sigmaSpace=75)
+    
+    return fixed_face
+    
 
 # Fix for generating the proper cubemap layout where back is connected to top vertically
 def create_cubemap_layout(cube_faces, with_labels=True):
