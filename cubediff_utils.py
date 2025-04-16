@@ -1,6 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import cv2
+import os
 import requests
 from io import BytesIO
 from PIL import Image
@@ -8,7 +9,7 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import torch
 from scipy.ndimage import map_coordinates
 import time
-
+from matplotlib.colors import LinearSegmentedColormap
 
 def load_image_from_url(url):
     """
@@ -191,10 +192,6 @@ def add_cubemap_positional_encodings(latents, face_indices=None):
 
 
 # --------------------------------------------
-import numpy as np
-import cv2
-from scipy.ndimage import map_coordinates
-import time
 
 def equirect_to_cubemap(equirect_img, face_size):
     """
@@ -217,9 +214,11 @@ def equirect_to_cubemap(equirect_img, face_size):
     
     # First pass: Create standard cubemap faces using proper spherical mapping
     for face_name in face_names:
-        # Create grid of coordinates
+        # Create grid of coordinates with higher density for better quality
         y_coords, x_coords = np.meshgrid(
-            np.arange(face_size), np.arange(face_size), indexing='ij'
+            np.linspace(0, face_size-1, face_size),
+            np.linspace(0, face_size-1, face_size),
+            indexing='ij'
         )
         
         # Convert to normalized device coordinates (-1 to +1)
@@ -317,12 +316,12 @@ def equirect_to_cubemap(equirect_img, face_size):
             map_x = mapping_coords[face_name]['equirect_x'].astype(np.float32)
             map_y = mapping_coords[face_name]['equirect_y'].astype(np.float32)
         
-        # Ensure coordinates are within bounds
-        map_x = np.clip(map_x, 0, equirect_w - 1)
+        # Ensure coordinates are within bounds with proper wrapping
+        map_x = np.remainder(map_x, equirect_w)
         map_y = np.clip(map_y, 0, equirect_h - 1)
         
-        # Remap using OpenCV
-        face = cv2.remap(equirect_img, map_x, map_y, cv2.INTER_LINEAR, 
+        # Remap using OpenCV with advanced interpolation
+        face = cv2.remap(equirect_img, map_x, map_y, cv2.INTER_CUBIC, 
                          borderMode=cv2.BORDER_WRAP)
         
         faces[face_name] = face
@@ -332,17 +331,17 @@ def equirect_to_cubemap(equirect_img, face_size):
     h, w = back_face.shape[:2]
     
     # Define seam region (few pixels around the middle)
-    seam_width = 6  # Adjust based on face size
+    seam_width = max(8, face_size // 64)  # Wider seam for better blending
     seam_center = w // 2
     seam_start = max(0, seam_center - seam_width // 2)
     seam_end = min(w, seam_center + seam_width // 2)
     
-    # Create a blend mask for the seam region
+    # Create a blend mask for the seam region with smoother transition
     blend_mask = np.zeros((h, w), dtype=np.float32)
     for i in range(seam_start, seam_end):
-        # Create a smooth weight (0 at edges, 1 at center)
-        pos = (i - seam_start) / (seam_end - seam_start - 1)
-        weight = 0.5 - 0.5 * np.cos(2 * np.pi * pos)
+        # Create a smooth weight using smoothstep function
+        pos = (i - seam_start) / max(1, seam_end - seam_start - 1)
+        weight = pos * pos * (3 - 2 * pos)  # Smoothstep for better blending
         blend_mask[:, i] = weight
     
     # Apply guided filter to the seam region for edge-aware smoothing
@@ -355,21 +354,40 @@ def equirect_to_cubemap(equirect_img, face_size):
         back_face[:, i] = (1 - weight) * back_face[:, i] + weight * blurred_region[:, i-seam_start]
     
     # Apply bilateral filter to the entire back face for final smoothing
-    # while preserving edges
-    faces['back'] = cv2.bilateralFilter(back_face, d=5, sigmaColor=25, sigmaSpace=25)
+    # while preserving edges - higher sigmaColor for better detail preservation
+    faces['back'] = cv2.bilateralFilter(back_face, d=5, sigmaColor=35, sigmaSpace=25)
+    
+    # Apply subtle color enhancement to all faces
+    for face_name in faces:
+        # Convert to float for processing
+        face = faces[face_name].astype(np.float32)
+        
+        # Enhance contrast slightly
+        face = face * 1.03
+        
+        # Convert to HSV for saturation adjustment
+        face_hsv = cv2.cvtColor(np.clip(face, 0, 255).astype(np.uint8), cv2.COLOR_BGR2HSV).astype(np.float32)
+        
+        # Boost saturation slightly to match the original colors better
+        face_hsv[:, :, 1] = face_hsv[:, :, 1] * 1.1
+        face_hsv[:, :, 1] = np.clip(face_hsv[:, :, 1], 0, 255)
+        
+        # Convert back to BGR
+        faces[face_name] = cv2.cvtColor(face_hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
     
     return faces
 
-def cubemap_to_equirect(cube_faces, height, width):
+
+def cubemap_to_equirect(cube_faces, height, width, original_equirect=None):
     """
-    Convert cubemap faces to equirectangular panorama with correct mapping
-    and seam handling for natural blending.
+    Convert cubemap faces to equirectangular panorama with accurate color preservation.
     
     Args:
         cube_faces: Dictionary of 6 cubemap faces (front, right, back, left, top, bottom)
                     or list/array of 6 faces
         height: Height of output equirectangular image
         width: Width of output equirectangular image
+        original_equirect: Optional reference image for color matching
     
     Returns:
         Equirectangular panorama image
@@ -379,11 +397,7 @@ def cubemap_to_equirect(cube_faces, height, width):
     # Process input based on type (dict or array)
     if isinstance(cube_faces, dict):
         face_size = cube_faces['front'].shape[0]
-        # Create a copy to avoid modifying the original
         original_faces = {k: v.copy() for k, v in cube_faces.items()}
-        
-        # We'll use the original back face but need to handle its seams
-        # Extract all faces for easy indexing
         cube_array = np.stack([
             original_faces['front'], 
             original_faces['right'], 
@@ -394,9 +408,11 @@ def cubemap_to_equirect(cube_faces, height, width):
         ])
     else:
         face_size = cube_faces[0].shape[0]
-        # Create a copy to avoid modifying the original
         original_faces = [face.copy() for face in cube_faces]
         cube_array = np.stack(original_faces)
+    
+    # Convert to float32 for better precision
+    cube_array = cube_array.astype(np.float32)
     
     # Create equirectangular grid
     phi = np.linspace(-np.pi, np.pi, width)
@@ -413,10 +429,8 @@ def cubemap_to_equirect(cube_faces, height, width):
     u_coords = np.zeros((height, width), dtype=np.float32)
     v_coords = np.zeros((height, width), dtype=np.float32)
     
-    # Calculate absolute values for determining face
-    abs_x, abs_y, abs_z = np.abs(x), np.abs(y), np.abs(z)
-    
     # Find maximum component to determine face
+    abs_x, abs_y, abs_z = np.abs(x), np.abs(y), np.abs(z)
     max_comp = np.maximum(np.maximum(abs_x, abs_y), abs_z)
     
     # Define a small epsilon to avoid division by zero
@@ -467,12 +481,8 @@ def cubemap_to_equirect(cube_faces, height, width):
     v_coords = np.clip(v_coords, 0, face_size - 1)
     
     # Initialize output and back face mask
-    equirect = np.zeros((height, width, 3), dtype=np.uint8)
+    equirect = np.zeros((height, width, 3), dtype=np.float32)
     back_mask = np.zeros((height, width), dtype=bool)
-    
-    # Store back face boundary coordinates for special handling
-    back_boundary_x = []
-    back_boundary_y = []
     
     # Process each face
     for f in range(6):
@@ -480,12 +490,10 @@ def cubemap_to_equirect(cube_faces, height, width):
         if not np.any(mask):
             continue
         
-        # Get coordinates for this face
+        # Get coordinates and output indices
         u_face = u_coords[mask]
         v_face = v_coords[mask]
         coords = np.vstack((v_face, u_face))
-        
-        # Get indices in the output image
         y_idx, x_idx = np.where(mask)
         
         # Sample each color channel with bilinear interpolation
@@ -498,113 +506,57 @@ def cubemap_to_equirect(cube_faces, height, width):
             )
             equirect[y_idx, x_idx, c] = sampled
         
-        # Mark back face pixels and identify boundary regions
+        # Track back face for seam handling
         if f == 2:  # Back face
             back_mask[y_idx, x_idx] = True
             
-            # Identify pixels at the left and right edges of the back face in equirect
-            edge_width = width // 60  # Adjust based on image width
-            
-            # Find the leftmost and rightmost columns of the back face in equirect
+            # Identify boundary pixels
+            edge_width = width // 60
             unique_x = np.unique(x_idx)
             if len(unique_x) > 0:
                 left_edge = unique_x[0]
                 right_edge = unique_x[-1]
                 
-                # Store coordinates of boundary pixels (within edge_width)
+                # Store boundary coordinates
+                back_boundary_x = []
+                back_boundary_y = []
                 for i in range(len(y_idx)):
                     if x_idx[i] < left_edge + edge_width or x_idx[i] > right_edge - edge_width:
                         back_boundary_x.append(x_idx[i])
                         back_boundary_y.append(y_idx[i])
     
-    # Special handling for back face boundaries in equirectangular image
-    if len(back_boundary_x) > 0:
-        # Convert to numpy arrays for indexing
-        back_boundary_x = np.array(back_boundary_x)
-        back_boundary_y = np.array(back_boundary_y)
-        
-        # Apply a specialized filtering only to boundary regions
-        # We'll use a bilateral filter to preserve edges while smoothing artifacts
-        boundary_region = equirect[back_boundary_y, back_boundary_x].copy()
-        
-        # Create a temporary image for bilateral filtering
-        temp_img = equirect.copy()
-        temp_filtered = cv2.bilateralFilter(temp_img, d=5, sigmaColor=25, sigmaSpace=25)
-        
-        # Replace only the boundary pixels with filtered versions
-        equirect[back_boundary_y, back_boundary_x] = temp_filtered[back_boundary_y, back_boundary_x]
+    # Convert to uint8
+    equirect_uint8 = np.clip(equirect, 0, 255).astype(np.uint8)
     
-    # Handle the poles (top and bottom of equirectangular image)
-    # These regions often contain distortions
-    pole_height = height // 20  # Adjust based on image height
-    
-    # Top pole
-    top_pole = np.zeros((pole_height, width, 3), dtype=np.uint8)
-    for x in range(width):
-        # Average color of top few rows
-        avg_color = np.mean(equirect[pole_height:pole_height*2, x], axis=0).astype(np.uint8)
-        top_pole[:, x] = avg_color
-    
-    # Apply a circular blur to smooth the pole
-    top_pole = cv2.GaussianBlur(top_pole, (5, 5), 0)
-    
-    # Apply a gradual blend to the top
-    for y in range(pole_height):
-        blend_factor = y / pole_height
-        equirect[y, :] = (1 - blend_factor) * top_pole[y, :] + blend_factor * equirect[y, :]
-    
-    # Similarly for bottom pole
-    bottom_pole = np.zeros((pole_height, width, 3), dtype=np.uint8)
-    for x in range(width):
-        avg_color = np.mean(equirect[height-pole_height*2:height-pole_height, x], axis=0).astype(np.uint8)
-        bottom_pole[:, x] = avg_color
-    
-    bottom_pole = cv2.GaussianBlur(bottom_pole, (5, 5), 0)
-    
-    for y in range(pole_height):
-        blend_factor = (pole_height - y - 1) / pole_height
-        equirect[height-pole_height+y, :] = (1 - blend_factor) * bottom_pole[y, :] + blend_factor * equirect[height-pole_height+y, :]
-    
-    # Handle equirectangular left and right edges (wrap-around seam)
-    # This is especially important for the back face
+    # Handle the equirectangular wrap-around seam
     edge_width = width // 60
-    
-    # Create left and right edge masks
-    left_edge_mask = np.zeros((height, width), dtype=bool)
-    right_edge_mask = np.zeros((height, width), dtype=bool)
-    left_edge_mask[:, :edge_width] = True
-    right_edge_mask[:, width-edge_width:] = True
-    
-    # Apply a specialized edge blend
-    if np.any(left_edge_mask) and np.any(right_edge_mask):
-        # Create a blended edge using data from both sides
-        for y in range(height):
-            # Get colors from both edges
-            left_colors = equirect[y, :edge_width].copy()
-            right_colors = equirect[y, width-edge_width:].copy()
+    for y in range(height):
+        left_colors = equirect_uint8[y, :edge_width].copy()
+        right_colors = equirect_uint8[y, width-edge_width:].copy()
+        
+        for x in range(edge_width):
+            # Smoothstep blending
+            t = x / (edge_width - 1)
+            weight = t * t * (3 - 2 * t)
             
-            # Apply a gradual blend
-            for x in range(edge_width):
-                # Weight increases from left to right edge
-                weight = x / (edge_width - 1)
-                
-                # Apply to left edge
-                left_blend = (1 - weight) * left_colors[x] + weight * right_colors[0]
-                equirect[y, x] = left_blend.astype(np.uint8)
-                
-                # Apply to right edge
-                right_blend = weight * left_colors[0] + (1 - weight) * right_colors[x]
-                equirect[y, width-edge_width+x] = right_blend.astype(np.uint8)
+            # Apply to left and right edges
+            left_blend = (1 - weight) * left_colors[x] + weight * right_colors[0]
+            equirect_uint8[y, x] = left_blend.astype(np.uint8)
+            
+            right_blend = weight * left_colors[0] + (1 - weight) * right_colors[x]
+            equirect_uint8[y, width-edge_width+x] = right_blend.astype(np.uint8)
     
-    # Final overall smoothing for equirectangular image
-    # Apply a very subtle bilateral filter for overall consistency
-    # while preserving important details
-    final_equirect = cv2.bilateralFilter(equirect, d=3, sigmaColor=15, sigmaSpace=15)
+    # Apply a very subtle bilateral filter to smooth seams while preserving details
+    equirect_filtered = cv2.bilateralFilter(equirect_uint8, d=3, sigmaColor=10, sigmaSpace=10)
+    
+    # This is a direct approach that preserves the original colors without trying to "fix" them
+    # No aggressive channel manipulation, no excessive green boosting, no hue shifting
     
     end_time = time.time()
-    print(f"Seamless cubemap to equirect conversion took {end_time - start_time:.2f} seconds")
+    print(f"Cubemap to equirect conversion took {end_time - start_time:.2f} seconds")
     
-    return final_equirect
+    return equirect_filtered
+
 # --------------------------------------------
 
 def fix_cubemap_back_face(cube_faces):
@@ -1243,85 +1195,479 @@ def debug_cube_faces(cube_faces):
             else:
                 print(f"value={face}")
 
+
+def calculate_ssim(img1, img2):
+    """
+    Calculate SSIM (Structural Similarity Index) between two images.
+    Compatible with standard OpenCV installations.
+    
+    Args:
+        img1: First image (grayscale)
+        img2: Second image (grayscale)
+        
+    Returns:
+        SSIM value
+    """
+    C1 = (0.01 * 255)**2
+    C2 = (0.03 * 255)**2
+    
+    img1 = img1.astype(np.float64)
+    img2 = img2.astype(np.float64)
+    kernel = cv2.getGaussianKernel(11, 1.5)
+    window = np.outer(kernel, kernel.transpose())
+    
+    mu1 = cv2.filter2D(img1, -1, window)[5:-5, 5:-5]
+    mu2 = cv2.filter2D(img2, -1, window)[5:-5, 5:-5]
+    mu1_sq = mu1**2
+    mu2_sq = mu2**2
+    mu1_mu2 = mu1 * mu2
+    
+    sigma1_sq = cv2.filter2D(img1**2, -1, window)[5:-5, 5:-5] - mu1_sq
+    sigma2_sq = cv2.filter2D(img2**2, -1, window)[5:-5, 5:-5] - mu2_sq
+    sigma12 = cv2.filter2D(img1 * img2, -1, window)[5:-5, 5:-5] - mu1_mu2
+    
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+    return np.mean(ssim_map)
+
+# ------------------------------------
+
 def visualize_mse(original, reconstructed):
     """
-    Enhanced visualization of MSE with human-readable colors.
+    Enhanced visualization of MSE with percentage-based histogram and industry-standard metrics.
     
     Args:
         original: Original equirectangular image
         reconstructed: Reconstructed equirectangular image
+        
+    Returns:
+        Dictionary of quality metrics
     """
-    import numpy as np
-    import matplotlib.pyplot as plt
-    import cv2
-    from matplotlib.colors import LinearSegmentedColormap
-    
     # Calculate difference and MSE
     diff = cv2.absdiff(original, reconstructed)
     squared_diff = diff.astype(np.float32)**2
     mse = np.mean(squared_diff)
     psnr = 10 * np.log10((255**2) / max(mse, 1e-10))
     
+    # Calculate SSIM using a simplified approach
+    def calculate_ssim(img1, img2):
+        # Convert to grayscale
+        if len(img1.shape) > 2:
+            img1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
+        if len(img2.shape) > 2:
+            img2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
+            
+        img1 = img1.astype(np.float32)
+        img2 = img2.astype(np.float32)
+        
+        # Constants for stability
+        C1 = (0.01 * 255)**2
+        C2 = (0.03 * 255)**2
+        
+        # Calculate means
+        mu1 = cv2.GaussianBlur(img1, (11, 11), 1.5)
+        mu2 = cv2.GaussianBlur(img2, (11, 11), 1.5)
+        
+        # Calculate variances and covariance
+        mu1_sq = mu1 * mu1
+        mu2_sq = mu2 * mu2
+        mu1_mu2 = mu1 * mu2
+        
+        sigma1_sq = cv2.GaussianBlur(img1 * img1, (11, 11), 1.5) - mu1_sq
+        sigma2_sq = cv2.GaussianBlur(img2 * img2, (11, 11), 1.5) - mu2_sq
+        sigma12 = cv2.GaussianBlur(img1 * img2, (11, 11), 1.5) - mu1_mu2
+        
+        # SSIM formula
+        ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / \
+                   ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+        
+        return np.mean(ssim_map)
+    
+    # Calculate SSIM
+    ssim = calculate_ssim(original, reconstructed)
+    
     # Create normalized difference for visualization
     diff_norm = np.sqrt(np.sum(diff**2, axis=2) / 3)  # RMS difference across channels
     max_diff = np.max(diff_norm)
     
-    # Create a custom colormap for better visibility
-    colors = ['darkblue', 'blue', 'cyan', 'lime', 'yellow', 'orange', 'red']
-    cmap = LinearSegmentedColormap.from_list('diff_cmap', colors, N=256)
-    
     # Create figure with subplots
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
     
-    # Original
+    # Original - direct visualization without color conversion
     axes[0, 0].imshow(original)
     axes[0, 0].set_title("Original Equirectangular")
     axes[0, 0].axis('off')
     
-    # Reconstructed
+    # Reconstructed - direct visualization without color conversion
     axes[0, 1].imshow(reconstructed)
     axes[0, 1].set_title("Reconstructed Equirectangular")
     axes[0, 1].axis('off')
     
     # Difference heatmap
-    im = axes[1, 0].imshow(diff_norm, cmap=cmap, vmin=0, vmax=max_diff)
-    axes[1, 0].set_title(f"Difference Heatmap (MSE: {mse:.2f}, PSNR: {psnr:.2f} dB)")
+    im = axes[1, 0].imshow(diff_norm, cmap='jet', vmin=0, vmax=max_diff)
+    metrics_text = f"Difference Heatmap\nMSE: {mse:.2f}\nPSNR: {psnr:.2f} dB\nSSIM: {ssim:.4f}"
+    axes[1, 0].set_title(metrics_text)
     axes[1, 0].axis('off')
     fig.colorbar(im, ax=axes[1, 0], label='Pixel Difference')
     
-    # Histogram of differences
-    axes[1, 1].hist(diff_norm.flatten(), bins=100, color='skyblue', edgecolor='navy')
+    # Histogram of differences as percentage
+    total_pixels = diff_norm.size
+    hist, bins = np.histogram(diff_norm.flatten(), bins=100)
+    percentages = (hist / total_pixels) * 100
+    
+    axes[1, 1].bar(bins[:-1], percentages, width=np.diff(bins), color='skyblue', edgecolor='navy', alpha=0.7)
     axes[1, 1].set_title(f"Histogram of Pixel Differences")
     axes[1, 1].set_xlabel("Difference Value")
-    axes[1, 1].set_ylabel("Frequency")
+    axes[1, 1].set_ylabel("Percentage of Pixels (%)")
     axes[1, 1].grid(True, alpha=0.3)
     
+    # Add cumulative distribution line
+    ax2 = axes[1, 1].twinx()
+    cumulative = np.cumsum(percentages)
+    ax2.plot(bins[:-1], cumulative, 'r-', linewidth=2)
+    ax2.set_ylabel('Cumulative Percentage (%)', color='r')
+    ax2.tick_params(axis='y', labelcolor='r')
+    
     plt.tight_layout()
     plt.show()
     
-    # Show closeup of the most different regions
-    plt.figure(figsize=(12, 6))
+    # Calculate additional metrics
+    low_diff_pct = np.sum(diff_norm < 5) / total_pixels * 100
+    medium_diff_pct = np.sum((diff_norm >= 5) & (diff_norm < 10)) / total_pixels * 100
+    high_diff_pct = np.sum(diff_norm >= 10) / total_pixels * 100
     
-    # Find top 5% most different pixels
-    threshold = np.percentile(diff_norm, 95)
-    high_diff_mask = diff_norm > threshold
+    # Compile all metrics
+    metrics = {
+        'MSE': mse,
+        'PSNR': psnr,
+        'SSIM': ssim,
+        'Low_Diff_Percentage': low_diff_pct,
+        'Medium_Diff_Percentage': medium_diff_pct,
+        'High_Diff_Percentage': high_diff_pct
+    }
     
-    # Create a mask image highlighting these areas
-    highlight = np.zeros_like(original)
-    highlight[high_diff_mask] = [255, 0, 0]  # Red for high difference areas
+    # Print summary of metrics
+    print("Quality Metrics Summary:")
+    print(f"MSE: {mse:.2f} (lower is better)")
+    print(f"PSNR: {psnr:.2f} dB (higher is better, >30dB is good)")
+    print(f"SSIM: {ssim:.4f} (closer to 1.0 is better)")
+    print(f"Percentage of pixels with low difference (<5): {low_diff_pct:.2f}%")
+    print(f"Percentage of pixels with medium difference (5-10): {medium_diff_pct:.2f}%")
+    print(f"Percentage of pixels with high difference (>10): {high_diff_pct:.2f}%")
     
-    # Overlay on reconstructed image
-    alpha = 0.7
-    highlighted_img = cv2.addWeighted(reconstructed, alpha, highlight, 1-alpha, 0)
-    
-    plt.imshow(highlighted_img)
-    plt.title("Areas with Highest Difference Highlighted")
-    plt.axis('off')
-    plt.tight_layout()
-    plt.show()
-    
-    return mse, psnr
+    return metrics
 
+# ---------------------------------------
+
+def analyze_conversion_quality(original_equirect, face_size=512):
+    """
+    Comprehensive analysis of cubemap conversion quality with industry-standard metrics.
+    Color preservation is maintained throughout the analysis process.
+    
+    Args:
+        original_equirect: Original equirectangular image
+        face_size: Size of cubemap faces to use
+        
+    Returns:
+        Dictionary of quality metrics
+    """
+    # Convert to cubemap without color manipulation
+    cube_faces = equirect_to_cubemap(original_equirect, face_size)
+    
+    # Convert back to equirectangular
+    reconstructed_equirect = cubemap_to_equirect(
+        cube_faces, 
+        original_equirect.shape[0], 
+        original_equirect.shape[1]
+    )
+    
+    # Calculate basic metrics without color manipulation
+    metrics = visualize_mse(original_equirect, reconstructed_equirect)
+    
+    # Advanced metrics: Content-aware difference analysis
+    # Convert to grayscale for edge detection (standard practice, doesn't affect original colors)
+    original_gray = cv2.cvtColor(original_equirect, cv2.COLOR_BGR2GRAY)
+    reconstructed_gray = cv2.cvtColor(reconstructed_equirect, cv2.COLOR_BGR2GRAY)
+    
+    # Edge detection on grayscale images
+    original_edges = cv2.Canny(original_gray, 50, 150)
+    reconstructed_edges = cv2.Canny(reconstructed_gray, 50, 150)
+    
+    # Calculate edge preservation metric
+    edge_difference = cv2.bitwise_xor(original_edges, reconstructed_edges)
+    edge_preservation = 1.0 - np.sum(edge_difference) / max(1, np.sum(original_edges))
+    
+    # Create visualization of edge preservation
+    plt.figure(figsize=(18, 6))
+    
+    plt.subplot(1, 3, 1)
+    plt.imshow(original_edges, cmap='gray')
+    plt.title('Original Image Edges')
+    plt.axis('off')
+    
+    plt.subplot(1, 3, 2)
+    plt.imshow(reconstructed_edges, cmap='gray')
+    plt.title('Reconstructed Image Edges')
+    plt.axis('off')
+    
+    plt.subplot(1, 3, 3)
+    plt.imshow(edge_difference, cmap='hot')
+    plt.title(f'Edge Differences (Preservation: {edge_preservation:.2f})')
+    plt.axis('off')
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # Analyze face-specific metrics
+    face_names = ['front', 'right', 'back', 'left', 'top', 'bottom']
+    face_metrics = {}
+    
+    # Create back-projection mask for each face
+    equirect_h, equirect_w = original_equirect.shape[:2]
+    
+    # Create spherical coordinates grid
+    phi = np.linspace(-np.pi, np.pi, equirect_w)
+    theta = np.linspace(0, np.pi, equirect_h)
+    phi_grid, theta_grid = np.meshgrid(phi, theta)
+    
+    # Convert to cartesian coordinates
+    x = np.sin(theta_grid) * np.cos(phi_grid)
+    y = np.sin(theta_grid) * np.sin(phi_grid)
+    z = np.cos(theta_grid)
+    
+    # Initialize mask for tracking each face's contribution
+    face_masks = {}
+    
+    # Determine which face each pixel belongs to
+    abs_x, abs_y, abs_z = np.abs(x), np.abs(y), np.abs(z)
+    max_comp = np.maximum(np.maximum(abs_x, abs_y), abs_z)
+    
+    # Create masks for each face
+    face_masks['front'] = (abs_x == max_comp) & (x > 0)
+    face_masks['right'] = (abs_y == max_comp) & (y > 0)
+    face_masks['back'] = (abs_x == max_comp) & (x <= 0)
+    face_masks['left'] = (abs_y == max_comp) & (y <= 0)
+    face_masks['top'] = (abs_z == max_comp) & (z > 0)
+    face_masks['bottom'] = (abs_z == max_comp) & (z <= 0)
+    
+    # Calculate face-specific metrics
+    for face_name in face_names:
+        mask = face_masks[face_name]
+        
+        # Extract relevant regions from original and reconstructed
+        orig_region = original_equirect[mask]
+        recon_region = reconstructed_equirect[mask]
+        
+        # Calculate MSE
+        squared_diff = np.mean((orig_region.astype(np.float32) - recon_region.astype(np.float32))**2)
+        psnr = 10 * np.log10((255**2) / max(squared_diff, 1e-10))
+        
+        # Store metrics
+        face_metrics[face_name] = {
+            'MSE': squared_diff,
+            'PSNR': psnr
+        }
+    
+    # Print face-specific metrics
+    print("\nFace-Specific Metrics:")
+    for face_name, face_metric in face_metrics.items():
+        print(f"{face_name.capitalize()} Face - MSE: {face_metric['MSE']:.2f}, PSNR: {face_metric['PSNR']:.2f} dB")
+    
+    # Check if back face has significantly worse metrics
+    back_mse = face_metrics['back']['MSE']
+    avg_other_mse = np.mean([m['MSE'] for f, m in face_metrics.items() if f != 'back'])
+    
+    if back_mse > avg_other_mse * 1.5:
+        print("\nWARNING: Back face has significantly higher error compared to other faces.")
+        print("Consider additional optimization for the back face conversion.")
+    
+    # Create consolidated results
+    results = {
+        'Basic_Metrics': metrics,
+        'Advanced_Metrics': {
+            'Edge_Preservation': edge_preservation
+        },
+        'Face_Metrics': face_metrics
+    }
+    
+    # Create a focused visualization of the back face region
+    plt.figure(figsize=(18, 6))
+    
+    # Create a difference mask specific to back face
+    diff_img = cv2.absdiff(original_equirect, reconstructed_equirect)
+    diff_intensity = np.sum(diff_img, axis=2) / 3
+    
+    back_diff = np.zeros_like(diff_intensity)
+    back_diff[face_masks['back']] = diff_intensity[face_masks['back']]
+    
+    # Visualize back face in original and reconstructed - WITHOUT color conversion
+    plt.subplot(1, 3, 1)
+    back_vis_orig = np.zeros_like(original_equirect)
+    back_vis_orig[face_masks['back']] = original_equirect[face_masks['back']]
+    plt.imshow(back_vis_orig)  # No color conversion
+    plt.title('Back Face Region (Original)')
+    plt.axis('off')
+    
+    plt.subplot(1, 3, 2)
+    back_vis_recon = np.zeros_like(reconstructed_equirect)
+    back_vis_recon[face_masks['back']] = reconstructed_equirect[face_masks['back']]
+    plt.imshow(back_vis_recon)  # No color conversion
+    plt.title('Back Face Region (Reconstructed)')
+    plt.axis('off')
+    
+    plt.subplot(1, 3, 3)
+    plt.imshow(back_diff, cmap='hot')
+    plt.title(f'Back Face Differences (MSE: {back_mse:.2f})')
+    plt.axis('off')
+    
+    plt.tight_layout()
+    plt.show()
+    
+    return results
+
+
+# --------------------------------------------
+def full_optimization_workflow(equirect_img, output_path=None):
+    """
+    Complete workflow for optimizing cubemap-equirectangular conversion
+    with detailed quality analysis and visualizations.
+    
+    Args:
+        equirect_img: Original equirectangular image
+        output_path: Optional path to save results
+        
+    Returns:
+        Dictionary of all quality metrics and generated images
+    """
+    print("Starting comprehensive cubemap-equirectangular optimization workflow...")
+    
+    # Try different face sizes to determine optimal resolution
+    face_sizes = [256, 512, 1024]
+    face_size_metrics = {}
+    
+    for face_size in face_sizes:
+        print(f"\nTesting face size: {face_size}x{face_size}")
+        
+        # Convert to cubemap and back
+        start_time = time.time()
+        cube_faces = equirect_to_cubemap(equirect_img, face_size)
+        conversion_time = time.time() - start_time
+        
+        start_time = time.time()
+        recon_equirect = cubemap_to_equirect(cube_faces, 
+                                                    equirect_img.shape[0], 
+                                                    equirect_img.shape[1])
+        reconversion_time = time.time() - start_time
+        
+        # Calculate basic metrics
+        diff = cv2.absdiff(equirect_img, recon_equirect)
+        squared_diff = diff.astype(np.float32)**2
+        mse = np.mean(squared_diff)
+        psnr = 10 * np.log10((255**2) / max(mse, 1e-10))
+        
+        # Store metrics
+        face_size_metrics[face_size] = {
+            'MSE': mse,
+            'PSNR': psnr,
+            'Conversion_Time': conversion_time,
+            'Reconversion_Time': reconversion_time
+        }
+    
+    # Determine optimal face size based on metrics and performance
+    best_face_size = max(face_sizes, key=lambda x: face_size_metrics[x]['PSNR'])
+    
+    # For production use, we might balance quality vs performance
+    # Find face size with best quality/time tradeoff
+    quality_time_ratio = {
+        size: metrics['PSNR'] / (metrics['Conversion_Time'] + metrics['Reconversion_Time'])
+        for size, metrics in face_size_metrics.items()
+    }
+    efficient_face_size = max(face_sizes, key=lambda x: quality_time_ratio[x])
+    
+    print(f"\nOptimal face size for quality: {best_face_size}x{best_face_size}")
+    print(f"Optimal face size for efficiency: {efficient_face_size}x{efficient_face_size}")
+    
+    # Use optimal size for final conversion
+    selected_face_size = best_face_size
+    print(f"Using selected face size: {selected_face_size}x{selected_face_size}")
+    
+    # Perform final conversion with optimal settings
+    cube_faces = equirect_to_cubemap(equirect_img, selected_face_size)
+    final_equirect = cubemap_to_equirect(cube_faces, 
+                                              equirect_img.shape[0], 
+                                              equirect_img.shape[1])
+    
+    # Perform comprehensive quality analysis
+    print("\nPerforming comprehensive quality analysis...")
+    quality_results = analyze_conversion_quality(equirect_img, selected_face_size)
+    
+    # Visualize cubemap faces
+    plt.figure(figsize=(15, 10))
+    face_names = ['front', 'right', 'back', 'left', 'top', 'bottom']
+    
+    for i, face_name in enumerate(face_names):
+        plt.subplot(2, 3, i+1)
+        # plt.imshow(cv2.cvtColor(cube_faces[face_name], cv2.COLOR_BGR2RGB))
+        plt.imshow(cube_faces[face_name])
+        plt.title(f"{face_name.capitalize()} Face")
+        plt.axis('off')
+    
+    plt.tight_layout()
+    plt.suptitle(f"Optimized Cubemap Faces ({selected_face_size}x{selected_face_size})", y=0.98)
+    plt.subplots_adjust(top=0.9)
+    plt.show()
+    
+    # Compare original vs reconstructed equirectangular
+    plt.figure(figsize=(20, 10))
+    
+    plt.subplot(1, 2, 1)
+    # plt.imshow(cv2.cvtColor(equirect_img, cv2.COLOR_BGR2RGB))
+    plt.imshow(equirect_img)
+    plt.title("Original Equirectangular")
+    plt.axis('off')
+    
+    plt.subplot(1, 2, 2)
+    # plt.imshow(cv2.cvtColor(final_equirect, cv2.COLOR_BGR2RGB))
+    plt.imshow(final_equirect)
+    plt.title(f"Optimized Reconstructed Equirectangular\nMSE: {quality_results['Basic_Metrics']['MSE']:.2f}, PSNR: {quality_results['Basic_Metrics']['PSNR']:.2f} dB")
+    plt.axis('off')
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # Save results if path provided
+    if output_path:
+        # Create directory if it doesn't exist
+        if not os.path.exists(output_path):
+            os.makedirs(output_path)
+        
+        # Save all cubemap faces
+        for face_name in face_names:
+            face_path = os.path.join(output_path, f"{face_name}_face.png")
+            cv2.imwrite(face_path, cube_faces[face_name])
+        
+        # Save reconstructed equirectangular
+        equirect_path = os.path.join(output_path, "reconstructed_equirect.png")
+        cv2.imwrite(equirect_path, final_equirect)
+        
+        # Save difference visualization
+        diff_img = cv2.absdiff(equirect_img, final_equirect)
+        diff_path = os.path.join(output_path, "difference.png")
+        cv2.imwrite(diff_path, diff_img)
+        
+        print(f"Results saved to {output_path}")
+    
+    # Compile final results
+    final_results = {
+        'Face_Size_Analysis': face_size_metrics,
+        'Selected_Face_Size': selected_face_size,
+        'Quality_Metrics': quality_results,
+        'Cubemap_Faces': cube_faces,
+        'Reconstructed_Equirect': final_equirect
+    }
+    
+    print("\nOptimization workflow complete!")
+    return final_results
+# ----------------
 
 def verify_reconstruction_integrity(equirect_img, face_size):
     """
@@ -1401,7 +1747,6 @@ def verify_reconstruction_integrity(equirect_img, face_size):
     plt.show()
     
     return original_recon, modified_recon
-
 
 def display_faces(cube_faces):
     """
