@@ -8,8 +8,8 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import torch
 from scipy.ndimage import map_coordinates
 import time
-
 import math
+from skimage.metrics import mean_squared_error, peak_signal_noise_ratio, structural_similarity
 
 def load_image_from_url(url):
     """
@@ -334,186 +334,189 @@ def fix_cubemap_edge_artifacts(cube_faces):
 
     return F
 
-
-def cubemap_to_equirect(cube_faces, H, W):
+def _prepare_lookup(H, W, face_size):
     """
-    1) For each equirect pixel, pick the single best face by dot‐product.
-    2) Sample that face *with BORDER_WRAP* so no black pixels ever appear.
+    Precompute face_map, u_maps, v_maps for an (H,W) pano and
+    cubemap faces of size face_size.
     """
-    # 6 faces in fixed order
-    face_list = ["front","right","back","left","top","bottom"]
-    normals = np.array([
-        [ 0,0, 1],[ 1,0,0],[ 0,0,-1],[-1,0,0],[ 0,1,0],[ 0,-1,0]
-    ],dtype=np.float32)
+    import numpy as np
 
-    face_size = cube_faces["front"].shape[0]
-    F_arr = np.stack([cube_faces[f] for f in face_list], axis=0).astype(np.float32)
-
-    # build ray directions for every equirect pixel
     j,i = np.meshgrid(np.arange(W), np.arange(H))
     lon = (j/(W-1))*2*np.pi - np.pi
     lat = np.pi/2 - (i/(H-1))*np.pi
+
     X = np.sin(lon)*np.cos(lat)
     Y = np.sin(lat)
     Z = np.cos(lon)*np.cos(lat)
     rays = np.stack([X,Y,Z], axis=-1).astype(np.float32)
 
-    # pick face via max(dot)
-    dots = np.stack([(rays*normals[k]).sum(-1) for k in range(6)],axis=0)
-    dots = np.maximum(dots, 0.0)
-    face_map = np.argmax(dots, axis=0)  # (H,W)
+    # face selection by max‐axis rule
+    absv = np.abs(rays)
+    major = np.argmax(absv, axis=-1)
 
-    # precompute UV maps for all faces
+    # build face_map (0..5) same order as normals in your code
+    # 0=right,1=left,2=top,3=bottom,4=front,5=back  (match your pipeline)
+    face_map = np.zeros((H,W), np.int8)
+    face_map[(major==0)&(X>0)] = 0  # right
+    face_map[(major==0)&(X<0)] = 1  # left
+    face_map[(major==1)&(Y>0)] = 2  # top
+    face_map[(major==1)&(Y<0)] = 3  # bottom
+    face_map[(major==2)&(Z>0)] = 4  # front
+    face_map[(major==2)&(Z<0)] = 5  # back
+
+    # precompute u/v for each of the 6 faces
     u_maps, v_maps = [], []
-    for k in range(6):
-        u,v = _face_dir_to_uv(rays, k, face_size)
+    for idx in range(6):
+        u,v = _face_dir_to_uv(rays, idx, face_size)
         u_maps.append(u); v_maps.append(v)
 
-    # sample each face only where it's chosen
-    pano = np.zeros((H,W,3), np.uint8)
-    for k in range(6):
-        mask = (face_map==k)
-        if not mask.any(): 
-            continue
-        samp = cv2.remap(
-            F_arr[k], u_maps[k], v_maps[k],
-            interpolation=cv2.INTER_CUBIC,
-            borderMode=cv2.BORDER_WRAP  # <-- wrap, not constant
-        ).astype(np.uint8)
-        pano[mask] = samp[mask]
-
-    return pano
+    return face_map, u_maps, v_maps
 
 
-def cubemap_to_equirect_from_maps(cube_faces, face_map, u_maps, v_maps):
+def cubemap_to_equirect(cube_faces, H, W, seam_fix=True):
     """
-    Reconstruct strictly by sampling each pixel from its chosen face,
-    using BORDER_WRAP so there are no black border pixels.
+    Drop‑in replacement for your old cubemap_to_equirect.
+    Internally calls the precompute, does a single pass remap with wrap,
+    then optionally smooths seams.
     """
-    H,W = face_map.shape
-    pano = np.zeros((H,W,3), np.uint8)
-    order = ["front","right","back","left","top","bottom"]
+    # 1) precompute maps
+    face_size = cube_faces['front'].shape[0]
+    face_map, u_maps, v_maps = _prepare_lookup(H, W, face_size)
 
-    for k, name in enumerate(order):
-        mask = (face_map==k)
-        if not mask.any(): continue
+    # 2) single‐face remap with wrap
+    import numpy as np, cv2
+    pano = np.zeros((H, W, 3), np.uint8)
+    order = ['right','left','top','bottom','front','back']
+    for k,name in enumerate(order):
+        m = (face_map==k)
+        if not m.any(): continue
         samp = cv2.remap(
             cube_faces[name],
             u_maps[k], v_maps[k],
             interpolation=cv2.INTER_CUBIC,
             borderMode=cv2.BORDER_WRAP
         )
-        pano[mask] = samp[mask]
+        pano[m] = samp[m]
+
+    # 3) optional 1‑px seam fix
+    if seam_fix:
+        mid = H//2
+        seams = np.where(face_map[mid,1:] != face_map[mid,:-1])[0] + 1
+        for j in seams:
+            if 1 <= j < W-1:
+                left  = pano[:, j-1].astype(np.float32)
+                right = pano[:, j+1].astype(np.float32)
+                pano[:,j] = ((left+right)*0.5).astype(np.uint8)
+
     return pano
 
-
-def cubemap_to_equirect(cube_faces, H, W):
-    """
-    Reconstruct an (H×W) equirectangular panorama from 6 cubemap faces
-    with no warnings, no black bars, and seamless blending.
+# def cubemap_to_equirect(cube_faces, H, W):
+#     """
+#     Reconstruct an (H×W) equirectangular panorama from 6 cubemap faces
+#     with no warnings, no black bars, and seamless blending.
     
-    cube_faces: dict with keys
-       'front' (+Z), 'right' (+X), 'back' (-Z),
-       'left' (-X),  'top' (+Y),   'bottom'(-Y)
-    """
-    # 1) build per‐pixel world rays
-    #    i=rows (lat), j=cols (lon)
-    j, i = np.meshgrid(np.arange(W), np.arange(H))
-    lon   = (j/(W-1))*2*np.pi - np.pi
-    lat   =  np.pi/2   - (i/(H-1))*np.pi
-    x = np.sin(lon)*np.cos(lat)
-    y = np.sin(lat)
-    z = np.cos(lon)*np.cos(lat)
+#     cube_faces: dict with keys
+#        'front' (+Z), 'right' (+X), 'back' (-Z),
+#        'left' (-X),  'top' (+Y),   'bottom'(-Y)
+#     """
+#     # 1) build per‐pixel world rays
+#     #    i=rows (lat), j=cols (lon)
+#     j, i = np.meshgrid(np.arange(W), np.arange(H))
+#     lon   = (j/(W-1))*2*np.pi - np.pi
+#     lat   =  np.pi/2   - (i/(H-1))*np.pi
+#     x = np.sin(lon)*np.cos(lat)
+#     y = np.sin(lat)
+#     z = np.cos(lon)*np.cos(lat)
 
-    # 2) decide which axis is “major” at each pixel
-    absx, absy, absz = np.abs(x), np.abs(y), np.abs(z)
-    major = np.argmax(np.stack([absx, absy, absz], axis=-1), axis=-1)
-    # major==0 → X‐face, major==1 → Y‐face, major==2 → Z‐face
+#     # 2) decide which axis is “major” at each pixel
+#     absx, absy, absz = np.abs(x), np.abs(y), np.abs(z)
+#     major = np.argmax(np.stack([absx, absy, absz], axis=-1), axis=-1)
+#     # major==0 → X‐face, major==1 → Y‐face, major==2 → Z‐face
 
-    # 3) allocate output
-    pano = np.zeros((H, W, 3), np.uint8)
-    face_size = cube_faces['front'].shape[0]
+#     # 3) allocate output
+#     pano = np.zeros((H, W, 3), np.uint8)
+#     face_size = cube_faces['front'].shape[0]
 
-    # 4) helper to compute safe u,v for a given face
-    def compute_uv(nx, ny, nd, face_size):
-        """
-        nx,ny = numerators, nd = denominator (can be zero)
-        returns (u,v) in float32 [0…face_size-1], no warnings.
-        """
-        u = np.empty_like(nx, dtype=np.float32)
-        v = np.empty_like(ny, dtype=np.float32)
-        # safe divide (nd==0 → u,v=0)
-        np.divide(nx, nd, out=u, where=(nd!=0))
-        np.divide(ny, nd, out=v, where=(nd!=0))
-        # clamp to [-1,1]
-        np.clip(u, -1, 1, out=u)
-        np.clip(v, -1, 1, out=v)
-        # to pixel coords
-        u = (u + 1)*0.5*(face_size-1)
-        v = (v + 1)*0.5*(face_size-1)
-        return u, v
+#     # 4) helper to compute safe u,v for a given face
+#     def compute_uv(nx, ny, nd, face_size):
+#         """
+#         nx,ny = numerators, nd = denominator (can be zero)
+#         returns (u,v) in float32 [0…face_size-1], no warnings.
+#         """
+#         u = np.empty_like(nx, dtype=np.float32)
+#         v = np.empty_like(ny, dtype=np.float32)
+#         # safe divide (nd==0 → u,v=0)
+#         np.divide(nx, nd, out=u, where=(nd!=0))
+#         np.divide(ny, nd, out=v, where=(nd!=0))
+#         # clamp to [-1,1]
+#         np.clip(u, -1, 1, out=u)
+#         np.clip(v, -1, 1, out=v)
+#         # to pixel coords
+#         u = (u + 1)*0.5*(face_size-1)
+#         v = (v + 1)*0.5*(face_size-1)
+#         return u, v
 
-    # 5) for each of the six logical faces, build a mask & remap
-    #    and fill pano[mask] with that face’s pixels.
-    for face_name in ['right','left','top','bottom','front','back']:
-        if face_name == 'right':
-            mask = (major==0) & (x>0)
-            # +X plane: x = +|x|
-            u, v = compute_uv( -z, -y,  x, face_size)
-        elif face_name == 'left':
-            mask = (major==0) & (x<0)
-            # -X plane: x = -|x|
-            u, v = compute_uv(  z, -y, -x, face_size)
-        elif face_name == 'top':
-            mask = (major==1) & (y>0)
-            # +Y plane
-            u, v = compute_uv(  x,  z,  y, face_size)
-        elif face_name == 'bottom':
-            mask = (major==1) & (y<0)
-            # -Y plane
-            u, v = compute_uv(  x, -z, -y, face_size)
-        elif face_name == 'front':
-            mask = (major==2) & (z>0)
-            # +Z plane
-            u, v = compute_uv(  x, -y,  z, face_size)
-        else:  # back
-            mask = (major==2) & (z<0)
-            # -Z plane
-            u, v = compute_uv( -x, -y, -z, face_size)
+#     # 5) for each of the six logical faces, build a mask & remap
+#     #    and fill pano[mask] with that face’s pixels.
+#     for face_name in ['right','left','top','bottom','front','back']:
+#         if face_name == 'right':
+#             mask = (major==0) & (x>0)
+#             # +X plane: x = +|x|
+#             u, v = compute_uv( -z, -y,  x, face_size)
+#         elif face_name == 'left':
+#             mask = (major==0) & (x<0)
+#             # -X plane: x = -|x|
+#             u, v = compute_uv(  z, -y, -x, face_size)
+#         elif face_name == 'top':
+#             mask = (major==1) & (y>0)
+#             # +Y plane
+#             u, v = compute_uv(  x,  z,  y, face_size)
+#         elif face_name == 'bottom':
+#             mask = (major==1) & (y<0)
+#             # -Y plane
+#             u, v = compute_uv(  x, -z, -y, face_size)
+#         elif face_name == 'front':
+#             mask = (major==2) & (z>0)
+#             # +Z plane
+#             u, v = compute_uv(  x, -y,  z, face_size)
+#         else:  # back
+#             mask = (major==2) & (z<0)
+#             # -Z plane
+#             u, v = compute_uv( -x, -y, -z, face_size)
 
-        if not mask.any():
-            continue
+#         if not mask.any():
+#             continue
 
-        # sample that face everywhere, then mask in only the needed pixels
-        samp = cv2.remap(
-            cube_faces[face_name],
-            u, v,
-            interpolation=cv2.INTER_CUBIC,
-            borderMode=cv2.BORDER_WRAP
-        )
-        pano[mask] = samp[mask]
+#         # sample that face everywhere, then mask in only the needed pixels
+#         samp = cv2.remap(
+#             cube_faces[face_name],
+#             u, v,
+#             interpolation=cv2.INTER_CUBIC,
+#             borderMode=cv2.BORDER_WRAP
+#         )
+#         pano[mask] = samp[mask]
 
-    # 6) erase any single‐column hard seams by averaging neighbors
-    mid = H//2
-    # find seam columns where face‐assign changes 
-    # (i.e. a boundary between two faces)
-    face_map = (
-        (major==0)&(x>0) * 0 + 
-        (major==0)&(x<0) * 1 +
-        (major==1)&(y>0) * 2 +
-        (major==1)&(y<0) * 3 +
-        (major==2)&(z>0) * 4 +
-        (major==2)&(z<0) * 5
-    ).astype(np.int32)
-    seams = np.where(face_map[mid,1:] != face_map[mid,:-1])[0] + 1
-    for j in seams:
-        if 1 <= j < W-1:
-            # column j = average of j–1 and j+1
-            left  = pano[:, j-1].astype(np.float32)
-            right = pano[:, j+1].astype(np.float32)
-            pano[:,j] = ((left + right)*0.5).astype(np.uint8)
+#     # 6) erase any single‐column hard seams by averaging neighbors
+#     mid = H//2
+#     # find seam columns where face‐assign changes 
+#     # (i.e. a boundary between two faces)
+#     face_map = (
+#         (major==0)&(x>0) * 0 + 
+#         (major==0)&(x<0) * 1 +
+#         (major==1)&(y>0) * 2 +
+#         (major==1)&(y<0) * 3 +
+#         (major==2)&(z>0) * 4 +
+#         (major==2)&(z<0) * 5
+#     ).astype(np.int32)
+#     seams = np.where(face_map[mid,1:] != face_map[mid,:-1])[0] + 1
+#     for j in seams:
+#         if 1 <= j < W-1:
+#             # column j = average of j–1 and j+1
+#             left  = pano[:, j-1].astype(np.float32)
+#             right = pano[:, j+1].astype(np.float32)
+#             pano[:,j] = ((left + right)*0.5).astype(np.uint8)
 
-    return pano
+#     return pano
 
 
 def erase_vertical_seams(pano, face_map):
@@ -932,6 +935,64 @@ def diagnose_conversion_issues(original, reconstructed):
     }
     
     return diagnostics
+
+
+
+def compute_metrics(orig, recon):
+    """
+    Compute a suite of quality metrics between two equirectangular panoramas:
+      • MSE              – plain Mean Squared Error
+      • PSNR             – Peak Signal‐to‐Noise Ratio
+      • SSIM             – Structural Similarity Index (windowed)
+      • MSE_spherical    – latitude‐weighted MSE
+      • PSNR_spherical   – PSNR derived from MSE_spherical
+
+    Args:
+      orig:   (H,W,3) uint8 original panorama
+      recon:  (H,W,3) uint8 reconstructed panorama
+
+    Returns:
+      dict with keys ['MSE','PSNR','SSIM','MSE_spherical','PSNR_spherical']
+    """
+    # ensure float32 for calculations
+    orig_f = orig.astype(np.float32)
+    recon_f = recon.astype(np.float32)
+
+    # 1) Classic MSE & PSNR
+    mse = mean_squared_error(orig, recon)
+    psnr = peak_signal_noise_ratio(orig, recon, data_range=255)
+
+    # 2) SSIM (windowed)
+    ssim = structural_similarity(
+        orig, recon,
+        data_range=255,
+        multichannel=True,
+        gaussian_weights=True,
+        sigma=1.5,
+        use_sample_covariance=False
+    )
+
+    # 3) Spherical (latitude‐weighted) MSE & PSNR
+    H, W = orig.shape[:2]
+    # latitude angles from +π/2 (top) to -π/2 (bottom)
+    lats = np.linspace(np.pi/2, -np.pi/2, H)[:,None]
+    weights = np.cos(lats)
+    weights /= weights.sum()
+
+    # per‐pixel squared error (averaged over channels)
+    se = ((orig_f - recon_f)**2).mean(axis=2)  # (H,W)
+    mse_sph = float((weights * se).sum())      # scalar
+
+    psnr_sph = 10 * np.log10((255.0**2) / mse_sph)
+
+    return {
+        'MSE': float(mse),
+        'PSNR': float(psnr),
+        'SSIM': float(ssim),
+        'MSE_spherical': mse_sph,
+        'PSNR_spherical': float(psnr_sph),
+    }
+
 
 # --------------------------------------------
 
