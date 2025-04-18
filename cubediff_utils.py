@@ -221,41 +221,70 @@ def _supersample_pole(face, factor=2):
 #     wy = np.array([w(ty+1), w(ty), w(ty-1), w(ty-2)])
 #     return (wy[:,:,None,None]*wx[:,None,:,None]*patch).sum((0,1))
 
-def _cubic_lerp(face, u, v):
-    """
-    face : H×H×3  uint8
-    u,v  : 1‑D float arrays of same length  (pixel coords inside this face)
 
-    Returns an N×3 uint8 array of sampled colours.
-    """
-    H = face.shape[0]
-    ui0 = np.clip(np.floor(u).astype(np.int32) - 1, 0, H-1)
-    vi0 = np.clip(np.floor(v).astype(np.int32) - 1, 0, H-1)
+# def _cubic_lerp(face, u, v):
+#     """
+#     face : H×H×3  uint8
+#     u,v  : 1‑D float arrays of same length  (pixel coords inside this face)
 
-    # gather 4 rows × 4 cols around each point
-    patch = np.zeros((len(u), 4, 4, 3), dtype=np.float32)
-    for dy in range(4):
-        rows = np.clip(vi0 + dy, 0, H-1)
-        row_pixels = face[rows]
-        for dx in range(4):
-            cols = np.clip(ui0 + dx, 0, H-1)
-            patch[:, dy, dx] = row_pixels[np.arange(len(rows)), cols]
+#     Returns an N×3 uint8 array of sampled colours.
+#     """
+#     H = face.shape[0]
+#     ui0 = np.clip(np.floor(u).astype(np.int32) - 1, 0, H-1)
+#     vi0 = np.clip(np.floor(v).astype(np.int32) - 1, 0, H-1)
 
-    tx = u - (ui0 + 1)
-    ty = v - (vi0 + 1)
+#     # gather 4 rows × 4 cols around each point
+#     patch = np.zeros((len(u), 4, 4, 3), dtype=np.float32)
+#     for dy in range(4):
+#         rows = np.clip(vi0 + dy, 0, H-1)
+#         row_pixels = face[rows]
+#         for dx in range(4):
+#             cols = np.clip(ui0 + dx, 0, H-1)
+#             patch[:, dy, dx] = row_pixels[np.arange(len(rows)), cols]
 
-    def w(t):
-        return ((-0.5*t + 1.5)*t - 1.5)*t + 1   # Catmull–Rom cubic weight
+#     tx = u - (ui0 + 1)
+#     ty = v - (vi0 + 1)
 
-    wx = np.stack([w(tx+1), w(tx), w(tx-1), w(tx-2)], axis=1)  # N×4
-    wy = np.stack([w(ty+1), w(ty), w(ty-1), w(ty-2)], axis=1)  # N×4
+#     def w(t):
+#         return ((-0.5*t + 1.5)*t - 1.5)*t + 1   # Catmull–Rom cubic weight
 
-    # tensor dot: (N×4)·(N×4×4×3)·(N×4)^T  →  N×3
-    interp = (wy[:, :, None, None] *
-              wx[:, None, :, None] *
-              patch).sum(axis=(1,2))
+#     wx = np.stack([w(tx+1), w(tx), w(tx-1), w(tx-2)], axis=1)  # N×4
+#     wy = np.stack([w(ty+1), w(ty), w(ty-1), w(ty-2)], axis=1)  # N×4
 
-    return np.clip(interp, 0, 255).astype(np.uint8)
+#     # tensor dot: (N×4)·(N×4×4×3)·(N×4)^T  →  N×3
+#     interp = (wy[:, :, None, None] *
+#               wx[:, None, :, None] *
+#               patch).sum(axis=(1,2))
+
+#     return np.clip(interp, 0, 255).astype(np.uint8)
+
+# ---------------------------------------------------------------------
+# Equirectangular -> Cubemap  (OpenGL axis convention)
+# ---------------------------------------------------------------------
+def equirect_to_cubemap(equi, face_size):
+    H, W = equi.shape[:2]
+    faces = {}
+    for name in ('front','right','back','left','top','bottom'):
+        u, v = _pixel_grid(face_size)
+        if   name == 'front':   x, y, z =  u,   -v,  1
+        elif name == 'right':   x, y, z =  1,   -v, -u
+        elif name == 'back':    x, y, z = -u,   -v, -1
+        elif name == 'left':    x, y, z = -1,   -v,  u
+        elif name == 'top':     x, y, z =  u,    1,  v
+        elif name == 'bottom':  x, y, z =  u,   -1, -v
+
+        inv = 1./np.sqrt(x*x+y*y+z*z)
+        x*=inv; y*=inv; z*=inv
+        lon = np.arctan2(x, z) + np.pi
+        lat = np.arcsin(y)
+        map_x = (lon/(2*np.pi)*W).astype(np.float32)
+        map_y = ((0.5 - lat/np.pi)*H).astype(np.float32)
+        faces[name] = cv2.remap(equi, map_x, map_y,
+                                interpolation=cv2.INTER_LANCZOS4,
+                                borderMode=cv2.BORDER_WRAP)
+    faces = _blend_seam(faces)
+    faces = _antialias_poles(faces)
+    return faces
 
 
 # ------------------------------------------------------------
@@ -317,44 +346,120 @@ def _cubic_lerp(face, u, v):
 #               'L':'left',  'U':'top',   'D':'bottom'}
 #     return {keymap[k]: (v*255).astype(np.uint8) for k, v in cube.items()}
 
-def equirect_to_cubemap(equi: np.ndarray, face_size: int):
-    H, W = equi.shape[:2]
-    out = {}
-    for name in ('front','right','back','left','top','bottom'):
-        u, v = _grid(face_size)
+# def equirect_to_cubemap(equi: np.ndarray, face_size: int):
+#     H, W = equi.shape[:2]
+#     out = {}
+#     for name in ('front','right','back','left','top','bottom'):
+#         u, v = _grid(face_size)
 
-        if   name == 'front':  x, y, z =  u,   -v,  1
-        elif name == 'right':  x, y, z =  1,   -v, -u
-        elif name == 'back':   x, y, z = -u,   -v, -1
-        elif name == 'left':   x, y, z = -1,   -v,  u
-        elif name == 'top':    x, y, z =  u,    1,  v
-        elif name == 'bottom': x, y, z =  u,   -1, -v
+#         if   name == 'front':  x, y, z =  u,   -v,  1
+#         elif name == 'right':  x, y, z =  1,   -v, -u
+#         elif name == 'back':   x, y, z = -u,   -v, -1
+#         elif name == 'left':   x, y, z = -1,   -v,  u
+#         elif name == 'top':    x, y, z =  u,    1,  v
+#         elif name == 'bottom': x, y, z =  u,   -1, -v
 
-        inv_len = 1./np.sqrt(x*x + y*y + z*z)
-        x *= inv_len; y *= inv_len; z *= inv_len
+#         inv_len = 1./np.sqrt(x*x + y*y + z*z)
+#         x *= inv_len; y *= inv_len; z *= inv_len
 
-        lon = np.arctan2(x, z) + np.pi        # 0…2π
-        lat = np.arcsin(y)                    # -π/2…π/2
+#         lon = np.arctan2(x, z) + np.pi        # 0…2π
+#         lat = np.arcsin(y)                    # -π/2…π/2
 
-        map_x = (lon / (2*np.pi) * W).astype(np.float32)
-        map_y = ((0.5 - lat/np.pi) * H).astype(np.float32)
+#         map_x = (lon / (2*np.pi) * W).astype(np.float32)
+#         map_y = ((0.5 - lat/np.pi) * H).astype(np.float32)
 
-        # out[name] = cv2.remap(equi, map_x, map_y,
-        #                       interpolation=cv2.INTER_LANCZOS4,
-        #                       borderMode=cv2.BORDER_WRAP)
+#         # out[name] = cv2.remap(equi, map_x, map_y,
+#         #                       interpolation=cv2.INTER_LANCZOS4,
+#         #                       borderMode=cv2.BORDER_WRAP)
         
-        face_img = cv2.remap(equi, map_x, map_y,
-                              interpolation=cv2.INTER_LANCZOS4,
-                              borderMode=cv2.BORDER_WRAP)
-        if name in ('top','bottom'):
-             face_img = _supersample_pole(face_img)   # 2× AA
-        out[name] = face_img
+#         face_img = cv2.remap(equi, map_x, map_y,
+#                               interpolation=cv2.INTER_LANCZOS4,
+#                               borderMode=cv2.BORDER_WRAP)
+#         if name in ('top','bottom'):
+#              face_img = _supersample_pole(face_img)   # 2× AA
+#         out[name] = face_img
 
+#     return out
+
+
+def cubemap_to_equirect(cube, H, W):
+    F = cube['front'].shape[0]
+    lon = (np.arange(W)+0.5)/W*2*np.pi - np.pi
+    lat =  np.pi/2 - (np.arange(H)+0.5)/H*np.pi
+    lon, lat = np.meshgrid(lon, lat)
+
+    x = np.sin(lon)*np.cos(lat)
+    y = np.sin(lat)
+    z = np.cos(lon)*np.cos(lat)
+    ax, ay, az = np.abs(x), np.abs(y), np.abs(z)
+
+    face_id = np.empty_like(x, int)
+
+    # dominant‐axis test
+    face_id[(az>=ax)&(az>=ay)&( z>0)] = 0   # front
+    face_id[(ax> az)&(ax>=ay)&( x>0)] = 1   # right
+    face_id[(az>=ax)&(az>=ay)&( z<0)] = 2   # back
+    face_id[(ax> az)&(ax>=ay)&( x<0)] = 3   # left
+    face_id[(ay> ax)&(ay> az)&( y>0)] = 4   # top
+    face_id[(ay> ax)&(ay> az)&( y<0)] = 5   # bottom
+
+    u = np.zeros_like(x, np.float32)
+    v = np.zeros_like(x, np.float32)
+    eps = 1e-8
+    m = face_id==0; u[m]= x[m]/(az[m]+eps); v[m]=-y[m]/(az[m]+eps)
+    m = face_id==1; u[m]=-z[m]/(ax[m]+eps); v[m]=-y[m]/(ax[m]+eps)
+    m = face_id==2; u[m]=-x[m]/(az[m]+eps); v[m]=-y[m]/(az[m]+eps)
+    m = face_id==3; u[m]= z[m]/(ax[m]+eps); v[m]=-y[m]/(ax[m]+eps)
+    m = face_id==4; u[m]= x[m]/(ay[m]+eps); v[m]= z[m]/(ay[m]+eps)
+    m = face_id==5; u[m]= x[m]/(ay[m]+eps); v[m]=-z[m]/(ay[m]+eps)
+
+    u = ((u+1)*0.5*(F-1)).astype(np.float32)
+    v = ((v+1)*0.5*(F-1)).astype(np.float32)
+
+    out = np.zeros((H, W, 3), np.uint8)
+    order = ['front','right','back','left','top','bottom']
+    for fid, name in enumerate(order):
+        m = face_id == fid
+        if not m.any():
+            continue
+        ys, xs = np.where(m)
+        y0,y1 = ys.min(), ys.max()+1
+        x0,x1 = xs.min(), xs.max()+1
+        out[y0:y1, x0:x1] = cv2.remap(
+            cube[name], u[y0:y1, x0:x1], v[y0:y1, x0:x1],
+            interpolation=cv2.INTER_LANCZOS4,
+            borderMode=cv2.BORDER_WRAP)
     return out
 
-# ------------------------------------------------------------
-# Cubemap  ➜  Equirect
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
+def _pixel_grid(n):
+    jj, ii = np.meshgrid(np.arange(n)+0.5,
+                         np.arange(n)+0.5,
+                         indexing='ij')
+    return 2*ii/n - 1, 2*jj/n - 1                 # u, v in [-1,1]
+
+def _blend_seam(cube):
+    """Average first & last two cols of lateral faces for C0 seam."""
+    out = cube.copy()
+    for k in ('front','right','back','left'):
+        f = cube[k].astype(np.float32)
+        f[:, 0:2]  = 0.5*(f[:, 0:2] + f[:, -2:])
+        f[:, -2:]  = f[:, 0:2]
+        out[k] = f.astype(np.uint8)
+    return out
+
+def _antialias_poles(cube, factor=2):
+    """Supersample U/D faces then downsample with box filter."""
+    out = cube.copy()
+    for k in ('top','bottom'):
+        f = cube[k]
+        big = cv2.resize(f, (0,0), fx=factor, fy=factor,
+                         interpolation=cv2.INTER_LANCZOS4)
+        out[k] = cv2.resize(big, f.shape[:2][::-1], interpolation=cv2.INTER_AREA)
+    return out
+
 
 # ────────────────────────────────────────────────────────────────
 # Cubemap  ➜  Equirectangular   (robust OpenCV remap version)
@@ -2132,57 +2237,85 @@ def display_faces(cube_faces):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def calculate_metrics(img_a, img_b):
-    """
-    img_a, img_b : H×W×3   NumPy uint8   or   PyTorch CHW uint8 / float
+# def calculate_metrics(img_a, img_b):
+#     """
+#     img_a, img_b : H×W×3   NumPy uint8   or   PyTorch CHW uint8 / float
 
-    Returns dict with keys:
-        mse, psnr, ssim,
-        low_diff_percentage, medium_diff_percentage, high_diff_percentage
-    """
-    # ------------- normalise both inputs to NumPy float32 [0,255] -----------
-    if 'torch' in str(type(img_a)):
-        import torch
-        if img_a.dtype == torch.uint8:
-            arr_a = img_a.permute(1,2,0).cpu().numpy().astype(np.float32)
-        else:                               # assume float 0‑1 or 0‑255
-            arr_a = (img_a.permute(1,2,0)*255.).cpu().numpy().astype(np.float32)
-    else:
-        arr_a = img_a.astype(np.float32)
+#     Returns dict with keys:
+#         mse, psnr, ssim,
+#         low_diff_percentage, medium_diff_percentage, high_diff_percentage
+#     """
+#     # ------------- normalise both inputs to NumPy float32 [0,255] -----------
+#     if 'torch' in str(type(img_a)):
+#         import torch
+#         if img_a.dtype == torch.uint8:
+#             arr_a = img_a.permute(1,2,0).cpu().numpy().astype(np.float32)
+#         else:                               # assume float 0‑1 or 0‑255
+#             arr_a = (img_a.permute(1,2,0)*255.).cpu().numpy().astype(np.float32)
+#     else:
+#         arr_a = img_a.astype(np.float32)
 
-    if 'torch' in str(type(img_b)):
-        import torch
-        if img_b.dtype == torch.uint8:
-            arr_b = img_b.permute(1,2,0).cpu().numpy().astype(np.float32)
-        else:
-            arr_b = (img_b.permute(1,2,0)*255.).cpu().numpy().astype(np.float32)
-    else:
-        arr_b = img_b.astype(np.float32)
+#     if 'torch' in str(type(img_b)):
+#         import torch
+#         if img_b.dtype == torch.uint8:
+#             arr_b = img_b.permute(1,2,0).cpu().numpy().astype(np.float32)
+#         else:
+#             arr_b = (img_b.permute(1,2,0)*255.).cpu().numpy().astype(np.float32)
+#     else:
+#         arr_b = img_b.astype(np.float32)
 
-    # ------------- basic errors --------------------------------------------
-    diff   = arr_a - arr_b
-    mse    = np.mean(diff**2)
-    psnr   = 10 * np.log10((255.0**2) / mse)
+#     # ------------- basic errors --------------------------------------------
+#     diff   = arr_a - arr_b
+#     mse    = np.mean(diff**2)
+#     psnr   = 10 * np.log10((255.0**2) / mse)
 
-    # SSIM expects 0‑255 float, channel‑last
-    ssim_val = ssim(arr_a, arr_b, channel_axis=2, data_range=255)
+#     # SSIM expects 0‑255 float, channel‑last
+#     ssim_val = ssim(arr_a, arr_b, channel_axis=2, data_range=255)
 
-    # ------------- histogram buckets ---------------------------------------
-    abs_diff = np.mean(np.abs(diff), axis=2)    # mean over RGB
-    total    = abs_diff.size
-    low_pct     = 100 * np.sum(abs_diff < 5)          / total
-    medium_pct  = 100 * np.sum((abs_diff >= 5) &
-                                (abs_diff < 10))      / total
-    high_pct    = 100 * np.sum(abs_diff >= 10)        / total
+#     # ------------- histogram buckets ---------------------------------------
+#     abs_diff = np.mean(np.abs(diff), axis=2)    # mean over RGB
+#     total    = abs_diff.size
+#     low_pct     = 100 * np.sum(abs_diff < 5)          / total
+#     medium_pct  = 100 * np.sum((abs_diff >= 5) &
+#                                 (abs_diff < 10))      / total
+#     high_pct    = 100 * np.sum(abs_diff >= 10)        / total
 
-    return {
-        "mse": mse,
-        "psnr": psnr,
-        "ssim": ssim_val,
-        "low_diff_percentage":    low_pct,
-        "medium_diff_percentage": medium_pct,
-        "high_diff_percentage":   high_pct,
-    }
+#     return {
+#         "mse": mse,
+#         "psnr": psnr,
+#         "ssim": ssim_val,
+#         "low_diff_percentage":    low_pct,
+#         "medium_diff_percentage": medium_pct,
+#         "high_diff_percentage":   high_pct,
+#     }
+
+# ---------------------------------------------------------------------
+# Quality metrics helper (NumPy / Torch agnostic)
+# ---------------------------------------------------------------------
+from skimage.metrics import structural_similarity as ssim
+def calculate_metrics(a, b):
+    import torch
+    def to_np(x):
+        if isinstance(x, np.ndarray):
+            return x.astype(np.float32)
+        if isinstance(x, torch.Tensor):
+            if x.dtype == torch.uint8:
+                return x.permute(1,2,0).cpu().numpy().astype(np.float32)
+            return (x.permute(1,2,0)*255.).cpu().numpy().astype(np.float32)
+        raise TypeError("unknown type")
+    a = to_np(a); b = to_np(b)
+    diff = a - b
+    mse  = np.mean(diff**2)
+    psnr = 10*np.log10((255.0**2)/mse)
+    ssim_val = ssim(a, b, channel_axis=2, data_range=255)
+    ad = np.mean(np.abs(diff), 2)
+    total = ad.size
+    return dict(
+        mse=mse, psnr=psnr, ssim=ssim_val,
+        low_diff_percentage    =100*np.sum(ad<5)/total,
+        medium_diff_percentage =100*np.sum((ad>=5)&(ad<10))/total,
+        high_diff_percentage   =100*np.sum(ad>=10)/total
+    )
 
 
 # ────────────────────────────────────────────────────────────────
