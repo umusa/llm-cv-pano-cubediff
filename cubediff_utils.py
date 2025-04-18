@@ -9,7 +9,8 @@ import torch
 from scipy.ndimage import map_coordinates
 import time
 import math
-from skimage.metrics import mean_squared_error, peak_signal_noise_ratio, structural_similarity
+# import py360convert as py360
+from skimage.metrics import structural_similarity as ssim
 
 def load_image_from_url(url):
     """
@@ -191,64 +192,417 @@ def add_cubemap_positional_encodings(latents, face_indices=None):
     return latents
 
 
-# --------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Helper: centred pixel grid in [-1,1]
+def _grid(N):
+    jj, ii = np.meshgrid(np.arange(N)+0.5,
+                         np.arange(N)+0.5,
+                         indexing='ij')
+    return 2*ii/N - 1, 2*jj/N - 1     # u (X‑axis), v (Y‑axis)
 
 
-def equirect_to_cubemap(equirect_img, face_size):
+# ─── pole supersample & down‑filter ──────────────────────────────────────────
+def _supersample_pole(face, factor=2):
+    big = cv2.resize(face, (face.shape[1]*factor, face.shape[0]*factor),
+                     interpolation=cv2.INTER_LANCZOS4)
+    # 2× box filter (exact area)
+    return cv2.resize(big, (face.shape[1], face.shape[0]),
+                      interpolation=cv2.INTER_AREA)
+
+# ─── cubic (Catmull‑Rom) sampler for inverse projector ──────────────────────
+# def _cubic_lerp(f, ui, vi):
+#     ui0 = np.clip(ui.astype(np.int32)-1, 0, f.shape[1]-1)
+#     vi0 = np.clip(vi.astype(np.int32)-1, 0, f.shape[0]-1)
+#     patch = f[vi0[:,None]+np.arange(4), ui0[:,None]+np.arange(4)[:,None]]  # 4×4
+#     tx = ui - (ui0+1)
+#     ty = vi - (vi0+1)
+#     def w(t): return (-0.5*t+1.5)*t*t - 1.5*t + 1
+#     wx = np.array([w(tx+1), w(tx), w(tx-1), w(tx-2)])
+#     wy = np.array([w(ty+1), w(ty), w(ty-1), w(ty-2)])
+#     return (wy[:,:,None,None]*wx[:,None,:,None]*patch).sum((0,1))
+
+def _cubic_lerp(face, u, v):
     """
-    Convert an equirectangular panorama into 6 cubemap faces,
-    using bicubic sampling + oversampling at the poles to reduce distortion.
+    face : H×H×3  uint8
+    u,v  : 1‑D float arrays of same length  (pixel coords inside this face)
+
+    Returns an N×3 uint8 array of sampled colours.
     """
-    H, W = equirect_img.shape[:2]
-    faces = {}
-    face_names = ["front", "right", "back", "left", "top", "bottom"]
+    H = face.shape[0]
+    ui0 = np.clip(np.floor(u).astype(np.int32) - 1, 0, H-1)
+    vi0 = np.clip(np.floor(v).astype(np.int32) - 1, 0, H-1)
 
-    for face in face_names:
-        # — pole faces: oversample then downsample —
-        if face in ("top", "bottom"):
-            os = 2  # oversampling factor
-            sz = face_size * os
-            # NDC grid in [-1,1]
-            x_ndc, y_ndc = np.meshgrid(
-                np.linspace(-1, 1, sz),
-                np.linspace(-1, 1, sz),
-                indexing="xy"
-            )
-            # compute each pixel’s 3D ray for this face
-            dirs = _compute_face_dirs(face, x_ndc, y_ndc)        # (sz,sz,3)
-            map_u, map_v = _dirs_to_equi_uv(dirs, W, H)         # each (sz,sz)
-            tmp = cv2.remap(
-                equirect_img, map_u, map_v,
-                interpolation=cv2.INTER_CUBIC,
-                borderMode=cv2.BORDER_WRAP
-            )
-            # downsample with area‑averaging
-            face_img = cv2.resize(tmp, (face_size, face_size),
-                                  interpolation=cv2.INTER_AREA)
+    # gather 4 rows × 4 cols around each point
+    patch = np.zeros((len(u), 4, 4, 3), dtype=np.float32)
+    for dy in range(4):
+        rows = np.clip(vi0 + dy, 0, H-1)
+        row_pixels = face[rows]
+        for dx in range(4):
+            cols = np.clip(ui0 + dx, 0, H-1)
+            patch[:, dy, dx] = row_pixels[np.arange(len(rows)), cols]
 
-        else:
-            # standard face: 1× sampling
-            x_ndc, y_ndc = np.meshgrid(
-                np.linspace(-1, 1, face_size),
-                np.linspace(-1, 1, face_size),
-                indexing="xy"
-            )
-            dirs = _compute_face_dirs(face, x_ndc, y_ndc)       # (face_size,face_size,3)
-            map_u, map_v = _dirs_to_equi_uv(dirs, W, H)
-            face_img = cv2.remap(
-                equirect_img, map_u, map_v,
-                interpolation=cv2.INTER_CUBIC,
-                borderMode=cv2.BORDER_WRAP
-            )
+    tx = u - (ui0 + 1)
+    ty = v - (vi0 + 1)
 
-        faces[face] = face_img
+    def w(t):
+        return ((-0.5*t + 1.5)*t - 1.5)*t + 1   # Catmull–Rom cubic weight
 
-    return faces
+    wx = np.stack([w(tx+1), w(tx), w(tx-1), w(tx-2)], axis=1)  # N×4
+    wy = np.stack([w(ty+1), w(ty), w(ty-1), w(ty-2)], axis=1)  # N×4
+
+    # tensor dot: (N×4)·(N×4×4×3)·(N×4)^T  →  N×3
+    interp = (wy[:, :, None, None] *
+              wx[:, None, :, None] *
+              patch).sum(axis=(1,2))
+
+    return np.clip(interp, 0, 255).astype(np.uint8)
+
+
+# ------------------------------------------------------------
+# Equirect  ➜  Cubemap
+# ------------------------------------------------------------
+
+# def equirect_to_cubemap(img_equi: np.ndarray, face_size: int):
+#     H, W = img_equi.shape[:2]
+#     out, names = {}, ['front','right','back','left','top','bottom']
+
+#     for name in names:
+#         u, v = _grid(face_size)
+
+#         # right‑handed +X right, +Y up, +Z forward
+#         if   name == 'front':   x, y, z =  u,   -v, 1
+#         elif name == 'right':   x, y, z =  1,   -v, -u
+#         elif name == 'back':    x, y, z = -u,   -v, -1
+#         elif name == 'left':    x, y, z = -1,   -v,  u
+#         elif name == 'top':     x, y, z =  u,    1,  v
+#         elif name == 'bottom':  x, y, z =  u,   -1, -v
+
+#         x = x / np.sqrt(x*x + y*y + z*z)
+#         y = y / np.sqrt(x*x + y*y + z*z)
+#         z = z / np.sqrt(x*x + y*y + z*z)
+
+#         lon = np.arctan2(x, z) + np.pi          # [0,2π)
+#         lat = np.arcsin(y)                      # [‑π/2,π/2]
+
+#         map_x = (lon / (2*np.pi) * W).astype(np.float32)
+#         map_y = ((0.5 - lat/np.pi) * H).astype(np.float32)
+
+#         out[name] = cv2.remap(img_equi, map_x, map_y,
+#                               interpolation=cv2.INTER_LANCZOS4,
+#                               borderMode=cv2.BORDER_WRAP)
+#     return out
+
+# ─── substitute the bodies of the two public functions ───────────────────────
+
+# def equirect_to_cubemap(img_equi: np.ndarray, face_size: int):
+#     """
+#     Wrapper around py360convert.e2c  (equirect → cubemap dictionary).
+
+#     Returns a dict with keys:
+#         'front', 'right', 'back', 'left', 'top', 'bottom'
+#     in exactly that order.  The images are uint8, shape (face_size, face_size, 3).
+#     """
+#     #   py360 expects float 32 image in [0,1]
+#     # cube = py360.e2c(img_equi.astype(np.float32)/255.,
+#     #                  face_w=face_size,
+#     #                  cube_format='dict')            # gives a dict of six faces
+#     # # convert back to uint8
+#     # return {k: (v*255).astype(np.uint8) for k, v in cube.items()}
+
+#     cube = py360.e2c(img_equi.astype(np.float32)/255.,
+#                      face_w=face_size,
+#                      cube_format='dict')        # keys: F,R,B,L,U,D
+
+#     keymap = {'F':'front', 'R':'right', 'B':'back',
+#               'L':'left',  'U':'top',   'D':'bottom'}
+#     return {keymap[k]: (v*255).astype(np.uint8) for k, v in cube.items()}
+
+def equirect_to_cubemap(equi: np.ndarray, face_size: int):
+    H, W = equi.shape[:2]
+    out = {}
+    for name in ('front','right','back','left','top','bottom'):
+        u, v = _grid(face_size)
+
+        if   name == 'front':  x, y, z =  u,   -v,  1
+        elif name == 'right':  x, y, z =  1,   -v, -u
+        elif name == 'back':   x, y, z = -u,   -v, -1
+        elif name == 'left':   x, y, z = -1,   -v,  u
+        elif name == 'top':    x, y, z =  u,    1,  v
+        elif name == 'bottom': x, y, z =  u,   -1, -v
+
+        inv_len = 1./np.sqrt(x*x + y*y + z*z)
+        x *= inv_len; y *= inv_len; z *= inv_len
+
+        lon = np.arctan2(x, z) + np.pi        # 0…2π
+        lat = np.arcsin(y)                    # -π/2…π/2
+
+        map_x = (lon / (2*np.pi) * W).astype(np.float32)
+        map_y = ((0.5 - lat/np.pi) * H).astype(np.float32)
+
+        # out[name] = cv2.remap(equi, map_x, map_y,
+        #                       interpolation=cv2.INTER_LANCZOS4,
+        #                       borderMode=cv2.BORDER_WRAP)
+        
+        face_img = cv2.remap(equi, map_x, map_y,
+                              interpolation=cv2.INTER_LANCZOS4,
+                              borderMode=cv2.BORDER_WRAP)
+        if name in ('top','bottom'):
+             face_img = _supersample_pole(face_img)   # 2× AA
+        out[name] = face_img
+
+    return out
+
+# ------------------------------------------------------------
+# Cubemap  ➜  Equirect
+# ------------------------------------------------------------
+
+# ────────────────────────────────────────────────────────────────
+# Cubemap  ➜  Equirectangular   (robust OpenCV remap version)
+# ────────────────────────────────────────────────────────────────
+def cubemap_to_equirect(faces: dict, H: int, W: int):
+    """
+    faces : dict with keys 'front','right','back','left','top','bottom'
+            each of shape (F, F, 3), uint8
+    H, W  : desired equirectangular output size
+    """
+
+    # 1. create full‑resolution lon/lat grid (pixel centres)
+    lon = (np.arange(W)+0.5)/W * 2*np.pi - np.pi
+    lat =  np.pi/2 - (np.arange(H)+0.5)/H * np.pi
+    lon, lat = np.meshgrid(lon, lat)          # each H×W
+
+    # 2. 3‑D directions
+    x = np.sin(lon)*np.cos(lat)
+    y = np.sin(lat)
+    z = np.cos(lon)*np.cos(lat)
+    ax, ay, az = np.abs(x), np.abs(y), np.abs(z)
+
+    # 3. which face?
+    idx = np.zeros_like(x, dtype=np.int8)
+    idx[(az>=ax)&(az>=ay)&( z>0)] = 0     # front  +Z
+    idx[(ax>az)&(ax>=ay)&( x>0)] = 1      # right  +X
+    idx[(az>=ax)&(az>=ay)&( z<0)] = 2     # back   -Z
+    idx[(ax>az)&(ax>=ay)&( x<0)] = 3      # left   -X
+    idx[(ay>ax)&(ay> az)&( y>0)] = 4      # top    +Y
+    idx[(ay>ax)&(ay> az)&( y<0)] = 5      # bottom -Y
+
+    # 4. build remap coordinates for every pixel *once*
+    F  = faces['front'].shape[0]
+    u  = np.empty_like(x, np.float32)
+    v  = np.empty_like(x, np.float32)
+    eps = 1e-8
+
+    # front
+    m = idx==0; u[m] =  x[m]/( az[m]+eps); v[m] = -y[m]/( az[m]+eps)
+    # right
+    m = idx==1; u[m] = -z[m]/( ax[m]+eps); v[m] = -y[m]/( ax[m]+eps)
+    # back
+    m = idx==2; u[m] = -x[m]/( az[m]+eps); v[m] = -y[m]/( az[m]+eps)
+    # left
+    m = idx==3; u[m] =  z[m]/( ax[m]+eps); v[m] = -y[m]/( ax[m]+eps)
+    # top
+    m = idx==4; u[m] =  x[m]/( ay[m]+eps); v[m] =  z[m]/( ay[m]+eps)
+    # bottom
+    m = idx==5; u[m] =  x[m]/( ay[m]+eps); v[m] = -z[m]/( ay[m]+eps)
+
+    u = ((u+1)*0.5*(F-1)).astype(np.float32)
+    v = ((v+1)*0.5*(F-1)).astype(np.float32)
+
+    # 5. allocate output and fill per face via cv2.remap
+    equi = np.zeros((H, W, 3), dtype=np.uint8)
+    names = ['front','right','back','left','top','bottom']
+    for fid, name in enumerate(names):
+        m = idx==fid
+        if not m.any():            # just in case
+            continue
+        # remap expects full maps, so build minimal bounding box to save RAM
+        ys, xs = np.where(m)
+        y0,y1 = ys.min(), ys.max()+1
+        x0,x1 = xs.min(), xs.max()+1
+
+        map_x = u[y0:y1, x0:x1]
+        map_y = v[y0:y1, x0:x1]
+        equi[y0:y1, x0:x1] = cv2.remap(
+            faces[name], map_x, map_y,
+            interpolation=cv2.INTER_LANCZOS4,
+            borderMode=cv2.BORDER_WRAP
+        )
+    return equi
+
+
+# def cubemap_to_equirect(faces: dict, H: int, W: int):
+#     """
+#     Inverse wrapper around py360convert.c2e  (cubemap → equirect).
+
+#     `faces` is the dict returned by equirect_to_cubemap.
+#     """
+#     # py360 wants a single (6, H, W, 3) array ordered FRBLUD
+#     order = ['front', 'right', 'back', 'left', 'top', 'bottom']
+#     cube   = np.stack([faces[k] for k in order]).astype(np.float32)/255.
+
+#     eq = py360.c2e(cube, h=H, w=W, cube_format='dict')      # float32 [0,1]
+#     return (eq*255).astype(np.uint8)
+
+
+# def cubemap_to_equirect(faces: dict, H: int, W: int):
+#     """
+#     Convert cubemap faces back to an H×W equirectangular image using py360convert.
+#     `faces` keys: 'front', 'right', 'back', 'left', 'top', 'bottom'.
+#     """
+#     # --------------- 1. rename + convert to float32 [0,1] -------------------
+#     frblud = {
+#         'F': faces['front' ].astype(np.float32) / 255.,
+#         'R': faces['right' ].astype(np.float32) / 255.,
+#         'B': faces['back'  ].astype(np.float32) / 255.,
+#         'L': faces['left'  ].astype(np.float32) / 255.,
+#         'U': faces['top'   ].astype(np.float32) / 255.,
+#         'D': faces['bottom'].astype(np.float32) / 255.,
+#     }
+
+#     # --------------- 2. pad width/height to multiples py360 requires -------
+#     W8 = (W + 7) & ~7      # next multiple of 8
+#     H8 = (H + 3) & ~3      # next multiple of 4
+
+#     eq = py360.c2e(frblud, h=H8, w=W8, cube_format='dict')   # float32 [0,1]
+
+#     # --------------- 3. resize back if we padded ---------------------------
+#     if (H8, W8) != (H, W):
+#         eq = cv2.resize(eq, (W, H), interpolation=cv2.INTER_LANCZOS4)
+
+#     return (eq * 255).astype(np.uint8)
+
+# def cubemap_to_equirect(faces: dict, H: int, W: int):
+#     F     = next(iter(faces.values())).shape[0]
+#     lon   = (np.arange(W)+0.5)/W * 2*np.pi - np.pi
+#     lat   =  np.pi/2 - (np.arange(H)+0.5)/H * np.pi
+#     lon, lat = np.meshgrid(lon, lat)
+
+#     x = np.sin(lon) * np.cos(lat)
+#     y = np.sin(lat)
+#     z = np.cos(lon) * np.cos(lat)
+
+#     absX, absY, absZ = np.abs(x), np.abs(y), np.abs(z)
+#     isXPositive = x > 0
+#     isYPositive = y > 0
+#     isZPositive = z > 0
+
+#     u = np.empty_like(x)
+#     v = np.empty_like(x)
+#     idx = np.empty_like(x, dtype=np.int8)   # 0‑5
+
+#     # +X (right)
+#     m = (absX >= absY) & (absX >= absZ) & isXPositive
+#     idx[m] = 1
+#     u[m] = -z[m] / absX[m]
+#     v[m] = -y[m] / absX[m]
+
+#     # –X (left)
+#     m = (absX >= absY) & (absX >= absZ) & ~isXPositive
+#     idx[m] = 3
+#     u[m] =  z[m] / absX[m]
+#     v[m] = -y[m] / absX[m]
+
+#     # +Y (top)
+#     m = (absY > absX) & (absY >= absZ) & isYPositive
+#     idx[m] = 4
+#     u[m] =  x[m] / absY[m]
+#     v[m] =  z[m] / absY[m]
+
+#     # –Y (bottom)
+#     m = (absY > absX) & (absY >= absZ) & ~isYPositive
+#     idx[m] = 5
+#     u[m] =  x[m] / absY[m]
+#     v[m] = -z[m] / absY[m]
+
+#     # +Z (front)
+#     m = (absZ > absX) & (absZ > absY) & isZPositive
+#     idx[m] = 0
+#     u[m] =  x[m] / absZ[m]
+#     v[m] = -y[m] / absZ[m]
+
+#     # –Z (back)
+#     m = (absZ > absX) & (absZ > absY) & ~isZPositive
+#     idx[m] = 2
+#     u[m] = -x[m] / absZ[m]
+#     v[m] = -y[m] / absZ[m]
+
+#     u_px = ((u+1)*0.5*(F-1)).astype(np.float32)
+#     v_px = ((v+1)*0.5*(F-1)).astype(np.float32)
+
+#     equi = np.empty((H, W, 3), dtype=np.uint8)
+#     order = ['front','right','back','left','top','bottom']
+
+#     for fid, name in enumerate(order):
+#         m = idx == fid
+#         if not m.any(): continue
+#         ui0 = np.floor(u_px[m]).astype(np.int32)
+#         vi0 = np.floor(v_px[m]).astype(np.int32)
+#         ui1 = np.clip(ui0+1, 0, F-1)
+#         vi1 = np.clip(vi0+1, 0, F-1)
+#         du  = (u_px[m]-ui0)[:,None]
+#         dv  = (v_px[m]-vi0)[:,None]
+#         f   = faces[name]
+#         equi[m] = ((1-du)*(1-dv))*f[vi0,ui0] + \
+#                   (   du *(1-dv))*f[vi0,ui1] + \
+#                   ((1-du)*   dv)*f[vi1,ui0] + \
+#                   (   du *   dv)*f[vi1,ui1]
+
+#     return equi
+
+
+# def equirect_to_cubemap(equirect_img, face_size):
+#     """
+#     Convert an equirectangular panorama into 6 cubemap faces,
+#     using bicubic sampling + oversampling at the poles to reduce distortion.
+#     """
+#     H, W = equirect_img.shape[:2]
+#     faces = {}
+#     face_names = ["front", "right", "back", "left", "top", "bottom"]
+
+#     for face in face_names:
+#         # — pole faces: oversample then downsample —
+#         if face in ("top", "bottom"):
+#             os = 2  # oversampling factor
+#             sz = face_size * os
+#             # NDC grid in [-1,1]
+#             x_ndc, y_ndc = np.meshgrid(
+#                 np.linspace(-1, 1, sz),
+#                 np.linspace(-1, 1, sz),
+#                 indexing="xy"
+#             )
+#             # compute each pixel’s 3D ray for this face
+#             dirs = _compute_face_dirs(face, x_ndc, y_ndc)        # (sz,sz,3)
+#             map_u, map_v = _dirs_to_equi_uv(dirs, W, H)         # each (sz,sz)
+#             tmp = cv2.remap(
+#                 equirect_img, map_u, map_v,
+#                 interpolation=cv2.INTER_CUBIC,
+#                 borderMode=cv2.BORDER_WRAP
+#             )
+#             # downsample with area‑averaging
+#             face_img = cv2.resize(tmp, (face_size, face_size),
+#                                   interpolation=cv2.INTER_AREA)
+
+#         else:
+#             # standard face: 1× sampling
+#             x_ndc, y_ndc = np.meshgrid(
+#                 np.linspace(-1, 1, face_size),
+#                 np.linspace(-1, 1, face_size),
+#                 indexing="xy"
+#             )
+#             dirs = _compute_face_dirs(face, x_ndc, y_ndc)       # (face_size,face_size,3)
+#             map_u, map_v = _dirs_to_equi_uv(dirs, W, H)
+#             face_img = cv2.remap(
+#                 equirect_img, map_u, map_v,
+#                 interpolation=cv2.INTER_CUBIC,
+#                 borderMode=cv2.BORDER_WRAP
+#             )
+
+#         faces[face] = face_img
+
+#     return faces
 
 
 # helper: map normalized face coords → 3D ray depending on face
-
-import numpy as np
 
 def _compute_face_dirs(face, x, y):
     """
@@ -334,81 +688,78 @@ def fix_cubemap_edge_artifacts(cube_faces):
 
     return F
 
-def _prepare_lookup(H, W, face_size):
-    """
-    Precompute face_map, u_maps, v_maps for an (H,W) pano and
-    cubemap faces of size face_size.
-    """
-    import numpy as np
 
-    j,i = np.meshgrid(np.arange(W), np.arange(H))
-    lon = (j/(W-1))*2*np.pi - np.pi
-    lat = np.pi/2 - (i/(H-1))*np.pi
+# def cubemap_to_equirect(cube_faces, H, W):
+#     """
+#     1) For each equirect pixel, pick the single best face by dot‐product.
+#     2) Sample that face *with BORDER_WRAP* so no black pixels ever appear.
+#     """
+#     # 6 faces in fixed order
+#     face_list = ["front","right","back","left","top","bottom"]
+#     normals = np.array([
+#         [ 0,0, 1],[ 1,0,0],[ 0,0,-1],[-1,0,0],[ 0,1,0],[ 0,-1,0]
+#     ],dtype=np.float32)
 
-    X = np.sin(lon)*np.cos(lat)
-    Y = np.sin(lat)
-    Z = np.cos(lon)*np.cos(lat)
-    rays = np.stack([X,Y,Z], axis=-1).astype(np.float32)
+#     face_size = cube_faces["front"].shape[0]
+#     F_arr = np.stack([cube_faces[f] for f in face_list], axis=0).astype(np.float32)
 
-    # face selection by max‐axis rule
-    absv = np.abs(rays)
-    major = np.argmax(absv, axis=-1)
+#     # build ray directions for every equirect pixel
+#     j,i = np.meshgrid(np.arange(W), np.arange(H))
+#     lon = (j/(W-1))*2*np.pi - np.pi
+#     lat = np.pi/2 - (i/(H-1))*np.pi
+#     X = np.sin(lon)*np.cos(lat)
+#     Y = np.sin(lat)
+#     Z = np.cos(lon)*np.cos(lat)
+#     rays = np.stack([X,Y,Z], axis=-1).astype(np.float32)
 
-    # build face_map (0..5) same order as normals in your code
-    # 0=right,1=left,2=top,3=bottom,4=front,5=back  (match your pipeline)
-    face_map = np.zeros((H,W), np.int8)
-    face_map[(major==0)&(X>0)] = 0  # right
-    face_map[(major==0)&(X<0)] = 1  # left
-    face_map[(major==1)&(Y>0)] = 2  # top
-    face_map[(major==1)&(Y<0)] = 3  # bottom
-    face_map[(major==2)&(Z>0)] = 4  # front
-    face_map[(major==2)&(Z<0)] = 5  # back
+#     # pick face via max(dot)
+#     dots = np.stack([(rays*normals[k]).sum(-1) for k in range(6)],axis=0)
+#     dots = np.maximum(dots, 0.0)
+#     face_map = np.argmax(dots, axis=0)  # (H,W)
 
-    # precompute u/v for each of the 6 faces
-    u_maps, v_maps = [], []
-    for idx in range(6):
-        u,v = _face_dir_to_uv(rays, idx, face_size)
-        u_maps.append(u); v_maps.append(v)
+#     # precompute UV maps for all faces
+#     u_maps, v_maps = [], []
+#     for k in range(6):
+#         u,v = _face_dir_to_uv(rays, k, face_size)
+#         u_maps.append(u); v_maps.append(v)
 
-    return face_map, u_maps, v_maps
+#     # sample each face only where it's chosen
+#     pano = np.zeros((H,W,3), np.uint8)
+#     for k in range(6):
+#         mask = (face_map==k)
+#         if not mask.any(): 
+#             continue
+#         samp = cv2.remap(
+#             F_arr[k], u_maps[k], v_maps[k],
+#             interpolation=cv2.INTER_CUBIC,
+#             borderMode=cv2.BORDER_WRAP  # <-- wrap, not constant
+#         ).astype(np.uint8)
+#         pano[mask] = samp[mask]
+
+#     return pano
 
 
-def cubemap_to_equirect(cube_faces, H, W, seam_fix=True):
-    """
-    Drop‑in replacement for your old cubemap_to_equirect.
-    Internally calls the precompute, does a single pass remap with wrap,
-    then optionally smooths seams.
-    """
-    # 1) precompute maps
-    face_size = cube_faces['front'].shape[0]
-    face_map, u_maps, v_maps = _prepare_lookup(H, W, face_size)
+# def cubemap_to_equirect_from_maps(cube_faces, face_map, u_maps, v_maps):
+#     """
+#     Reconstruct strictly by sampling each pixel from its chosen face,
+#     using BORDER_WRAP so there are no black border pixels.
+#     """
+#     H,W = face_map.shape
+#     pano = np.zeros((H,W,3), np.uint8)
+#     order = ["front","right","back","left","top","bottom"]
 
-    # 2) single‐face remap with wrap
-    import numpy as np, cv2
-    pano = np.zeros((H, W, 3), np.uint8)
-    order = ['right','left','top','bottom','front','back']
-    for k,name in enumerate(order):
-        m = (face_map==k)
-        if not m.any(): continue
-        samp = cv2.remap(
-            cube_faces[name],
-            u_maps[k], v_maps[k],
-            interpolation=cv2.INTER_CUBIC,
-            borderMode=cv2.BORDER_WRAP
-        )
-        pano[m] = samp[m]
+#     for k, name in enumerate(order):
+#         mask = (face_map==k)
+#         if not mask.any(): continue
+#         samp = cv2.remap(
+#             cube_faces[name],
+#             u_maps[k], v_maps[k],
+#             interpolation=cv2.INTER_CUBIC,
+#             borderMode=cv2.BORDER_WRAP
+#         )
+#         pano[mask] = samp[mask]
+#     return pano
 
-    # 3) optional 1‑px seam fix
-    if seam_fix:
-        mid = H//2
-        seams = np.where(face_map[mid,1:] != face_map[mid,:-1])[0] + 1
-        for j in seams:
-            if 1 <= j < W-1:
-                left  = pano[:, j-1].astype(np.float32)
-                right = pano[:, j+1].astype(np.float32)
-                pano[:,j] = ((left+right)*0.5).astype(np.uint8)
-
-    return pano
 
 # def cubemap_to_equirect(cube_faces, H, W):
 #     """
@@ -935,64 +1286,6 @@ def diagnose_conversion_issues(original, reconstructed):
     }
     
     return diagnostics
-
-
-
-def compute_metrics(orig, recon):
-    """
-    Compute a suite of quality metrics between two equirectangular panoramas:
-      • MSE              – plain Mean Squared Error
-      • PSNR             – Peak Signal‐to‐Noise Ratio
-      • SSIM             – Structural Similarity Index (windowed)
-      • MSE_spherical    – latitude‐weighted MSE
-      • PSNR_spherical   – PSNR derived from MSE_spherical
-
-    Args:
-      orig:   (H,W,3) uint8 original panorama
-      recon:  (H,W,3) uint8 reconstructed panorama
-
-    Returns:
-      dict with keys ['MSE','PSNR','SSIM','MSE_spherical','PSNR_spherical']
-    """
-    # ensure float32 for calculations
-    orig_f = orig.astype(np.float32)
-    recon_f = recon.astype(np.float32)
-
-    # 1) Classic MSE & PSNR
-    mse = mean_squared_error(orig, recon)
-    psnr = peak_signal_noise_ratio(orig, recon, data_range=255)
-
-    # 2) SSIM (windowed)
-    ssim = structural_similarity(
-        orig, recon,
-        data_range=255,
-        multichannel=True,
-        gaussian_weights=True,
-        sigma=1.5,
-        use_sample_covariance=False
-    )
-
-    # 3) Spherical (latitude‐weighted) MSE & PSNR
-    H, W = orig.shape[:2]
-    # latitude angles from +π/2 (top) to -π/2 (bottom)
-    lats = np.linspace(np.pi/2, -np.pi/2, H)[:,None]
-    weights = np.cos(lats)
-    weights /= weights.sum()
-
-    # per‐pixel squared error (averaged over channels)
-    se = ((orig_f - recon_f)**2).mean(axis=2)  # (H,W)
-    mse_sph = float((weights * se).sum())      # scalar
-
-    psnr_sph = 10 * np.log10((255.0**2) / mse_sph)
-
-    return {
-        'MSE': float(mse),
-        'PSNR': float(psnr),
-        'SSIM': float(ssim),
-        'MSE_spherical': mse_sph,
-        'PSNR_spherical': float(psnr_sph),
-    }
-
 
 # --------------------------------------------
 
@@ -1726,7 +2019,12 @@ def verify_reconstruction_integrity(equirect_img, face_size):
     
     # Create cubemap faces
     cube_faces = equirect_to_cubemap(equirect_img, face_size)
-    
+
+    # --------  EXACTLY the same two fixes the notebook had  -------------------
+    cube_faces = fix_vertical_seams(cube_faces)        # blends ±π columns
+    cube_faces = antialias_poles(cube_faces, factor=2) # 2× supersample / down‑box
+    # --------------------------------------------------------------------------
+
     # Display original faces
     print("Original Cubemap Faces:")
     display_faces(cube_faces)
@@ -1828,3 +2126,102 @@ def display_faces(cube_faces):
     
     plt.tight_layout()
     plt.show()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Comprehensive image‑quality metrics
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def calculate_metrics(img_a, img_b):
+    """
+    img_a, img_b : H×W×3   NumPy uint8   or   PyTorch CHW uint8 / float
+
+    Returns dict with keys:
+        mse, psnr, ssim,
+        low_diff_percentage, medium_diff_percentage, high_diff_percentage
+    """
+    # ------------- normalise both inputs to NumPy float32 [0,255] -----------
+    if 'torch' in str(type(img_a)):
+        import torch
+        if img_a.dtype == torch.uint8:
+            arr_a = img_a.permute(1,2,0).cpu().numpy().astype(np.float32)
+        else:                               # assume float 0‑1 or 0‑255
+            arr_a = (img_a.permute(1,2,0)*255.).cpu().numpy().astype(np.float32)
+    else:
+        arr_a = img_a.astype(np.float32)
+
+    if 'torch' in str(type(img_b)):
+        import torch
+        if img_b.dtype == torch.uint8:
+            arr_b = img_b.permute(1,2,0).cpu().numpy().astype(np.float32)
+        else:
+            arr_b = (img_b.permute(1,2,0)*255.).cpu().numpy().astype(np.float32)
+    else:
+        arr_b = img_b.astype(np.float32)
+
+    # ------------- basic errors --------------------------------------------
+    diff   = arr_a - arr_b
+    mse    = np.mean(diff**2)
+    psnr   = 10 * np.log10((255.0**2) / mse)
+
+    # SSIM expects 0‑255 float, channel‑last
+    ssim_val = ssim(arr_a, arr_b, channel_axis=2, data_range=255)
+
+    # ------------- histogram buckets ---------------------------------------
+    abs_diff = np.mean(np.abs(diff), axis=2)    # mean over RGB
+    total    = abs_diff.size
+    low_pct     = 100 * np.sum(abs_diff < 5)          / total
+    medium_pct  = 100 * np.sum((abs_diff >= 5) &
+                                (abs_diff < 10))      / total
+    high_pct    = 100 * np.sum(abs_diff >= 10)        / total
+
+    return {
+        "mse": mse,
+        "psnr": psnr,
+        "ssim": ssim_val,
+        "low_diff_percentage":    low_pct,
+        "medium_diff_percentage": medium_pct,
+        "high_diff_percentage":   high_pct,
+    }
+
+
+# ────────────────────────────────────────────────────────────────
+# 1.  Fix the ±π longitude seam       (vertical seam in equirect)
+# ────────────────────────────────────────────────────────────────
+def fix_vertical_seams(cube):
+    """
+    Blend the first two and last two columns of *each lateral* face
+    (front/right/back/left) so that the equirectangular wrap seam is C0‑continuous.
+
+    cube : {'front','right','back','left','top','bottom'}  ->  H×H×3  uint8
+    """
+    out = {}
+    for k, img in cube.items():
+        if k in ('top', 'bottom'):
+            out[k] = img.copy()
+            continue
+        blended = img.copy().astype(np.float32)
+        # blend first 2 and last 2 pixel columns
+        blended[:, 0:2]   = 0.5*(img[:, 0:2].astype(np.float32) +
+                                 img[:, -2:].astype(np.float32))
+        blended[:, -2:]   = blended[:, 0:2]
+        out[k] = blended.clip(0,255).astype(np.uint8)
+    return out
+
+# ────────────────────────────────────────────────────────────────
+# 2.  Anti‑alias the pole faces
+# ────────────────────────────────────────────────────────────────
+def antialias_poles(cube, factor=2):
+    """
+    Super‑sample the 'top' and 'bottom' faces by <factor>, then box‑filter
+    back down (cv2.INTER_AREA).   Default factor=2 is enough for 512‑px faces.
+    """
+    out = cube.copy()
+    for pole in ('top', 'bottom'):
+        face = cube[pole]
+        big = cv2.resize(face, (0,0), fx=factor, fy=factor,
+                         interpolation=cv2.INTER_LANCZOS4)
+        out[pole] = cv2.resize(big, (face.shape[1], face.shape[0]),
+                               interpolation=cv2.INTER_AREA)
+    return out
+
