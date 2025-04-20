@@ -1,0 +1,42 @@
+# Default configuration for CubeDiff model
+
+# Model configuration
+model:
+  pretrained_model_name: "runwayml/stable-diffusion-v1-5"
+  lora_rank: 16
+  lora_alpha: 16
+  prediction_type: "v_prediction"  # or "epsilon"
+
+# Data configuration
+data:
+  data_dir: "data/processed/cubemaps"
+  captions_file: "data/processed/captions.json"
+  num_workers: 4
+  batch_size: 1  # Per GPU
+
+# Training configuration
+training:
+  output_dir: "outputs/cubediff"
+  learning_rate: 1.0e-4
+  min_learning_rate: 1.0e-6
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  gradient_accumulation_steps: 4
+  mixed_precision: "fp16"  # or "no"
+  train_steps: 30000
+  save_every_n_steps: 1000
+  eval_every_n_steps: 1000
+
+# Inference configuration
+inference:
+  num_inference_steps: 50
+  guidance_scale: 7.5
+  height: 512
+  width: 512
+
+# Logging configuration
+logging:
+  use_wandb: false
+  wandb_project: "cubediff"
+  wandb_run_name: "cubediff_default"
+  log_every_n_steps: 10

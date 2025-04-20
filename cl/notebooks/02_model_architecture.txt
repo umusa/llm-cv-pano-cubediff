@@ -1,0 +1,389 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# CubeDiff: Model Architecture\n",
+    "\n",
+    "This notebook demonstrates the CubeDiff model architecture implementation:\n",
+    "\n",
+    "1. Load pretrained Stable Diffusion model\n",
+    "2. Implement inflated attention layers\n",
+    "3. Implement synchronized group normalization\n",
+    "4. Add positional encodings\n",
+    "5. Apply LoRA for efficient fine-tuning\n",
+    "6. Test the complete model architecture"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import os\n",
+    "import sys\n",
+    "import numpy as np\n",
+    "import torch\n",
+    "from diffusers import StableDiffusionPipeline, UNet2DConditionModel\n",
+    "from transformers import CLIPTokenizer, CLIPTextModel\n",
+    "import matplotlib.pyplot as plt\n",
+    "\n",
+    "# Add parent directory to path\n",
+    "module_path = os.path.abspath(os.path.join('..'))\n",
+    "if module_path not in sys.path:\n",
+    "    sys.path.append(module_path)\n",
+    "\n",
+    "# Import custom modules\n",
+    "from model.attention import inflate_attention_layer, InflatedAttention\n",
+    "from model.normalization import SynchronizedGroupNorm, replace_group_norms\n",
+    "from model.positional_encoding import CubemapPositionalEncoding\n",
+    "from model.architecture import CubeDiffModel\n",
+    "from training.lora import LoRALayer, add_lora_to_model"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 1. Load Pretrained Stable Diffusion Model"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Load pretrained Stable Diffusion pipeline\n",
+    "model_id = \"runwayml/stable-diffusion-v1-5\"\n",
+    "pipeline = StableDiffusionPipeline.from_pretrained(model_id, torch_dtype=torch.float16)\n",
+    "\n",
+    "# Extract components\n",
+    "unet = pipeline.unet\n",
+    "vae = pipeline.vae\n",
+    "text_encoder = pipeline.text_encoder\n",
+    "tokenizer = pipeline.tokenizer\n",
+    "\n",
+    "# Move to CPU to save GPU memory during testing\n",
+    "unet = unet.to(\"cpu\")\n",
+    "vae = vae.to(\"cpu\")\n",
+    "text_encoder = text_encoder.to(\"cpu\")\n",
+    "\n",
+    "print(f\"UNet parameters: {sum(p.numel() for p in unet.parameters()):,}\")\n",
+    "print(f\"VAE parameters: {sum(p.numel() for p in vae.parameters()):,}\")\n",
+    "print(f\"Text Encoder parameters: {sum(p.numel() for p in text_encoder.parameters()):,}\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 2. Test Inflated Attention Implementation"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Get a sample attention layer from UNet\n",
+    "sample_attn = None\n",
+    "for name, module in unet.named_modules():\n",
+    "    if 'attn' in name and hasattr(module, 'to_q'):\n",
+    "        sample_attn = module\n",
+    "        print(f\"Found attention layer: {name}\")\n",
+    "        break\n",
+    "\n",
+    "# Test inflated attention layer\n",
+    "inflated_attn = inflate_attention_layer(sample_attn)\n",
+    "\n",
+    "# Test forward pass\n",
+    "batch_size = 2\n",
+    "num_faces = 6\n",
+    "seq_len = 16\n",
+    "hidden_dim = sample_attn.to_q.in_features\n",
+    "\n",
+    "# Create test input\n",
+    "test_input = torch.randn(batch_size, num_faces, seq_len, hidden_dim)\n",
+    "test_context = torch.randn(batch_size, num_faces, seq_len, hidden_dim)\n",
+    "\n",
+    "# Run forward pass\n",
+    "with torch.no_grad():\n",
+    "    output = inflated_attn(test_input, test_context)\n",
+    "\n",
+    "print(f\"Input shape: {test_input.shape}\")\n",
+    "print(f\"Output shape: {output.shape}\")\n",
+    "assert output.shape == test_input.shape, \"Output shape doesn't match input shape\""
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 3. Test Synchronized Group Normalization"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Get a sample GroupNorm layer from UNet\n",
+    "sample_gn = None\n",
+    "for name, module in unet.named_modules():\n",
+    "    if isinstance(module, torch.nn.GroupNorm):\n",
+    "        sample_gn = module\n",
+    "        print(f\"Found GroupNorm layer: {name}\")\n",
+    "        print(f\"  num_groups: {module.num_groups}\")\n",
+    "        print(f\"  num_channels: {module.num_channels}\")\n",
+    "        break\n",
+    "\n",
+    "# Create synchronized GroupNorm\n",
+    "synced_gn = SynchronizedGroupNorm(\n",
+    "    num_groups=sample_gn.num_groups,\n",
+    "    num_channels=sample_gn.num_channels,\n",
+    "    eps=sample_gn.eps,\n",
+    "    affine=sample_gn.affine\n",
+    ")\n",
+    "\n",
+    "# Copy weights\n",
+    "if sample_gn.affine:\n",
+    "    synced_gn.weight.data.copy_(sample_gn.weight.data)\n",
+    "    synced_gn.bias.data.copy_(sample_gn.bias.data)\n",
+    "\n",
+    "# Test forward pass\n",
+    "batch_size = 2\n",
+    "num_faces = 6\n",
+    "channels = sample_gn.num_channels\n",
+    "height = 32\n",
+    "width = 32\n",
+    "\n",
+    "# Create test input\n",
+    "test_input = torch.randn(batch_size, num_faces, channels, height, width)\n",
+    "\n",
+    "# Run forward pass\n",
+    "with torch.no_grad():\n",
+    "    output = synced_gn(test_input)\n",
+    "\n",
+    "print(f\"Input shape: {test_input.shape}\")\n",
+    "print(f\"Output shape: {output.shape}\")\n",
+    "assert output.shape == test_input.shape, \"Output shape doesn't match input shape\"\n",
+    "\n",
+    "# Test replacing all GroupNorm layers\n",
+    "small_test_model = torch.nn.Sequential(\n",
+    "    torch.nn.GroupNorm(32, 128),\n",
+    "    torch.nn.Conv2d(128, 128, 3, 1, 1),\n",
+    "    torch.nn.GroupNorm(32, 128),\n",
+    "    torch.nn.Conv2d(128, 256, 3, 1, 1),\n",
+    "    torch.nn.GroupNorm(32, 256)\n",
+    ")\n",
+    "\n",
+    "modified_model = replace_group_norms(small_test_model, in_place=False)\n",
+    "\n",
+    "# Check if GroupNorm layers were replaced\n",
+    "for name, module in modified_model.named_modules():\n",
+    "    if isinstance(module, (torch.nn.GroupNorm, SynchronizedGroupNorm)):\n",
+    "        print(f\"Layer {name}: {type(module).__name__}\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 4. Test Positional Encoding"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Create positional encoding module\n",
+    "pos_enc = CubemapPositionalEncoding(embedding_dim=4, max_resolution=64)\n",
+    "\n",
+    "# Test forward pass\n",
+    "batch_size = 2\n",
+    "num_faces = 6\n",
+    "channels = 4\n",
+    "height = 64\n",
+    "width = 64\n",
+    "\n",
+    "# Create test input\n",
+    "test_input = torch.randn(batch_size, num_faces, channels, height, width)\n",
+    "\n",
+    "# Run forward pass\n",
+    "output = pos_enc(test_input)\n",
+    "\n",
+    "print(f\"Input shape: {test_input.shape}\")\n",
+    "print(f\"Output shape: {output.shape}\")\n",
+    "print(f\"Added {output.shape[2] - test_input.shape[2]} positional encoding channels\")\n",
+    "\n",
+    "# Visualize the positional encoding\n",
+    "face_coords = pos_enc.face_coords.cpu().numpy()\n",
+    "\n",
+    "fig, axs = plt.subplots(2, 3, figsize=(15, 10))\n",
+    "face_names = ['front', 'right', 'back', 'left', 'top', 'bottom']\n",
+    "\n",
+    "for i, face_name in enumerate(face_names):\n",
+    "    row, col = i // 3, i % 3\n",
+    "    # Visualize the x coordinate as RGB\n",
+    "    rgb = face_coords[i, :, :, :3] * 0.5 + 0.5\n",
+    "    axs[row, col].imshow(rgb)\n",
+    "    axs[row, col].set_title(face_name)\n",
+    "    axs[row, col].axis('off')\n",
+    "\n",
+    "plt.tight_layout()\n",
+    "plt.show()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 5. Test LoRA Implementation"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Create a simple linear layer\n",
+    "linear = torch.nn.Linear(128, 256)\n",
+    "\n",
+    "# Add LoRA\n",
+    "lora_layer = LoRALayer(128, 256, rank=4)\n",
+    "\n",
+    "# Test forward pass\n",
+    "test_input = torch.randn(2, 128)\n",
+    "out1 = linear(test_input)\n",
+    "out2 = linear(test_input) + lora_layer(test_input)\n",
+    "\n",
+    "print(f\"Original output shape: {out1.shape}\")\n",
+    "print(f\"LoRA output shape: {out2.shape}\")\n",
+    "\n",
+    "# Test adding LoRA to the whole model\n",
+    "small_model = torch.nn.Sequential(\n",
+    "    torch.nn.Linear(128, 256),\n",
+    "    torch.nn.ReLU(),\n",
+    "    torch.nn.Linear(256, 512)\n",
+    ")\n",
+    "\n",
+    "# Count original parameters\n",
+    "orig_params = sum(p.numel() for p in small_model.parameters() if p.requires_grad)\n",
+    "print(f\"Original trainable parameters: {orig_params:,}\")\n",
+    "\n",
+    "# Add LoRA\n",
+    "lora_params = add_lora_to_model(small_model, rank=4, target_modules=[torch.nn.Linear])\n",
+    "\n",
+    "# Count LoRA parameters\n",
+    "lora_param_count = sum(p.numel() for p in lora_params)\n",
+    "print(f\"LoRA trainable parameters: {lora_param_count:,}\")\n",
+    "print(f\"Parameter reduction: {lora_param_count / orig_params:.2%} of original\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 6. Test Complete CubeDiff Model"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Initialize CubeDiff model\n",
+    "cubediff_model = CubeDiffModel(\"runwayml/stable-diffusion-v1-5\")\n",
+    "\n",
+    "# Count parameters\n",
+    "total_params = sum(p.numel() for p in cubediff_model.parameters())\n",
+    "trainable_params = sum(p.numel() for p in cubediff_model.parameters() if p.requires_grad)\n",
+    "\n",
+    "print(f\"Total parameters: {total_params:,}\")\n",
+    "print(f\"Trainable parameters: {trainable_params:,}\")\n",
+    "print(f\"Parameter efficiency: {trainable_params / total_params:.2%}\")\n",
+    "\n",
+    "# Add LoRA for even more parameter efficiency\n",
+    "from diffusers.models.attention import Attention\n",
+    "lora_params = add_lora_to_model(cubediff_model.base_unet, rank=4, target_modules=[Attention])\n",
+    "\n",
+    "# Count LoRA parameters\n",
+    "lora_param_count = sum(p.numel() for p in lora_params)\n",
+    "trainable_params_with_lora = sum(p.numel() for p in cubediff_model.parameters() if p.requires_grad)\n",
+    "\n",
+    "print(f\"\\nAfter adding LoRA:\")\n",
+    "print(f\"LoRA trainable parameters: {lora_param_count:,}\")\n",
+    "print(f\"Total trainable parameters: {trainable_params_with_lora:,}\")\n",
+    "print(f\"Parameter efficiency: {trainable_params_with_lora / total_params:.2%}\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 7. Test Model Forward Pass"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Create dummy inputs\n",
+    "batch_size = 1\n",
+    "num_faces = 6\n",
+    "channels = 4  # Latent channels\n",
+    "latent_h = 64\n",
+    "latent_w = 64\n",
+    "\n",
+    "# Latents\n",
+    "latents = torch.randn(batch_size, num_faces, channels, latent_h, latent_w)\n",
+    "\n",
+    "# Timesteps\n",
+    "timesteps = torch.tensor([500])\n",
+    "\n",
+    "# Text embeddings (dummy)\n",
+    "encoder_hidden_states = torch.randn(batch_size, 77, 768)  # CLIP embedding size\n",
+    "\n",
+    "# Forward pass\n",
+    "with torch.no_grad():\n",
+    "    output = cubediff_model(latents, timesteps, encoder_hidden_states)\n",
+    "\n",
+    "print(f\"Input shape: {latents.shape}\")\n",
+    "print(f\"Output shape: {output.shape}\")\n",
+    "assert output.shape == latents.shape, \"Output shape doesn't match input shape\""
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.8.10"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 4
+}

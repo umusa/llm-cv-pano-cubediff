@@ -1,0 +1,193 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# CubeDiff: Training Pipeline\n",
+    "\n",
+    "This notebook demonstrates the training pipeline for CubeDiff:\n",
+    "\n",
+    "1. Configure training parameters\n",
+    "2. Initialize the model and training components\n",
+    "3. Train on a small dataset\n",
+    "4. Monitor training progress\n",
+    "5. Save checkpoints"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import os\n",
+    "import sys\n",
+    "import numpy as np\n",
+    "import torch\n",
+    "from diffusers import StableDiffusionPipeline, DDPMScheduler\n",
+    "import matplotlib.pyplot as plt\n",
+    "from PIL import Image\n",
+    "from tqdm.auto import tqdm\n",
+    "import json\n",
+    "import time\n",
+    "\n",
+    "# Add parent directory to path\n",
+    "module_path = os.path.abspath(os.path.join('..'))\n",
+    "if module_path not in sys.path:\n",
+    "    sys.path.append(module_path)\n",
+    "\n",
+    "# Import custom modules\n",
+    "from model.architecture import CubeDiffModel\n",
+    "from data.dataset import CubemapDataset, get_dataloader\n",
+    "from training.trainer import CubeDiffTrainer\n",
+    "from training.lora import add_lora_to_model"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 1. Define Training Configuration"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Create a configuration class\n",
+    "class TrainingConfig:\n",
+    "    def __init__(self):\n",
+    "        # Model config\n",
+    "        self.pretrained_model_name = \"runwayml/stable-diffusion-v1-5\"\n",
+    "        self.lora_rank = 16\n",
+    "        self.lora_alpha = 16\n",
+    "        self.prediction_type = \"v_prediction\"  # or \"epsilon\"\n",
+    "        \n",
+    "        # Training config\n",
+    "        self.output_dir = \"../outputs/cubediff_mini\"\n",
+    "        self.data_dir = \"../data/processed/cubemaps\"\n",
+    "        self.captions_file = \"../data/processed/captions.json\"\n",
+    "        self.batch_size = 1\n",
+    "        self.learning_rate = 1e-4\n",
+    "        self.min_learning_rate = 1e-6\n",
+    "        self.weight_decay = 0.01\n",
+    "        self.max_grad_norm = 1.0\n",
+    "        self.num_workers = 2\n",
+    "        self.gradient_accumulation_steps = 4\n",
+    "        self.mixed_precision = \"fp16\"\n",
+    "        \n",
+    "        # Logging config\n",
+    "        self.use_wandb = False\n",
+    "        self.wandb_project = \"cubediff\"\n",
+    "        self.wandb_run_name = \"cubediff_mini\"\n",
+    "        self.log_every_n_steps = 10\n",
+    "        self.save_every_n_steps = 100\n",
+    "        self.eval_every_n_steps = 100\n",
+    "\n",
+    "config = TrainingConfig()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 2. Prepare Dataset"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Create datasets\n",
+    "train_dataset = CubemapDataset(\n",
+    "    data_dir=config.data_dir,\n",
+    "    captions_file=config.captions_file\n",
+    ")\n",
+    "\n",
+    "# For this mini example, we'll use the same dataset for validation\n",
+    "val_dataset = train_dataset\n",
+    "\n",
+    "print(f\"Training dataset size: {len(train_dataset)}\")\n",
+    "\n",
+    "# Inspect a sample\n",
+    "sample = train_dataset[0]\n",
+    "print(f\"Sample caption: {sample['caption']}\")\n",
+    "print(f\"Sample faces shape: {sample['faces'].shape}\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 3. Initialize and Train Model"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Initialize trainer\n",
+    "trainer = CubeDiffTrainer(\n",
+    "    config=config,\n",
+    "    pretrained_model_name=config.pretrained_model_name,\n",
+    "    output_dir=config.output_dir,\n",
+    "    mixed_precision=config.mixed_precision,\n",
+    "    gradient_accumulation_steps=config.gradient_accumulation_steps\n",
+    ")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Run a mini training session\n",
+    "num_steps = 250  # Just for demonstration\n",
+    "\n",
+    "# Start timer\n",
+    "start_time = time.time()\n",
+    "\n",
+    "# Train the model\n",
+    "trainer.train(\n",
+    "    train_dataset=train_dataset,\n",
+    "    val_dataset=val_dataset,\n",
+    "    num_train_epochs=num_steps\n",
+    ")\n",
+    "\n",
+    "# End timer\n",
+    "end_time = time.time()\n",
+    "training_time = end_time - start_time\n",
+    "\n",
+    "print(f\"\\nTraining completed in {training_time:.2f} seconds\")\n",
+    "print(f\"Average time per step: {training_time / num_steps:.2f} seconds\")\n",
+    "print(f\"Estimated time for 30000 steps: {(training_time / num_steps) * 30000 / 3600:.2f} hours\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 4. Visualize Training Progress"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# If wandb was used, we can visualize the training curves\n",
+    "if config.use_wandb:\n",
+    "    import wandb\n",
+    "    \n",
+    "    # Get run history\n",
+    "    api = wandb.Api()\n",
+    "    run = api.run

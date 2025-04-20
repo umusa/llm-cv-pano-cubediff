@@ -1,0 +1,76 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# CubeDiff: Data Preparation\n",
+    "\n",
+    "This notebook demonstrates the process of preparing panorama data for CubeDiff training.\n",
+    "\n",
+    "1. Download sample panoramas\n",
+    "2. Convert equirectangular panoramas to cubemaps\n",
+    "3. Visualize the data\n",
+    "4. Create datasets and dataloaders"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import os\n",
+    "import sys\n",
+    "import numpy as np\n",
+    "import torch\n",
+    "from PIL import Image\n",
+    "from matplotlib import pyplot as plt\n",
+    "import requests\n",
+    "from tqdm.auto import tqdm\n",
+    "import json\n",
+    "\n",
+    "# Add parent directory to path\n",
+    "module_path = os.path.abspath(os.path.join('..'))\n",
+    "if module_path not in sys.path:\n",
+    "    sys.path.append(module_path)\n",
+    "\n",
+    "# Import custom modules\n",
+    "from data.preprocessing import equirect_to_cubemap, preprocess_panorama_dataset\n",
+    "from data.dataset import CubemapDataset, get_dataloader"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 1. Download Sample Panoramas\n",
+    "\n",
+    "Let's download a few sample panoramas from Polyhaven."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Create data directories\n",
+    "os.makedirs(\"../data/raw\", exist_ok=True)\n",
+    "os.makedirs(\"../data/processed\", exist_ok=True)\n",
+    "\n",
+    "# Sample panorama URLs from Polyhaven\n",
+    "sample_urls = [\n",
+    "    \"https://dl.polyhaven.org/file/ph-assets/HDRIs/exr/2k/alps_field_2k.exr\",\n",
+    "    \"https://dl.polyhaven.org/file/ph-assets/HDRIs/exr/2k/empty_warehouse_01_2k.exr\",\n",
+    "    \"https://dl.polyhaven.org/file/ph-assets/HDRIs/exr/2k/sunflowers_2k.exr\",\n",
+    "    \"https://dl.polyhaven.org/file/ph-assets/HDRIs/exr/2k/venetian_crossroads_2k.exr\",\n",
+    "    \"https://dl.polyhaven.org/file/ph-assets/HDRIs/exr/2k/rural_asphalt_road_2k.exr\"\n",
+    "]\n",
+    "\n",
+    "# Download panoramas\n",
+    "for url in tqdm(sample_urls, desc=\"Downloading panoramas\"):\n",
+    "    filename = os.path.basename(url)\n",
+    "    filepath = os.path.join(\"../data/raw\", filename)\n",
+    "    \n",
+    "    if not os.path

@@ -1,0 +1,49 @@
+# Training configuration for CubeDiff on L4 GPUs
+
+# Model configuration
+model:
+  pretrained_model_name: "runwayml/stable-diffusion-v1-5"
+  lora_rank: 16  # Higher rank for better quality
+  lora_alpha: 16
+  prediction_type: "v_prediction"  # Recommended in CubeDiff paper
+
+# Data configuration - optimized for small dataset
+data:
+  data_dir: "data/processed/cubemaps"
+  captions_file: "data/processed/captions.json"
+  num_workers: 4
+  batch_size: 1  # Small batch size per GPU to fit in memory
+
+# Training configuration - optimized for L4 GPUs
+training:
+  output_dir: "outputs/cubediff_l4"
+  learning_rate: 1.0e-4
+  min_learning_rate: 1.0e-6
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  gradient_accumulation_steps: 8  # Increase effective batch size with lower memory usage
+  mixed_precision: "bf16"  # Use bf16 for L4 GPUs (fallback to fp16 if not supported)
+  train_steps: 20000  # Reduced steps for faster training
+  save_every_n_steps: 500
+  eval_every_n_steps: 500
+
+# Checkpointing for 8-hour training sessions
+checkpointing:
+  auto_resume: true
+  save_total_limit: 5  # Keep only the 5 most recent checkpoints
+  session_length_hours: 8  # Maximum training session length
+
+# Inference configuration
+inference:
+  num_inference_steps: 50
+  guidance_scale: 7.5
+  height: 512
+  width: 512
+
+# Logging configuration
+logging:
+  use_wandb: true
+  wandb_project: "cubediff"
+  wandb_run_name: "cubediff_l4_training"
+  log_every_n_steps: 10
+  log_images_every_n_steps: 500
