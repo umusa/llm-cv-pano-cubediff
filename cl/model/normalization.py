@@ -24,46 +24,71 @@ class SynchronizedGroupNorm(nn.Module):
         Apply synchronized group normalization across cube faces.
         
         Args:
-            x: Input tensor of shape [batch, num_faces, channels, height, width]
+            x: Input tensor (either 4D or 5D)
             
         Returns:
             Normalized tensor of same shape
         """
-        # Get original shape
-        batch_size, num_faces, C, H, W = x.shape
-        
-        # Reshape to normalize across faces
-        x_reshaped = x.view(batch_size, num_faces * C, H, W)
-        
-        # Reshape for group norm calculation
-        N, C_all, H, W = x_reshaped.shape
-        G = self.num_groups
-        
-        # Reshape input to separate groups
-        x_reshaped = x_reshaped.view(N, G, C_all // G, H, W)
-        
-        # Calculate mean and var across spatial dims and group channels
-        mean = x_reshaped.mean(dim=(2, 3, 4), keepdim=True)
-        var = x_reshaped.var(dim=(2, 3, 4), keepdim=True, unbiased=False)
-        
-        # Normalize
-        x_reshaped = (x_reshaped - mean) / torch.sqrt(var + self.eps)
-        
-        # Reshape back
-        x_reshaped = x_reshaped.view(N, C_all, H, W)
-        
-        # Apply weight and bias if affine
-        if self.affine:
-            # Reshape weight and bias for broadcasting
-            weight = self.weight.view(1, C, 1, 1).repeat(1, num_faces, 1, 1).view(1, C_all, 1, 1)
-            bias = self.bias.view(1, C, 1, 1).repeat(1, num_faces, 1, 1).view(1, C_all, 1, 1)
+        # Check if input is 4D or 5D
+        if len(x.shape) == 5:
+            # Input is [batch, num_faces, channels, height, width]
+            batch_size, num_faces, C, H, W = x.shape
             
-            x_reshaped = x_reshaped * weight + bias
-        
-        # Reshape back to original format
-        x_normalized = x_reshaped.view(batch_size, num_faces, C, H, W)
-        
-        return x_normalized
+            # Reshape to normalize across faces
+            x_reshaped = x.view(batch_size, num_faces * C, H, W)
+            
+            # Reshape for group norm calculation
+            N, C_all, H, W = x_reshaped.shape
+            G = self.num_groups
+            
+            # Reshape input to separate groups
+            x_reshaped = x_reshaped.view(N, G, C_all // G, H, W)
+            
+            # Calculate mean and var across spatial dims and group channels
+            mean = x_reshaped.mean(dim=(2, 3, 4), keepdim=True)
+            var = x_reshaped.var(dim=(2, 3, 4), keepdim=True, unbiased=False)
+            
+            # Normalize
+            x_reshaped = (x_reshaped - mean) / torch.sqrt(var + self.eps)
+            
+            # Reshape back
+            x_reshaped = x_reshaped.view(N, C_all, H, W)
+            
+            # Apply weight and bias if affine
+            if self.affine:
+                # Reshape weight and bias for broadcasting
+                weight = self.weight.view(1, C, 1, 1).repeat(1, num_faces, 1, 1).view(1, C_all, 1, 1)
+                bias = self.bias.view(1, C, 1, 1).repeat(1, num_faces, 1, 1).view(1, C_all, 1, 1)
+                
+                x_reshaped = x_reshaped * weight + bias
+            
+            # Reshape back to original format
+            x_normalized = x_reshaped.view(batch_size, num_faces, C, H, W)
+            
+            return x_normalized
+        else:
+            # Input is standard [batch, channels, height, width]
+            N, C, H, W = x.shape
+            G = self.num_groups
+            
+            # Reshape input to separate groups
+            x_reshaped = x.view(N, G, C // G, H, W)
+            
+            # Calculate mean and var across spatial dims and group channels
+            mean = x_reshaped.mean(dim=(2, 3, 4), keepdim=True)
+            var = x_reshaped.var(dim=(2, 3, 4), keepdim=True, unbiased=False)
+            
+            # Normalize
+            x_reshaped = (x_reshaped - mean) / torch.sqrt(var + self.eps)
+            
+            # Reshape back
+            x_reshaped = x_reshaped.view(N, C, H, W)
+            
+            # Apply weight and bias if affine
+            if self.affine:
+                x_reshaped = x_reshaped * self.weight.view(1, C, 1, 1) + self.bias.view(1, C, 1, 1)
+            
+            return x_reshaped
 
 def replace_group_norms(module, in_place=True):
     """

@@ -16,6 +16,7 @@ class CubeDiffPipeline:
         pretrained_model_name="runwayml/stable-diffusion-v1-5",
         checkpoint_path=None,
         device="cuda",
+        strict_loading=True
     ):
         self.device = device
         
@@ -42,11 +43,27 @@ class CubeDiffPipeline:
         self.model = CubeDiffModel(pretrained_model_name)
         
         # Load checkpoint if provided
-        if checkpoint_path:
-            self.model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+        # if checkpoint_path:
+        #     self.model.load_state_dict(torch.load(checkpoint_path, map_location=device))
         
+        if checkpoint_path:
+            state_dict = torch.load(checkpoint_path, map_location="cpu")
+            try:
+                self.model.load_state_dict(state_dict, strict=strict_loading)
+            except RuntimeError as e:
+                # If strict loading fails, try with a more permissive approach
+                if strict_loading:
+                    print(f"Strict loading failed, attempting non-strict loading: {e}")
+                    self.model.load_state_dict(state_dict, strict=False)
+                    print("Non-strict loading succeeded")
+                else:
+                    # If non-strict loading also fails, raise the error
+                    raise e
+                
         self.model.to(device)
         self.model.eval()
+
+
     
     def generate(
         self,

@@ -76,6 +76,7 @@ logs/
 *.zip
 *.tar
 *.gz
+*.exr
 
 # Exception for README images
 !images/*.png

@@ -129,38 +129,38 @@ def add_lora_to_model(model, rank=4, alpha=1.0, target_modules=None):
     target_modules = target_modules or [Attention]
     lora_params = []
     
-    for name, module in model.named_modules():
+    # First collect all modules to modify
+    modules_to_modify = []
+    for name, module in list(model.named_modules()):
         if any(isinstance(module, target_type) for target_type in target_modules):
             if isinstance(module, nn.Linear):
-                # Add LoRA to linear layer
-                _, lora_layer = add_lora_to_linear_layer(module, rank, alpha)
-                parent_name = '.'.join(name.split('.')[:-1])
-                child_name = name.split('.')[-1] + '_lora'
-                
-                if parent_name:
-                    parent = model
-                    for part in parent_name.split('.'):
-                        parent = getattr(parent, part)
-                    setattr(parent, child_name, lora_layer)
-                else:
-                    setattr(model, child_name, lora_layer)
-                
-                lora_params.extend(list(lora_layer.parameters()))
-            
+                modules_to_modify.append((name, module, "linear"))
             elif isinstance(module, Attention):
-                # Add LoRA to attention module
-                lora_attn = LoRAAttention(module, rank, alpha)
-                parent_name = '.'.join(name.split('.')[:-1])
-                child_name = name.split('.')[-1] + '_lora'
-                
-                if parent_name:
-                    parent = model
-                    for part in parent_name.split('.'):
-                        parent = getattr(parent, part)
-                    setattr(parent, child_name, lora_attn)
-                else:
-                    setattr(model, child_name, lora_attn)
-                
-                lora_params.extend([p for p in lora_attn.parameters() if p.requires_grad])
+                modules_to_modify.append((name, module, "attention"))
     
-    return lora_params        
+    # Then modify the collected modules
+    for name, module, module_type in modules_to_modify:
+        parent_name = '.'.join(name.split('.')[:-1])
+        child_name = name.split('.')[-1] + '_lora'
+        
+        # Get the parent module
+        if parent_name:
+            parent = model
+            for part in parent_name.split('.'):
+                parent = getattr(parent, part)
+        else:
+            parent = model
+        
+        if module_type == "linear":
+            # Add LoRA to linear layer
+            _, lora_layer = add_lora_to_linear_layer(module, rank, alpha)
+            setattr(parent, child_name, lora_layer)
+            lora_params.extend(list(lora_layer.parameters()))
+        
+        elif module_type == "attention":
+            # Add LoRA to attention module
+            lora_attn = LoRAAttention(module, rank, alpha)
+            setattr(parent, child_name, lora_attn)
+            lora_params.extend([p for p in lora_attn.parameters() if p.requires_grad])
+    
+    return lora_params     

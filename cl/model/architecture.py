@@ -46,6 +46,9 @@ class CubeDiffModel(nn.Module):
                 self.base_unet.conv_in.weight
             )
             self.modified_conv_in.bias.copy_(self.base_unet.conv_in.bias)
+        
+        # Permanently replace the conv_in layer with our modified version
+        self.base_unet.conv_in = self.modified_conv_in
     
     def inflate_attention_layers(self):
         """
@@ -53,7 +56,7 @@ class CubeDiffModel(nn.Module):
         """
         # Process all attention layers in the model
         for name, module in self.base_unet.named_modules():
-            if isinstance(module, (nn.MultiheadAttention, nn.modules.attention.MultiheadAttention)):
+            if isinstance(module, nn.MultiheadAttention):
                 # Get parent module
                 parent_name = '.'.join(name.split('.')[:-1])
                 parent_module = self.base_unet
@@ -94,7 +97,7 @@ class CubeDiffModel(nn.Module):
         for face_idx in range(num_faces):
             face_latent = latents_with_pos[:, face_idx]
             
-            # Forward through UNet
+            # Forward through UNet with the permanently modified conv_in
             noise_pred = self.base_unet(
                 face_latent,
                 timesteps,
