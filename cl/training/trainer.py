@@ -1356,7 +1356,7 @@ def add_memory_monitoring(trainer):
     # Add method to trainer
     trainer.adapt_to_memory_pressure = types.MethodType(adapt_to_memory_pressure, trainer)
     
-    return trainer
+    return trainer 
 
 
 # Define the function in a cell before training
@@ -1370,3 +1370,179 @@ def get_tensor_info(tensor, name="tensor"):
             print(f"{name} - Grad fn: {tensor.grad_fn}")
     except:
         pass
+
+
+def fix_loss_curve(trainer):
+    """
+    Minimal fix for loss curve visualization that produces just a single figure.
+    This solution intercepts wandb logging to capture and plot loss data.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import os
+    
+    # Initialize empty arrays for tracking loss data
+    trainer.steps = []
+    trainer.losses = []
+    
+    # Create a single figure that will be updated
+    trainer.fig, trainer.ax = plt.subplots(figsize=(10, 6))
+    trainer.ax.set_xlabel('Step')
+    trainer.ax.set_ylabel('Loss')
+    trainer.ax.set_title('Training Loss')
+    trainer.ax.grid(True)
+    trainer.ax.set_xlim([0, 10])  # Initial view until we get data
+    trainer.ax.set_ylim([0, 2])   # Initial y-range until we get data
+    
+    # Store original wandb log method to intercept data
+    if hasattr(trainer, 'wandb_run') and trainer.wandb_run is not None:
+        original_wandb_log = trainer.wandb_run.log
+        
+        def intercept_wandb_log(log_dict, *args, **kwargs):
+            """Intercept wandb logging to capture loss data"""
+            # Extract loss and step if present
+            if 'train/loss' in log_dict and 'train/step' in log_dict:
+                loss_val = log_dict['train/loss']
+                step_val = log_dict['train/step']
+                
+                # Store the values without duplicates
+                if step_val not in trainer.steps:
+                    trainer.steps.append(step_val)
+                    trainer.losses.append(loss_val)
+                    
+                    # Update the plot
+                    trainer.ax.clear()
+                    trainer.ax.plot(trainer.steps, trainer.losses, 'b-', linewidth=2)
+                    trainer.ax.set_xlabel('Step')
+                    trainer.ax.set_ylabel('Loss')
+                    trainer.ax.set_title('Training Loss')
+                    trainer.ax.grid(True)
+                    
+                    # Set proper axis limits
+                    trainer.ax.set_xlim([0, max(trainer.steps) * 1.05])
+                    
+                    if len(trainer.losses) > 1:
+                        min_loss = min(trainer.losses)
+                        max_loss = max(trainer.losses)
+                        margin = (max_loss - min_loss) * 0.1 if max_loss > min_loss else 0.1
+                        trainer.ax.set_ylim([max(0, min_loss - margin), max_loss + margin])
+                    
+                    # Save the updated plot, overwriting previous version
+                    plt.tight_layout()
+                    plt.savefig(os.path.join(trainer.logs_dir, 'loss_curve.png'))
+                    
+                    # Save raw data as backup
+                    np.save(os.path.join(trainer.logs_dir, 'loss_data.npy'), 
+                          {'steps': trainer.steps, 'losses': trainer.losses})
+            
+            # Call the original log method
+            return original_wandb_log(log_dict, *args, **kwargs)
+        
+        # Replace wandb log method to intercept data
+        trainer.wandb_run.log = intercept_wandb_log
+    
+    # Override existing plot method if it exists
+    if hasattr(trainer, 'steps') and hasattr(trainer, 'losses'):
+        # Don't create multiple figures - just update the existing one
+        original_plot = plt.figure
+        
+        def single_figure_plot(*args, **kwargs):
+            """Ensure only one figure is created"""
+            if hasattr(trainer, 'fig') and plt.fignum_exists(trainer.fig.number):
+                # Return existing figure instead of creating a new one
+                return trainer.fig
+            else:
+                # If no figure exists, create one
+                return original_plot(*args, **kwargs)
+        
+        # Replace plt.figure with our version
+        plt.figure = single_figure_plot
+    
+    # Save the initial empty plot
+    plt.tight_layout()
+    os.makedirs(trainer.logs_dir, exist_ok=True)
+    plt.savefig(os.path.join(trainer.logs_dir, 'loss_curve.png'))
+    
+    return trainer
+
+
+# def direct_fix_loss_curve(trainer):
+#     """
+#     Direct fix for the loss curve issue that accesses wandb log data
+#     and creates a proper visualization without modifying training methods.
+#     """
+#     import matplotlib.pyplot as plt
+#     import numpy as np
+#     import os
+#     import types
+    
+#     # Initialize empty arrays for tracking loss data
+#     trainer.steps = []
+#     trainer.losses = []
+    
+#     # Store original wandb log method to intercept data
+#     if hasattr(trainer, 'wandb_run') and trainer.wandb_run is not None:
+#         original_wandb_log = trainer.wandb_run.log
+        
+#         def intercept_wandb_log(log_dict, *args, **kwargs):
+#             """Intercept wandb logging to capture loss data"""
+#             # Extract loss and step if present
+#             if 'train/loss' in log_dict and 'train/step' in log_dict:
+#                 loss_val = log_dict['train/loss']
+#                 step_val = log_dict['train/step']
+                
+#                 # Store the values
+#                 if step_val not in trainer.steps:
+#                     trainer.steps.append(step_val)
+#                     trainer.losses.append(loss_val)
+                    
+#                     # Create a proper plot with the data
+#                     if not hasattr(trainer, 'fig') or trainer.fig is None:
+#                         trainer.fig, trainer.ax = plt.subplots(figsize=(10, 6))
+                    
+#                     trainer.ax.clear()
+#                     trainer.ax.plot(trainer.steps, trainer.losses, 'b-', linewidth=2)
+#                     trainer.ax.set_xlabel('Step')
+#                     trainer.ax.set_ylabel('Loss')
+#                     trainer.ax.set_title('Training Loss')
+#                     trainer.ax.grid(True)
+                    
+#                     # Set proper axis limits
+#                     trainer.ax.set_xlim([0, max(trainer.steps) * 1.05])
+                    
+#                     if len(trainer.losses) > 1:
+#                         min_loss = min(trainer.losses)
+#                         max_loss = max(trainer.losses)
+#                         margin = (max_loss - min_loss) * 0.1 if max_loss > min_loss else 0.1
+#                         trainer.ax.set_ylim([max(0, min_loss - margin), max_loss + margin])
+                    
+#                     # Save the plot
+#                     plt.tight_layout()
+#                     plt.savefig(os.path.join(trainer.logs_dir, 'loss_curve.png'))
+                    
+#                     # Also save raw data as backup
+#                     np.save(os.path.join(trainer.logs_dir, 'loss_data.npy'), 
+#                           {'steps': trainer.steps, 'losses': trainer.losses})
+            
+#             # Call the original log method
+#             return original_wandb_log(log_dict, *args, **kwargs)
+        
+#         # Replace wandb log method to intercept data
+#         trainer.wandb_run.log = intercept_wandb_log
+    
+#     # Create the initial plot figure
+#     if not hasattr(trainer, 'fig') or trainer.fig is None:
+#         trainer.fig, trainer.ax = plt.subplots(figsize=(10, 6))
+#         trainer.ax.set_xlabel('Step')
+#         trainer.ax.set_ylabel('Loss')
+#         trainer.ax.set_title('Training Loss')
+#         trainer.ax.grid(True)
+#         trainer.ax.set_xlim([0, 10])  # Initial view until we get data
+#         trainer.ax.set_ylim([0, 2])   # Initial y-range until we get data
+    
+#     # Save the initial empty plot
+#     plt.tight_layout()
+#     os.makedirs(trainer.logs_dir, exist_ok=True)
+#     plt.savefig(os.path.join(trainer.logs_dir, 'loss_curve_init.png'))
+    
+#     return trainer
