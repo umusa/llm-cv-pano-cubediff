@@ -119,7 +119,7 @@ class CubeDiffTrainer:
             print(f"Large batch size detected ({self.config.batch_size}). Consider reducing if memory issues persist.")
         elif not hasattr(self.config, 'batch_size'):
             # Set default if not provided
-            self.config.batch_size = 4
+            self.config.batch_size = 32 # 4
             print(f"Setting batch_size to {self.config.batch_size}")
         
         # Set multiprocessing start method to 'spawn' which is more stable 
@@ -792,20 +792,23 @@ class CubeDiffTrainer:
                 
                 for i in range(faces.shape[1]):
                     face = faces[:, i]
-                    
-                    # Handle channel dimension ordering
-                    if face.shape[-1] == 3:  # If channels are last
-                        face = face.permute(0, 3, 1, 2)  # NHWC -> NCHW
-                    
-                    # Convert to VAE dtype
-                    face = face.to(dtype=vae_dtype, device=vae_device)
-                    
-                    # Normalize if needed
-                    if face.max() > 1.0:
-                        face = face / 127.5 - 1.0
-                    
-                    # Encode safely
-                    face_latent = self.safe_encode_with_vae(face)
+                    if face.shape[1] == 4 and face.shape[2] == 64 and face.shape[3] == 64:
+                        # Already a latent, no need to encode
+                        face_latent = face
+                    else: 
+                        # Handle channel dimension ordering
+                        if face.shape[-1] == 3:  # If channels are last
+                            face = face.permute(0, 3, 1, 2)  # NHWC -> NCHW
+                        
+                        # Convert to VAE dtype
+                        face = face.to(dtype=vae_dtype, device=vae_device)
+                        
+                        # Normalize if needed
+                        if face.max() > 1.0:
+                            face = face / 127.5 - 1.0
+                        
+                        # Encode safely
+                        face_latent = self.safe_encode_with_vae(face)
                     latents.append(face_latent)
                 
                 # Stack latents along face dimension
@@ -1120,10 +1123,10 @@ class CubeDiffTrainer:
             self._original_num_workers = self.config.num_workers
             
             # Start with conservative values
-            self.config.batch_size = 1
-            self.config.num_workers = 0
+            self.config.batch_size = self.config.batch_size # 1
+            self.config.num_workers = self.config.num_workers # 0
             
-            print(f"Progressive loading enabled. Starting with batch_size=1, num_workers=0")
+            print(f"Progressive loading enabled. Starting with batch_size={self.config.batch_size}, num_workers={self.config.num_workers}")
             print(f"Will gradually increase to batch_size={self._original_batch_size}, num_workers={self._original_num_workers}")
 
     def progressive_loading_step(self, global_step):

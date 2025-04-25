@@ -1,6 +1,8 @@
 import torch
 from torch.optim import AdamW
 import types
+import time
+from cl.training.system_config import monitor_memory, clear_gpu_memory, detailed_memory_usage
 
 def fix_mixed_precision_issue(trainer):
     """
@@ -60,13 +62,13 @@ def fix_mixed_precision_issue(trainer):
         # Instead we'll define our own fixed training loop here
         
         # Setup for generating sample images
-        if hasattr(self.config, 'sample_prompts') and self.config.sample_prompts:
-            sample_prompts = self.config.sample_prompts
-        else:
-            sample_prompts = [
-                "A beautiful mountain lake at sunset with snow-capped peaks",
-                "A futuristic cityscape with tall skyscrapers and flying vehicles"
-            ]
+        # if hasattr(self.config, 'sample_prompts') and self.config.sample_prompts:
+        #     sample_prompts = self.config.sample_prompts
+        # else:
+        #     sample_prompts = [
+        #         "A beautiful mountain lake at sunset with snow-capped peaks",
+        #         "A futuristic cityscape with tall skyscrapers and flying vehicles"
+        #     ]
         
         # Training loop
         global_step = 0
@@ -87,13 +89,19 @@ def fix_mixed_precision_issue(trainer):
         progress_bar = tqdm(range(num_train_epochs), desc="Training")
         
         print("fix_mixed_precision.py - fix_mixed_precision_issue - Patched main training loop started with", num_train_epochs, "epochs ...")
-        
+        print(f"self.config is {self.config}")
         # Main training loop 
+        # Call before your training starts
+        detailed_memory_usage()
         try:
             for epoch in range(num_train_epochs):
+                torch.cuda.empty_cache()
+                epoch_start_time = time.time()
                 print(f"------------ fix_mixed_precision.py - fix_mixed_precision_issue - Patched main training loop started with epoch {epoch} ----------")
                 for step, batch in enumerate(train_dataloader):
-                    print(f"*** fix_mixed_precision.py - fix_mixed_precision_issue - training step started with step {step}")
+                    torch.cuda.empty_cache()
+                    step_start_time = time.time()
+                    # print(f"*** fix_mixed_precision.py - fix_mixed_precision_issue - training step started with step {step}, batch_size is {self.config.batch_size} ...")
                     # Extract batch data
                     faces = batch["faces"]  # [batch, 6, C, H, W]
                     captions = batch["caption"]
@@ -107,35 +115,43 @@ def fix_mixed_precision_issue(trainer):
                         return_tensors="pt"
                     ).input_ids.to(self.accelerator.device)
                     
+                    # print(f"*** fix_mixed_precision.py - fix_mixed_precision_issue - after process captions text")
+
                     with torch.no_grad():
                         text_embeddings = self.text_encoder(tokens)[0]
-                    
+                    # print(f"*** fix_mixed_precision.py - fix_mixed_precision_issue - after text_embeddings = self.text_encoder(tokens)[0]")
+
                     # Process face images with VAE
                     latents = []
                     vae_param = next(self.vae.parameters())
                     vae_dtype = vae_param.dtype
                     vae_device = vae_param.device
-                    
+                    # print(f"*** fix_mixed_precision.py - fix_mixed_precision_issue - process each facew started ...")
                     for i in range(faces.shape[1]):
                         face = faces[:, i]
-                        
-                        # Ensure correct format
-                        if face.shape[-1] == 3:  # If channels are last
-                            face = face.permute(0, 3, 1, 2)  # NHWC -> NCHW
-                        
-                        # Convert to VAE dtype and device
-                        face = face.to(dtype=vae_dtype, device=vae_device)
-                        
-                        # Normalize if needed
-                        if face.max() > 1.0:
-                            face = face / 127.5 - 1.0
-                        
-                        # Encode with VAE
-                        with torch.no_grad():
-                            face_latent = self.vae.encode(face).latent_dist.sample() * 0.18215
+                        if face.shape[1] == 4 and face.shape[2] == 64 and face.shape[3] == 64:
+                            # Already a latent, no need to encode
+                            face_latent = face
+                        else:                          
+                            # Ensure correct format
+                            if face.shape[-1] == 3:  # If channels are last
+                                face = face.permute(0, 3, 1, 2)  # NHWC -> NCHW
+                            
+                            # Convert to VAE dtype and device
+                            face = face.to(dtype=vae_dtype, device=vae_device)
+                            
+                            # Normalize if needed
+                            if face.max() > 1.0:
+                                face = face / 127.5 - 1.0
+                            
+                            # Encode with VAE
+                            # print(f"*** fix_mixed_precision.py - fix_mixed_precision_issue - Encode with VAE - face shape is {face.shape}")
+                            with torch.no_grad():
+                                face_latent = self.vae.encode(face).latent_dist.sample() * 0.18215
                         
                         latents.append(face_latent)
                     
+                    # print(f"*** fix_mixed_precision.py - fix_mixed_precision_issue - all faces processed")
                     # Stack latents
                     latents = torch.stack(latents, dim=1)
                     
@@ -147,7 +163,8 @@ def fix_mixed_precision_issue(trainer):
                         (latents.shape[0],),
                         device=self.accelerator.device,
                     )
-                    
+                    # print(f"*** fix_mixed_precision.py - fix_mixed_precision_issue - ssert noise")
+
                     # The key fix: proper gradient accumulation with accelerator
                     # This avoids the unscale_() error by ensuring the optimizer step
                     # is called correctly within the accumulation context
@@ -158,10 +175,12 @@ def fix_mixed_precision_issue(trainer):
                         noisy_latents = self.noise_scheduler.add_noise(
                             latents_f32, noise_f32, timesteps
                         ).to(latents.dtype)
-                        
+                        # print(f"*** fix_mixed_precision.py - fix_mixed_precision_issue - added noise")
+
                         # Get model prediction
                         noise_pred = self.model(noisy_latents, timesteps, text_embeddings)
-                        
+                        # print(f"*** fix_mixed_precision.py - fix_mixed_precision_issue - get model prediction")
+
                         # Compute loss (use float32 for stability)
                         if self.config.prediction_type == "epsilon":
                             target = noise
@@ -171,16 +190,20 @@ def fix_mixed_precision_issue(trainer):
                             )
                         else:
                             raise ValueError(f"Unknown prediction type: {self.config.prediction_type}")
-                        
+                        # print(f"*** fix_mixed_precision.py - fix_mixed_precision_issue - \
+                            #   self.config.prediction_type is {self.config.prediction_type}, set target")
+
                         # Make sure both tensors have the same dtype for loss computation
                         noise_pred = noise_pred.float()
                         target = target.float()
                         
                         loss = torch.nn.functional.mse_loss(noise_pred, target)
-                        
+                        # print(f"*** fix_mixed_precision.py - fix_mixed_precision_issue - get mse_loss between noise_pred, target")
+
                         # Backward pass
                         self.accelerator.backward(loss)
-                        
+                        # print(f"*** fix_mixed_precision.py - fix_mixed_precision_issue - accelerator backward")
+
                         # Clip gradients if needed
                         if self.accelerator.sync_gradients:                 # <─ only on last micro‑batch
                             if self.config.max_grad_norm > 0:
@@ -194,7 +217,9 @@ def fix_mixed_precision_issue(trainer):
                             optimizer.step()
                             lr_scheduler.step()
                             optimizer.zero_grad(set_to_none=True)              # clear grads for next accumulation window
-                            
+                            # print(f"*** fix_mixed_precision.py - fix_mixed_precision_issue - self.accelerator.sync_gradients is {self.accelerator.sync_gradients}")
+                        # print(f"*** fix_mixed_precision.py - fix_mixed_precision_issue - after self.accelerator.sync_gradients")
+
                     # Log metrics and save checkpoints
                     if global_step % self.config.log_every_n_steps == 0:
                         time_elapsed = (datetime.datetime.now() - start_time).total_seconds() / 60.0
@@ -223,13 +248,15 @@ def fix_mixed_precision_issue(trainer):
                     # Save checkpoint
                     if global_step % self.config.save_every_n_steps == 0:
                         self.save_checkpoint(os.path.join(self.output_dir, f"checkpoint-{global_step}"))
-                    
+                    # print(f"*** fix_mixed_precision.py - fix_mixed_precision_issue - Save checkpoint")
+
                     # Generate samples
-                    if hasattr(self.config, 'sample_every_n_steps') and \
-                    self.config.sample_every_n_steps > 0 and \
-                    global_step % self.config.sample_every_n_steps == 0:
-                        self.generate_samples(sample_prompts, global_step)
-                    
+                    # if hasattr(self.config, 'sample_every_n_steps') and \
+                    # self.config.sample_every_n_steps > 0 and \
+                    # global_step % self.config.sample_every_n_steps == 0:
+                    #     self.generate_samples(sample_prompts, global_step)
+                    # print(f"*** fix_mixed_precision.py - fix_mixed_precision_issue - generate_samples")
+
                     # Evaluate model
                     if val_dataloader and global_step % self.config.eval_every_n_steps == 0:
                         eval_loss = self.evaluate(val_dataloader)
@@ -238,17 +265,27 @@ def fix_mixed_precision_issue(trainer):
                         if self.wandb_run:
                             self.wandb_run.log({"val/loss": eval_loss})
                     
+                    print(f"*** fix_mixed_precision.py - fix_mixed_precision_issue - Evaluate model with eval_loss as {eval_loss}")
+
                     global_step += 1
                     progress_bar.update(1)
-                    
+                    step_end_time = time.time()
                     # # Break if maximum steps reached
                     # if global_step >= num_train_epochs:
                     #     break
-                
+                    clear_gpu_memory()
+                    # monitor_memory()
+                    torch.cuda.empty_cache()
+                    print(f"*** fix_mixed_precision.py - fix_mixed_precision_issue - training step {step} done, cost {step_end_time - step_start_time} seconds")
                 # Break if maximum steps reached
                 # if global_step >= num_train_epochs:
                 #     break
-                    
+            epoch_end_time = time.time()
+            torch.cuda.empty_cache()
+            clear_gpu_memory()
+            # monitor_memory()
+            print(f"*** fix_mixed_precision.py - fix_mixed_precision_issue - epoch {epoch} done, cost {epoch_end_time - epoch_start_time} seconds")
+
         except Exception as e:
             print(f"Runtime error: {str(e)}")
             print(f"Training error: {str(e)}")
