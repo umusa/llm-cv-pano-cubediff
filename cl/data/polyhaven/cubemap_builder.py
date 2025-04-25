@@ -12,6 +12,11 @@ import concurrent.futures
 import multiprocessing
 import time
 import sys
+import OpenEXR, Imath
+
+# from concurrent.futures import ProcessPoolExecutor
+from multiprocessing import get_context
+from concurrent.futures import ProcessPoolExecutor  # still used for API compatibility
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -406,6 +411,7 @@ def load_hdr_image_gpu(erp_path: Union[str, pathlib.Path]) -> Optional[np.ndarra
     Returns:
         np.ndarray or None: Loaded image as numpy array, or None if loading failed
     """
+    logger.info("▶ Using Python OpenEXR to load .exr")
     erp_path = str(erp_path)
     
     # Fast path for EXR files
@@ -725,34 +731,26 @@ def batch_convert(src_dir, dst_dir, face_px=512):
         logger.warning(f"No panorama files found in {src_dir}")
         return 0
     
-    logger.info(f"Converting {len(erp_files)} panoramas using {NUM_CPU_CORES} processes")
-    
-    # Process panoramas in parallel
+    logger.info(f"Converting {len(erp_files)} panoramas using {NUM_CPU_CORES} CPU processes")
     successful = 0
-    
-    # Create a progress bar
     pbar = tqdm.tqdm(total=len(erp_files), desc="Converting panoramas")
-    
-    # Use ThreadPoolExecutor for I/O-bound operations
-    with concurrent.futures.ThreadPoolExecutor(max_workers=NUM_CPU_CORES) as executor:
-        # Submit all tasks
-        future_to_path = {
-            executor.submit(process_panorama, path, dst_dir, face_px): path 
-            for path in erp_files
-        }
-        
-        # Process results as they complete
-        for future in concurrent.futures.as_completed(future_to_path):
-            path = future_to_path[future]
+ 
+    # Switch to true multiprocessing for CPU‐bound conversion
+    spawn_ctx = get_context("spawn")
+    with ProcessPoolExecutor(
+        max_workers=NUM_CPU_CORES,
+        mp_context=spawn_ctx
+    ) as executor:
+        futures = {executor.submit(process_panorama, path, dst_dir, face_px): path
+                   for path in erp_files}
+        for fut in concurrent.futures.as_completed(futures):
+            p = futures[fut]
             try:
-                if future.result():
+                if fut.result():
                     successful += 1
             except Exception as e:
-                logger.error(f"Failed to process {path}: {e}")
-            
-            # Update progress bar
+                logger.error(f"Error processing {p.name}: {e}")
             pbar.update(1)
-    
     pbar.close()
     
     logger.info(f"Successfully converted {successful} out of {len(erp_files)} panoramas")

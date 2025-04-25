@@ -215,11 +215,18 @@ def main():
     # Create output directories
     try:
         logger.info(f"Creating output directories in {args.out}")
+        # tmp = pathlib.Path(args.out) / "raw"
+        # erp_dir = tmp / "erp"
+        # faces_dir = tmp / "faces"
+        # latent_dir = pathlib.Path(args.out) / "latents"
+        
         tmp = pathlib.Path(args.out) / "raw"
         erp_dir = tmp / "erp"
-        faces_dir = tmp / "faces"
+        # we want raw/faces and raw/panoramas, so point conversion at tmp
+        conversion_root = tmp
+        faces_dir = conversion_root / "faces"
         latent_dir = pathlib.Path(args.out) / "latents"
-        
+
         os.makedirs(tmp, exist_ok=True)
         os.makedirs(erp_dir, exist_ok=True)
         os.makedirs(faces_dir, exist_ok=True)
@@ -249,10 +256,17 @@ def main():
         sys.exit(1)
         
     # Convert to cubemap faces
+    # try:
+    #     logger.info("Converting equirectangular panoramas to cubemap faces...")
+    #     num_converted = batch_convert(erp_dir, faces_dir, face_px=512)
+    #     logger.info(f"Converted {num_converted} panoramas to cubemap faces")
     try:
         logger.info("Converting equirectangular panoramas to cubemap faces...")
-        num_converted = batch_convert(erp_dir, faces_dir, face_px=512)
+        num_converted = batch_convert(erp_dir, conversion_root, face_px=512)
         logger.info(f"Converted {num_converted} panoramas to cubemap faces")
+        if num_converted == 0:
+            logger.error("No panoramas were converted—something went wrong!")
+            sys.exit(1)
     except Exception as e:
         logger.error(f"Error during cubemap conversion: {e}")
         sys.exit(1)
