@@ -156,17 +156,23 @@ class CubeDiffTrainer:
                 input_ids      = batch["input_ids"].to(self.accelerator.device)     # [B, L]
                 attention_mask = batch["attention_mask"].to(self.accelerator.device)# [B, L]
 
-                with torch.no_grad():
-                    # pass both IDs and mask into your text_encoder
-                    txt_outputs = self.text_encoder(input_ids, attention_mask=attention_mask)
-                    txt_emb     = txt_outputs.last_hidden_state      # or txt_outputs[0]
+                # with torch.no_grad():
+                #     # pass both IDs and mask into your text_encoder
+                #     txt_outputs = self.text_encoder(input_ids, attention_mask=attention_mask)
+                #     txt_emb     = txt_outputs.last_hidden_state      # or txt_outputs[0]
 
                 noise     = torch.randn_like(lat)
                 timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps,
                                           (lat.shape[0],), device=lat.device)
                 noisy_lat = self.noise_scheduler.add_noise(lat, noise, timesteps)
 
-                pred = self.model(noisy_lat, timesteps, txt_emb)
+                # pred = self.model(noisy_lat, timesteps, txt_emb)
+                pred = self.model(
+                    noisy_lat,
+                    timesteps,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask
+                )
                 print(f"trainer.py - CubeDiffTrainer - after text_encoder - after self.model(noisy_lat, timesteps, txt_emb) - get pred\n")
 
                 loss = torch.nn.functional.mse_loss(pred.float(), noise.float())
