@@ -254,7 +254,7 @@ def fix_mixed_precision_issue(trainer):
                     # if hasattr(self.config, 'sample_every_n_steps') and \
                     # self.config.sample_every_n_steps > 0 and \
                     # global_step % self.config.sample_every_n_steps == 0:
-                    #     self.generate_samples(sample_prompts, global_step)
+                        self.generate_samples(sample_prompts, global_step)
                     # print(f"*** fix_mixed_precision.py - fix_mixed_precision_issue - generate_samples")
 
                     # Evaluate model

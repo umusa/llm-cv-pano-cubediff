@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from diffusers import UNet2DConditionModel
-from diffusers.models.unet_2d_condition import UNet2DConditionModel
+from diffusers.models.unets import UNet2DConditionModel
 
 from .attention import inflate_attention_layer
 from .normalization import replace_group_norms
@@ -74,6 +74,16 @@ class CubeDiffModel(nn.Module):
         """
         replace_group_norms(self.base_unet, in_place=True)
     
+     # Add this method to your class
+    def enable_gradient_checkpointing(self):
+        # Enable gradient checkpointing on the underlying UNet
+        if hasattr(self, "unet"):
+            self.unet.enable_gradient_checkpointing()
+        # For any other submodules that support gradient checkpointing
+        for module in self.modules():
+            if hasattr(module, "gradient_checkpointing"):
+                module.gradient_checkpointing = True
+
     def forward(self, latents, timesteps, encoder_hidden_states):
         """
         Forward pass for CubeDiff model.

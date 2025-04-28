@@ -1,0 +1,21 @@
+# ------------------------------------------------------------
+#  Accelerate config for a single GCP VM with **4 × NVIDIA L4**
+#  Generated once by `accelerate config default …`, provided
+#  here so you can copy-paste instead of running the wizard.
+# ------------------------------------------------------------
+compute_environment: LOCAL_MACHINE        # running on one VM
+distributed_type: MULTI_GPU              # torchrun backend
+num_processes: 4                         # 4 GPUs
+gpu_ids: all                             # or "0,1,2,3"
+main_process_port: 29501                 # free TCP port
+machine_rank: 0
+num_machines: 1
+mixed_precision: bf16                    # L4 tensor-cores
+downcast_bf16: no                        # keep bf16 in optimizer
+main_training_function: main
+tpu_env: {}
+fsdp_config: {}
+deepspeed_config: {}
+megatron_lm_config: {}
+distributed_kwargs: {}
+# ------------------------------------------------------------
