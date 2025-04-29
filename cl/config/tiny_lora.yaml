@@ -1,8 +1,8 @@
-#  LoRA fine-tuning of CubeDiff “tiny” model – 700 panoramas
+#  configure for LoRA fine-tuning of CubeDiff “tiny” model – 700 panoramas
 # --- data --------------------------------------------------
 dataset:       "../data/dataspace/polyhaven_tiny/cubediff_train.tar"    # ← train tar
 val_dataset:   "../data/dataspace/polyhaven_tiny/cubediff_val.tar"      # ← val tar
-batch_size:    1          # 2 per-GPU
+batch_size:    2          # 2 per-GPU
 num_workers:   1 
 
 # --- optimisation -----------------------------------------

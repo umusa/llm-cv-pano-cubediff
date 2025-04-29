@@ -1,7 +1,17 @@
+import torch._dynamo
+# completely disable Dynamo/inductor so no libcuda.so check ever happens
+torch._dynamo.disable()
 # -------------  cl/training/trainer.py  --------------------
-# Re-written sections are marked  ✱✱✱  ; everything else is unchanged.
-import os, datetime, time, json, types, numpy as np
+
+import os
+# tell torch.compile to use AOT‐eager by default, never inductor
+os.environ["TORCH_COMPILE_BACKEND"] = "aot_eager"
 import torch
+import torch._dynamo
+# suppress any Dynamo/inductor errors so we always fall back cleanly
+torch._dynamo.config.suppress_errors = True
+
+import datetime, time, json, types, numpy as np
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from accelerate import Accelerator
@@ -10,12 +20,10 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import wandb, psutil, threading
 
-# ✱✱✱ NEW imports
 from cl.data.latent_webdataset import get_dataloader
 from cl.training.lora        import apply_lora
 from cl.model.architecture   import CubeDiffModel
 # -----------------------------------------------------------
-
 
 class CubeDiffTrainer:
     def __init__(self, config,
@@ -27,13 +35,13 @@ class CubeDiffTrainer:
         self.output_dir = Path(output_dir); self.output_dir.mkdir(exist_ok=True, parents=True)
         self.images_dir = self.output_dir / "samples"; self.images_dir.mkdir(exist_ok=True)
         self.logs_dir   = self.output_dir / "logs";    self.logs_dir.mkdir(exist_ok=True)
+        self.mixed_precision = mixed_precision
 
         # Accelerator
         self.accelerator = Accelerator(mixed_precision=mixed_precision,
                                        gradient_accumulation_steps=gradient_accumulation_steps)
 
         # optional offline-wandb
-        # if getattr(self.config, "use_wandb", False):
         if "use_wandb" not in self.config:
             wandb.init(dir=str(self.logs_dir/"wandb"),
                        project=self.config.get("wandb_project","cubediff"),
@@ -54,19 +62,52 @@ class CubeDiffTrainer:
                     torch_dtype=torch.bfloat16)                    # bf16 to save vram
 
         self.vae, self.text_encoder, self.tokenizer = pipe.vae, pipe.text_encoder, pipe.tokenizer
-        self.vae.requires_grad_(False);   self.text_encoder.requires_grad_(False)
+        self.vae.requires_grad_(False)
+        self.text_encoder.requires_grad_(False)
 
-        self.noise_scheduler = DDPMScheduler.from_pretrained(pretrained_model_name, subfolder="scheduler")
+        # Set up noise scheduler
+        self.noise_scheduler = DDPMScheduler.from_pretrained(
+            pretrained_model_name,
+            subfolder="scheduler",
+        )
+        dtype = torch.float16 if self.mixed_precision == "fp16" else torch.float32
+        # align scheduler buffers with chosen dtype
+        for k, v in self.noise_scheduler.__dict__.items():
+            if isinstance(v, torch.Tensor):
+                setattr(self.noise_scheduler, k, v.to(dtype))
 
         # build CubeDiff UNet (float32 → optimiser stability)
         self.model = CubeDiffModel(pretrained_model_name).to(dtype=torch.float32)
-        print(f"trainer.py - CubeDiffTrainer - after build CubeDiffModel with name as {self.model._get_name()}")
-        self.model = apply_lora(self.model, r=self.config["lora_r"], alpha=self.config["lora_alpha"])
-        print(f"trainer.py - CubeDiffTrainer - after apply_lora")
+        print(f"trainer.py - CubeDiffTrainer - after build CubeDiffModel: {self.model._get_name()}")
+        
+        # … after building self.model = CubeDiffModel(...)
+        # Use our custom LoRA injection from cl/training/lora.py
+        # which directly patches the UNet’s Q/K/V/out modules.
+        self.model = apply_lora(
+          self.model,
+          r=self.config["lora_r"],
+          alpha=self.config["lora_alpha"]
+        )
         self.model.enable_gradient_checkpointing()
-        print(f"trainer.py - CubeDiffTrainer - after enable_gradient_checkpointing")
-        self.model = torch.compile(self.model)
-        print(f"trainer.py - CubeDiffTrainer - after torch.compile model")
+
+        # Try to compile with torch.compile, but fall back to eager if libcuda.so is missing.
+        # try:
+        #     # you can also do backend="eager" to disable any inductor kernels
+        #     self.model = torch.compile(self.model, backend="inductor")
+        #     self.model.base_unet = torch.compile(self.model.base_unet, backend="inductor")
+        # except AssertionError as e:
+        #     print("⚠️  torch.compile(inductor) failed (missing libcuda.so?), falling back to eager:", e)
+        #     self.model = torch.compile(self.model, backend="eager")
+        #     self.model.base_unet = torch.compile(self.model.base_unet, backend="eager")
+
+        # Enable gradient checkpointing on the U-Net
+        self.model.base_unet.enable_gradient_checkpointing()
+        print("trainer.py - Enabled gradient checkpointing on base_unet")
+
+        # Compile with torch.compile() — thanks to TORCH_COMPILE_BACKEND="aot_eager",
+        # this will use the aot_eager backend (no inductor), and suppress errors.
+        # self.model = torch.compile(self.model)
+        # self.model.base_unet = torch.compile(self.model.base_unet)
 
         tot = sum(p.numel() for p in self.model.parameters())
         train = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
@@ -79,10 +120,8 @@ class CubeDiffTrainer:
         self.train_dataloader = get_dataloader(
                 self.config["dataset"],
                 batch_size = self.config["batch_size"],
-                # workers       = getattr(self.config, "num_workers", 4))
                 num_workers       = self.config.get("num_workers", 4))
         print(f"trainer.py - CubeDiffTrainer - after train_dataloader\n")
-        # if getattr(self.config, "val_dataset", None):
         if "val_dataset" in self.config:
             self.val_dataloader = get_dataloader(
                     self.config["val_dataset"],
@@ -99,16 +138,15 @@ class CubeDiffTrainer:
 
         # Wrap only model + train loader in Accelerator.
         # Checking “if self.val_dataloader” would call __len__()
-        # on your WebDataset (no __len__ → TypeError), so we skip it here.
+        # on the WebDataset (no __len__ → TypeError), so skip it here.
         # shard/move model + train loader to GPU (or DDP device)
         self.model, self.train_dataloader = self.accelerator.prepare(
             self.model,
             self.train_dataloader,
         )
         # Leave self.val_dataloader unwrapped; run it manually under
-        # torch.no_grad() in your eval/sampling loop if you need it.
+        # torch.no_grad() in eval/sampling loop if need it.
         # This is standard practice in multi-GPU setups.
-        # ─────── KEY FIX ───────
         # now that we've moved into GPU/DDP, also put text_encoder and VAE on that device
         self.text_encoder.to(self.accelerator.device)
         self.vae.to(self.accelerator.device)
@@ -135,56 +173,63 @@ class CubeDiffTrainer:
         # and (b) threshold for next eval
         processed_samples = 0
         next_eval_at      = eval_every_n_samples
-
-        gstep = 0; start = time.time()
+        gstep = 0
         train_losses, val_losses = [], []
-
+        g_start_tm = time.time()
+        print(f"trainer.py - CubeDiffTrainer - the training loop started with batch_size as {self.config['batch_size']}, eval_every_n_samples as {eval_every_n_samples} ...")
         for step, batch in enumerate(self.train_dataloader):
-            print(f"Batch type: {type(batch)}")
-            if isinstance(batch, dict):
-                print(f"Batch keys: {batch.keys()}")
-                for k, v in batch.items():
-                    print(f"Key: {k}, Type: {type(v)}, ", end="")
-                    if isinstance(v, torch.Tensor):
-                        print(f"Shape: {v.shape}")
-                    else:
-                        print(f"Value: {v}")
-                        
+            print(f"---------------- training step {step} ----------------")
+            # if isinstance(batch, dict):
+            #     print(f"Batch keys: {batch.keys()}")
+            #     for k, v in batch.items():
+            #         print(f"Key: {k}, Type: {type(v)}, ", end="")
+            #         if isinstance(v, torch.Tensor):
+            #             print(f"Shape: {v.shape}")
+            #         else:
+            #             print(f"Value: {v}")
+            start_tm = time.time()
             with self.accelerator.accumulate(self.model):
                 # … inside for step, batch in enumerate(self.train_dataloader):
                 lat = batch["latent"].to(self.accelerator.device)              # [B,6,4,64,64]
                 input_ids      = batch["input_ids"].to(self.accelerator.device)     # [B, L]
                 attention_mask = batch["attention_mask"].to(self.accelerator.device)# [B, L]
 
-                # with torch.no_grad():
-                #     # pass both IDs and mask into your text_encoder
-                #     txt_outputs = self.text_encoder(input_ids, attention_mask=attention_mask)
-                #     txt_emb     = txt_outputs.last_hidden_state      # or txt_outputs[0]
-
                 noise     = torch.randn_like(lat)
                 timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps,
                                           (lat.shape[0],), device=lat.device)
                 noisy_lat = self.noise_scheduler.add_noise(lat, noise, timesteps)
 
-                # pred = self.model(noisy_lat, timesteps, txt_emb)
+                # 1) precompute CLIP text embeddings (frozen, no grad)
+                with torch.no_grad():
+                    clip_out = self.text_encoder(
+                        input_ids, # panorama caption token
+                        attention_mask=attention_mask
+                    )
+                    txt_emb = clip_out.last_hidden_state
+
+                # 2) forward through CubeDiffModel via encoder_hidden_states
                 pred = self.model(
-                    noisy_lat,
-                    timesteps,
-                    input_ids=input_ids,
-                    attention_mask=attention_mask
+                    latents=noisy_lat,
+                    timesteps=timesteps,
+                    encoder_hidden_states=txt_emb
                 )
-                print(f"trainer.py - CubeDiffTrainer - after text_encoder - after self.model(noisy_lat, timesteps, txt_emb) - get pred\n")
+                                
+                # print(f"trainer.py - CubeDiffTrainer - after text_encoder - after self.model(noisy_lat, timesteps, txt_emb) - get pred\n")
 
                 loss = torch.nn.functional.mse_loss(pred.float(), noise.float())
-                print(f"trainer.py - CubeDiffTrainer - after mse_loss - get loss\n")
+                print(f"training loss {loss}\n")
                 self.accelerator.backward(loss)
-                print(f"trainer.py - CubeDiffTrainer - after accelerator backward\n")
+                # print(f"trainer.py - CubeDiffTrainer - after accelerator backward\n")
 
                 if self.accelerator.sync_gradients:
                     self.accelerator.clip_grad_norm_(self.model.parameters(), 1.0)
                     optim.step(); optim.zero_grad(); sched.step()
+                    print(f"self.accelerator.sync_gradients is {self.accelerator.sync_gradients} - done\n")
 
-            # ---- logging & sampling
+            end_tm = time.time()
+            print(f"in the training loop - step {step} cost {end_tm - start_tm:.2f} seconds\n")
+
+            # ---- logging & sampling ----------------
             if self.accelerator.is_main_process:
                 # 1) update sample count
                 batch_size = batch["latent"].size(0)
@@ -193,24 +238,32 @@ class CubeDiffTrainer:
                 # 2) log train loss every N steps (unchanged)
                 if gstep % self.config["log_every_n_steps"] == 0:
                     train_losses.append((processed_samples, loss.item()))
-                    print(f"samples {processed_samples:>4}  train-loss {loss.item():.4f}")
+                    print(f"logging - batch_size is {batch_size}, samples {processed_samples:>4}  train-loss {loss.item():.4f}")
 
                 # 3) every `eval_every_n_samples`, eval + sample‐gen
                 if eval_every_n_samples and processed_samples >= next_eval_at:
                     val_loss = self.evaluate()
                     val_losses.append((processed_samples, val_loss))
                     print(f"→ val‐loss @ {processed_samples} samples: {val_loss:.4f}")
-                    # generate panorama from current LoRA checkpoint
+
+                    # generate panorama from current LoRA checkpoint - why the generated panorama is black ?!
                     self.generate_samples(sample_prompts, processed_samples)
                     next_eval_at += eval_every_n_samples
-
+                    print(f"in the training loop - logging and sampling - self.accelerator.is_main_process is {self.accelerator.is_main_process} - after self.generate_samples - val_loss is {val_loss}\n")
+                    
             gstep += 1
+        g_end_tm = time.time()
+        print(f"out of the training loop - all steps done, gstep is {gstep}, cost {g_end_tm - g_start_tm:.2f} seconda\n")
 
-        # save final LoRA
+        # ----------------- save final LoRA ----------------------
         if self.accelerator.is_main_process:
             path = self.output_dir / "adapter_model.bin"
-            torch.save(self.accelerator.get_state_dict(self.model)['base_unet'], path)
-            print(f"\n✔ saved LoRA to {path}")
+            # pull the real underlying model out of the Accelerator wrapper
+            unwrapped = self.accelerator.unwrap_model(self.model)
+            # grab just the U-Net’s weights
+            unet_sd = unwrapped.base_unet.state_dict()
+            torch.save(unet_sd, path)
+            print(f"\n✔ saved U-Net adapter to {path}")
 
         # ───────────────────────────────────────────────────────────────
         # after all training, plot train & val curves
@@ -240,19 +293,47 @@ class CubeDiffTrainer:
     def generate_samples(self, prompts, step):
         from cl.inference.pipeline import CubeDiffPipeline
         self.accelerator.wait_for_everyone()
-        if not self.accelerator.is_main_process: return
+        if not self.accelerator.is_main_process: 
+            return
 
         tmp_ckpt = self.output_dir / f"tmp_{step}.bin"
 
-        torch.save(self.accelerator.get_state_dict(self.model)['base_unet'], tmp_ckpt)
+        # pull the *underlying* model off of the accelerator
+        unwrapped = self.accelerator.unwrap_model(self.model)
+        # get just the UNet weights
+        unet_sd   = unwrapped.base_unet.state_dict()
+        torch.save(unet_sd, tmp_ckpt)
+        print(f"in generate_samples -  unet_sd tmp_ckpt saved at {tmp_ckpt}\n")
 
-        pipe = CubeDiffPipeline(pretrained_model_name="runwayml/stable-diffusion-v1-5",
-                                checkpoint_path=str(tmp_ckpt),
-                                device="cuda")
+        # 1) instantiate pipeline normally
+        pipe = CubeDiffPipeline(
+            pretrained_model_name="runwayml/stable-diffusion-v1-5"
+        )
+
+        # 2) read your U-Net weights back
+        adapter_state = torch.load(tmp_ckpt, map_location="cuda")
+        
+        # 3) cast them to the same dtype as the pipeline’s U-Net
+        unet_dtype = next(pipe.model.base_unet.parameters()).dtype
+        for k, v in adapter_state.items():
+            adapter_state[k] = v.to(unet_dtype)
+        
+        # 4) load *only* into the U-Net
+        missing, unexpected = pipe.model.base_unet.load_state_dict(adapter_state, strict=False)
+        print("in generate_samples - loaded UNet adapter, missing: ", missing)
+
+        print(f"in generate_samples -  create inference pipe and generate the pnoaram based on the given prompts\n")
         for i,p in enumerate(prompts):
+            # why the generated panorama is black ?!
             pano = pipe.generate(p, num_inference_steps=30, guidance_scale=7.5)
+            temp = self.images_dir / f"step{step}_{i}.jpg"
             pano.save(self.images_dir / f"step{step}_{i}.jpg")
+            print(f"in generate_samples - prompt is {p}, saved pano at {temp}\n")
+
         tmp_ckpt.unlink()
+        if os.path.exists(tmp_ckpt):
+            os.remove(tmp_ckpt)
+        print(f"in generate_samples - prompts is {prompts}, step is {step}, pano saved at {temp}, unet tmp_ckpt {tmp_ckpt} was removed\n")
 
         # ---------------------------------------------------------------------
         # ✱✱✱  New: run a full pass over val_dataloader and return avg loss. ✱✱✱
@@ -281,7 +362,11 @@ class CubeDiffTrainer:
                     device=lat.device
                 )
                 noisy_lat = self.noise_scheduler.add_noise(lat, noise, timesteps)
-                pred      = self.model(noisy_lat, timesteps, txt_emb)
+                pred    = self.model(
+                    latents=noisy_lat,
+                    timesteps=timesteps,
+                    encoder_hidden_states=txt_emb
+                )
 
                 loss = torch.nn.functional.mse_loss(pred.float(), noise.float(), reduction="mean")
                 running += loss.item() * lat.size(0)

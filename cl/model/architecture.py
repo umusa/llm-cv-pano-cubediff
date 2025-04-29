@@ -63,9 +63,10 @@ class CubeDiffModel(nn.Module):
         """Enable gradient checkpointing on the U-Net"""
         self.base_unet.enable_gradient_checkpointing()
 
+    
     def forward(
         self,
-        latents,                   # [B, num_faces, C, H, W]
+        latents,                   # [B, F, C, H, W]
         timesteps,                 # [B] or scalar
         encoder_hidden_states=None,
         input_ids=None,
@@ -73,28 +74,42 @@ class CubeDiffModel(nn.Module):
         **kwargs
     ):
         """
-        Forward with either precomputed embeddings or raw tokens.
+        Forward pass for CubeDiff:
+        - If `encoder_hidden_states` is None, uses `input_ids`+`attention_mask` to compute them.
+        - Adds UV positional encoding,
+            flattens faces so U-Net sees [B*F, C+2, H, W],
+            repeats timesteps per face,
+            then reshapes back to [B, F, C, H, W].
         """
-        # If embeddings not provided, compute from tokens
+        # 1) if you only got raw tokens, build embeddings now
         if encoder_hidden_states is None:
-            if input_ids is None:
-                raise ValueError("Provide either encoder_hidden_states or input_ids + attention_mask")
+            if input_ids is None or attention_mask is None:
+                raise ValueError("Must provide either encoder_hidden_states or both input_ids+attention_mask")
             with torch.no_grad():
-                out = self.text_encoder(input_ids, attention_mask=attention_mask)
-                encoder_hidden_states = out.last_hidden_state
-        # Apply positional encoding to latents
+                clip_out = self.text_encoder(input_ids, attention_mask=attention_mask)
+                encoder_hidden_states = clip_out.last_hidden_state  # [B, L, D]
+
         B, F, C, H, W = latents.shape
+
+        # 2) positional encode and flatten latents to [B*F, C+2, H, W]
         lat = self.positional_encoding(latents)
-        # Reshape for U-Net: merge face dimension
         lat = lat.view(B * F, C + 2, H, W)
-        # Repeat timesteps per face
+
+        # 3) repeat timesteps per face → [B*F]
         if isinstance(timesteps, torch.Tensor):
             timesteps = timesteps.unsqueeze(1).repeat(1, F).view(-1)
-        # U-Net forward
-        pred = self.base_unet(
-            lat,
-            timesteps,
-            encoder_hidden_states=encoder_hidden_states
-        ).sample
-        # Restore face batch dimension
-        return pred.view(B, F, *pred.shape[1:])
+
+        # 4) tile the CLIP embeddings to match that same B*F batch
+        #    from [B, L, D] → [B, 1, L, D] → [B, F, L, D] → [B*F, L, D]
+        hs = encoder_hidden_states
+        B2, L, D = hs.shape
+        if B2 != B:
+            raise ValueError(f"batch mismatch: embeddings batch {B2} vs latents batch {B}")
+        hs = hs.unsqueeze(1).expand(B, F, L, D).reshape(B * F, L, D)
+
+        # 5) run your modified UNet with the correctly‐sized embeddings
+        out = self.base_unet(lat, timesteps, encoder_hidden_states=hs).sample  # [B*F, C, H, W]
+
+        # 6) un‐flatten the face dimension
+        return out.view(B, F, *out.shape[1:])
+
