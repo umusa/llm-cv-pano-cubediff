@@ -41,19 +41,28 @@ class CubeDiffModel(nn.Module):
 
         # Positional encoding for cubemap faces
         self.positional_encoding = CubemapPositionalEncoding(
-            embedding_dim=4,
+            embedding_dim=9, # ← NEW matches change abov
             max_resolution=64
         )
 
         # Modify conv_in to accept additional UV channels
+        # in_ch = self.base_unet.conv_in.in_channels
+        # new_conv = nn.Conv2d(
+        #     in_ch + 2,
+        #     self.base_unet.conv_in.out_channels,
+        #     kernel_size=self.base_unet.conv_in.kernel_size,
+        #     stride=self.base_unet.conv_in.stride,
+        #     padding=self.base_unet.conv_in.padding
+        # )
+
+        extra = self.positional_encoding.embedding_dim
         in_ch = self.base_unet.conv_in.in_channels
-        new_conv = nn.Conv2d(
-            in_ch + 2,
-            self.base_unet.conv_in.out_channels,
-            kernel_size=self.base_unet.conv_in.kernel_size,
-            stride=self.base_unet.conv_in.stride,
-            padding=self.base_unet.conv_in.padding
-        )
+        new_conv = nn.Conv2d(in_ch + extra,                  # +9 instead of +2
+                            self.base_unet.conv_in.out_channels,
+                            kernel_size=self.base_unet.conv_in.kernel_size,
+                            stride=self.base_unet.conv_in.stride,
+                            padding=self.base_unet.conv_in.padding)
+
         with torch.no_grad():
             new_conv.weight[:, :in_ch].copy_(self.base_unet.conv_in.weight)
             new_conv.bias.copy_(self.base_unet.conv_in.bias)
@@ -93,8 +102,9 @@ class CubeDiffModel(nn.Module):
 
         # 2) positional encode and flatten latents to [B*F, C+2, H, W]
         # lat = self.positional_encoding(latents)
-        lat = self.positional_encoding(latents, resolution=H)
-        lat = lat.view(B * F, C + 2, H, W)
+        # lat = lat.view(B * F, C + 2, H, W)
+        lat = self.positional_encoding(latents, resolution=H)  # already returns C+9
+        lat = lat.view(B*F, C + self.positional_encoding.embedding_dim, H, W)
 
         # 3) repeat timesteps per face → [B*F]
         if isinstance(timesteps, torch.Tensor):

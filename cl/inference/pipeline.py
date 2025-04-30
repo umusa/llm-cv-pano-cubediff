@@ -173,7 +173,7 @@ class CubeDiffPipeline:
             device=self.device,
             dtype=model_dtype,
         )
-        print(f"pipeline.py - CubeDiffPipeline - generate() - before Denoise latents, latents shape is {latents.shape}, latents is {latents}\n")
+        print(f"pipeline.py - CubeDiffPipeline - generate() - before Denoise latents, latents shape is {latents.shape}, latents type is {type(latents)}\n")
 
         # Denoise latents
         for t in self.scheduler.timesteps:
@@ -209,7 +209,7 @@ class CubeDiffPipeline:
             latents = self.scheduler.step(noise_pred, t, latents).prev_sample
             # print(f"pipeline.py - CubeDiffPipeline - generate() - Get model prediction - after update latents - latents shape is {latents.shape}, latents is {latents}\n")
 
-        print(f"pipeline.py - CubeDiffPipeline - generate() - after Denoise latents, latents shape is {latents.shape}, latents is {latents}\n")
+        print(f"pipeline.py - CubeDiffPipeline - generate() - after Denoise latents, latents shape is {latents.shape}, latents type is {type(latents)}\n")
         # Decode latents
         with torch.no_grad():
             cube_faces = []
@@ -240,18 +240,18 @@ class CubeDiffPipeline:
         cube_faces = cube_faces.cpu().permute(0, 2, 3, 1).numpy()  # [6, H, W, 3]
         
         # Convert to equirectangular (panorama)
-        print(f"pipeline.py - CubeDiffPipeline - generate() - before cubemap_to_equirect, cube_faces shape is {cube_faces.shape}, cube_faces is {cube_faces}\n")
+        print(f"pipeline.py - CubeDiffPipeline - generate() - before cubemap_to_equirect, cube_faces shape is {cube_faces.shape}\n")
         equirect = cubemap_to_equirect(cube_faces, height * 2, width * 4)
         
         if output_type == "np":
             return equirect
         
         # Convert to PIL image
-        print(f"pipeline.py - CubeDiffPipeline - generate() - before converted to PIL image, equirect shape is {equirect.shape}, equirect is {equirect}\n")
+        print(f"pipeline.py - CubeDiffPipeline - generate() - before converted to PIL image, equirect shape is {equirect.shape}\n")
         equirect = (equirect * 255).astype(np.uint8)
-        print(f"pipeline.py - CubeDiffPipeline - generate() - after equirect * 255, equirect is {equirect}\n")
+        print(f"pipeline.py - CubeDiffPipeline - generate() - after equirect * 255\n")
         equirect_pil = Image.fromarray(equirect)
-        print(f"pipeline.py - CubeDiffPipeline - generate() - after converted to PIL image, equirect is {equirect_pil}\n")
+        print(f"pipeline.py - CubeDiffPipeline - generate() - after converted to PIL image\n")
 
         # ───────── NEW: optional down-scale preview ─────────
         if preview_hw is not None and output_type == "pil":

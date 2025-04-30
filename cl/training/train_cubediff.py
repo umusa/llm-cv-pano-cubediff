@@ -16,6 +16,7 @@ def main():
     args = ap.parse_args()
 
     cfg = yaml.safe_load(pathlib.Path(args.cfg).read_text())
+    print(f"train_cubediff.py - cfg is {cfg}")
     trainer = CubeDiffTrainer(
                 config  = cfg,
                 output_dir = cfg.get("output_dir", "outputs/cubediff_run"),

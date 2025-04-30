@@ -23,6 +23,7 @@ import wandb, psutil, threading
 from cl.data.latent_webdataset import get_dataloader
 from cl.training.lora        import apply_lora
 from cl.model.architecture   import CubeDiffModel
+from cl.training.seam_loss import seam_loss 
 # -----------------------------------------------------------
 
 class CubeDiffTrainer:
@@ -32,6 +33,7 @@ class CubeDiffTrainer:
                  mixed_precision="bf16",                 # <-- default bf16
                  gradient_accumulation_steps=1):
         self.config  = config
+        print(f"trainer.py - CUbeDiffTrainer - config is {self.config}")
         self.output_dir = Path(output_dir); self.output_dir.mkdir(exist_ok=True, parents=True)
         self.images_dir = self.output_dir / "samples"; self.images_dir.mkdir(exist_ok=True)
         self.logs_dir   = self.output_dir / "logs";    self.logs_dir.mkdir(exist_ok=True)
@@ -83,6 +85,9 @@ class CubeDiffTrainer:
         # … after building self.model = CubeDiffModel(...)
         # Use our custom LoRA injection from cl/training/lora.py
         # which directly patches the UNet’s Q/K/V/out modules.
+
+        print(f"trainer.py - CUbeDiffTrainer - config is {self.config}")
+        
         self.model = apply_lora(
           self.model,
           r=self.config["lora_r"],
@@ -217,6 +222,8 @@ class CubeDiffTrainer:
                 # print(f"trainer.py - CubeDiffTrainer - after text_encoder - after self.model(noisy_lat, timesteps, txt_emb) - get pred\n")
 
                 loss = torch.nn.functional.mse_loss(pred.float(), noise.float())
+                # loss = loss + 0.1 * seam_loss(pred.float(), noise.float()) # (λ = 0.1 is the weight used by CubeDiff; adjust if needed.)
+                loss      = loss + 0.1 * seam_loss(pred)     # use new signature
                 print(f"training loss {loss}\n")
                 self.accelerator.backward(loss)
                 # print(f"trainer.py - CubeDiffTrainer - after accelerator backward\n")
@@ -368,7 +375,10 @@ class CubeDiffTrainer:
                     encoder_hidden_states=txt_emb
                 )
 
-                loss = torch.nn.functional.mse_loss(pred.float(), noise.float(), reduction="mean")
+                # loss = torch.nn.functional.mse_loss(pred.float(), noise.float(), reduction="mean")
+                # loss = loss + 0.1 * seam_loss(pred.float(), noise.float()) # (λ = 0.1 is the weight used by CubeDiff; adjust if needed.)
+                base = torch.nn.functional.mse_loss(pred.float(), noise.float(), reduction="mean")
+                loss = base + 0.1 * seam_loss(pred)
                 running += loss.item() * lat.size(0)
                 total   += lat.size(0)
 
