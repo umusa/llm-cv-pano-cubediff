@@ -111,6 +111,9 @@ class CubeDiffPipeline:
         height=512,
         width=512,
         output_type="pil",
+        *,
+        preview_hw=(512, 1024),                 # NEW – (h,w) you want to see
+        preview_interpolation=Image.BILINEAR # or LANCZOS / NEAREST
     ):
         """
         Generate a panorama from a text prompt.
@@ -250,5 +253,10 @@ class CubeDiffPipeline:
         equirect_pil = Image.fromarray(equirect)
         print(f"pipeline.py - CubeDiffPipeline - generate() - after converted to PIL image, equirect is {equirect_pil}\n")
 
+        # ───────── NEW: optional down-scale preview ─────────
+        if preview_hw is not None and output_type == "pil":
+            equirect_pil = equirect_pil.resize(preview_hw[::-1],  # PIL expects (w,h)
+                            resample=preview_interpolation)
+            
         return equirect_pil
 # EOF -------------------

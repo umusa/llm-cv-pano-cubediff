@@ -92,7 +92,8 @@ class CubeDiffModel(nn.Module):
         B, F, C, H, W = latents.shape
 
         # 2) positional encode and flatten latents to [B*F, C+2, H, W]
-        lat = self.positional_encoding(latents)
+        # lat = self.positional_encoding(latents)
+        lat = self.positional_encoding(latents, resolution=H)
         lat = lat.view(B * F, C + 2, H, W)
 
         # 3) repeat timesteps per face → [B*F]

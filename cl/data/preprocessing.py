@@ -104,11 +104,109 @@ def cubemap_to_equirect(cube_faces, out_h, out_w):
         Numpy array of equirectangular panorama
     """
     # Implementation similar to above but in reverse
-    # ...
-    
     # Placeholder implementation for now
-    equirect = np.zeros((out_h, out_w, 3), dtype=np.uint8)
-    return equirect
+    # equirect = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+    """
+    Inverse of `equirect_to_cubemap`.
+    Args
+    ----
+    cube_faces : (6, H, W, 3) uint8/float32 array  – front, right, back, left, top, bottom
+    out_h, out_w : int                              – desired panorama size
+    Returns
+    -------
+    equirect : (out_h, out_w, 3) float32 in [0,1]
+    """
+    cube_faces = np.asarray(cube_faces)
+
+    # normalise only if the data are uint8
+    if cube_faces.dtype == np.uint8:
+        cube_faces = cube_faces.astype(np.float32) / 255.0
+    else:                                 # already float 0-1
+        cube_faces = cube_faces.astype(np.float32)
+
+    N  = cube_faces.shape[1]        # face resolution
+    yy, xx = np.meshgrid(np.arange(out_h), np.arange(out_w), indexing="ij")
+
+    # 1) spherical angles
+    phi   = (xx / out_w  - 0.5) * 2 * np.pi        # [-π, π]
+    theta = (0.5 - yy / out_h) * np.pi             # [-π/2, π/2]
+
+    # 2) unit vectors
+    cos_t = np.cos(theta)
+    xs = cos_t * np.cos(phi)
+    ys = cos_t * np.sin(phi)
+    zs = np.sin(theta)
+
+    ax, ay, az = np.abs(xs), np.abs(ys), np.abs(zs)
+
+    # allocate output
+    equirect = np.empty((out_h, out_w, 3), dtype=np.float32)
+
+    # helper to sample from a face with bilinear filtering
+    def sample(face_idx, s, t):
+        # (s,t) in [-1,1] ⇒ pixel coords
+        u = (s + 1) * 0.5 * (N - 1)
+        v = (t + 1) * 0.5 * (N - 1)
+
+        u0 = np.floor(u).astype(np.int32)
+        v0 = np.floor(v).astype(np.int32)
+        u1 = np.clip(u0 + 1, 0, N - 1)
+        v1 = np.clip(v0 + 1, 0, N - 1)
+
+        du = (u - u0)[..., None]
+        dv = (v - v0)[..., None]
+
+        # gather
+        c00 = cube_faces[face_idx, v0, u0]
+        c01 = cube_faces[face_idx, v0, u1]
+        c10 = cube_faces[face_idx, v1, u0]
+        c11 = cube_faces[face_idx, v1, u1]
+
+        return (1 - du) * (1 - dv) * c00 + \
+               du       * (1 - dv) * c01 + \
+               (1 - du) *  dv      * c10 + \
+               du       *  dv      * c11
+
+    # 3) face masks & projections
+    # --- +X (front) and –X (back)
+    mask = (ax >= ay) & (ax >= az)
+    front = mask & (xs > 0)
+    back  = mask & (xs <= 0)
+
+    equirect[front] = sample(0,
+                              ys[front] / ax[front],
+                             -zs[front] / ax[front])
+    equirect[back]  = sample(2,
+                             -ys[back] / ax[back],
+                             -zs[back] / ax[back])
+
+    # --- +Y (right) and –Y (left)
+    mask = (ay > ax) & (ay >= az)
+    right = mask & (ys > 0)
+    left  = mask & (ys <= 0)
+
+    equirect[right] = sample(1,
+                             -xs[right] / ay[right],
+                             -zs[right] / ay[right])
+    equirect[left]  = sample(3,
+                              xs[left] / ay[left],
+                             -zs[left] / ay[left])
+
+    # --- +Z (top) and –Z (bottom)
+    mask = (az > ax) & (az > ay)
+    top    = mask & (zs > 0)
+    bottom = mask & (zs <= 0)
+
+    equirect[top]    = sample(4,
+                               ys[top] / az[top],
+                               xs[top] / az[top])
+    equirect[bottom] = sample(5,
+                               ys[bottom] / az[bottom],
+                              -xs[bottom] / az[bottom])
+
+    return np.clip(equirect, 0, 1)
+
+    
 
 import os
 import json
