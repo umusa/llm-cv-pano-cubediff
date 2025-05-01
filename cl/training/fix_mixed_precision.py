@@ -4,7 +4,7 @@ import types
 import time
 from cl.training.system_config import monitor_memory, clear_gpu_memory, detailed_memory_usage
 
-def fix_mixed_precision_issue(trainer):
+def fix_mixed_precision_issue_bk(trainer):
     """
     Fix issues with mixed precision training, particularly the unscale_() error.
     
@@ -101,7 +101,7 @@ def fix_mixed_precision_issue(trainer):
                 for step, batch in enumerate(train_dataloader):
                     torch.cuda.empty_cache()
                     step_start_time = time.time()
-                    # print(f"*** fix_mixed_precision.py - fix_mixed_precision_issue - training step started with step {step}, batch_size is {self.config.batch_size} ...")
+                    print(f"*** fix_mixed_precision.py - fix_mixed_precision_issue - training step started with step {step}, batch_size is {self.config.batch_size} ...")
                     # Extract batch data
                     faces = batch["faces"]  # [batch, 6, C, H, W]
                     captions = batch["caption"]
@@ -115,18 +115,18 @@ def fix_mixed_precision_issue(trainer):
                         return_tensors="pt"
                     ).input_ids.to(self.accelerator.device)
                     
-                    # print(f"*** fix_mixed_precision.py - fix_mixed_precision_issue - after process captions text")
+                    print(f"*** fix_mixed_precision.py - fix_mixed_precision_issue - after process captions text")
 
                     with torch.no_grad():
                         text_embeddings = self.text_encoder(tokens)[0]
-                    # print(f"*** fix_mixed_precision.py - fix_mixed_precision_issue - after text_embeddings = self.text_encoder(tokens)[0]")
+                    print(f"*** fix_mixed_precision.py - fix_mixed_precision_issue - after text_embeddings = self.text_encoder(tokens)[0]")
 
                     # Process face images with VAE
                     latents = []
                     vae_param = next(self.vae.parameters())
                     vae_dtype = vae_param.dtype
                     vae_device = vae_param.device
-                    # print(f"*** fix_mixed_precision.py - fix_mixed_precision_issue - process each facew started ...")
+                    print(f"*** fix_mixed_precision.py - fix_mixed_precision_issue - process each facew started ...")
                     for i in range(faces.shape[1]):
                         face = faces[:, i]
                         if face.shape[1] == 4 and face.shape[2] == 64 and face.shape[3] == 64:
@@ -178,6 +178,7 @@ def fix_mixed_precision_issue(trainer):
                         # print(f"*** fix_mixed_precision.py - fix_mixed_precision_issue - added noise")
 
                         # Get model prediction
+                        print(f"fix_mixed_precision.py - fix_mixed_precision_issue - before get model prediction")
                         noise_pred = self.model(noisy_latents, timesteps, text_embeddings)
                         # print(f"*** fix_mixed_precision.py - fix_mixed_precision_issue - get model prediction")
 

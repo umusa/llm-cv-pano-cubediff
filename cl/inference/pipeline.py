@@ -3,7 +3,7 @@ import torch.nn.functional as F
 from diffusers import StableDiffusionPipeline, DDIMScheduler
 from PIL import Image
 import numpy as np
-
+import time
 from ..model.architecture import CubeDiffModel
 from ..data.preprocessing import cubemap_to_equirect
 
@@ -184,7 +184,7 @@ class CubeDiffPipeline:
             with torch.no_grad():
                 # Use int64 for timesteps as required by the model
                 timesteps = torch.tensor([t] * latent_model_input.shape[0], device=self.device, dtype=torch.int64)
-                
+                print(f"pipeline.py - CubeDiffPipeline - generate() - Get model prediction - before noise_pred = self.model\n")
                 noise_pred = self.model(
                     latent_model_input,
                     timesteps,
@@ -241,8 +241,11 @@ class CubeDiffPipeline:
         
         # Convert to equirectangular (panorama)
         print(f"pipeline.py - CubeDiffPipeline - generate() - before cubemap_to_equirect, cube_faces shape is {cube_faces.shape}\n")
+        equi_tm = time.time()
         equirect = cubemap_to_equirect(cube_faces, height * 2, width * 4)
-        
+        equi_end_tm = time.time()
+        print(f"pipeline.py - CubeDiffPipeline - generate() - cubemap_to_equirect cost {equi_end_tm-equi_tm:.2f} seconds\n")
+
         if output_type == "np":
             return equirect
         

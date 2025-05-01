@@ -21,7 +21,7 @@ from model import CubeDiff, CubeDiffPipeline
 from data import visualize_cubemap, equirectangular_to_cubemap_batch, cubemap_to_equirectangular_batch
 
 
-class CubeDiffTrainer:
+class CubeDiffTrainer_bk:
     """
     Trainer for the CubeDiff model.
     """

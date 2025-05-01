@@ -154,7 +154,7 @@ def main():
     )
     
     # Create trainer
-    trainer = CubeDiffTrainer(
+    trainer = CubeDiffTrainer_bk(
         vae=vae,
         unet=unet,
         text_encoder=text_encoder,

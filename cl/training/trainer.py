@@ -1,39 +1,43 @@
+# -------------  cl/training/trainer.py  --------------------
 import torch._dynamo
 # completely disable Dynamo/inductor so no libcuda.so check ever happens
 torch._dynamo.disable()
-# -------------  cl/training/trainer.py  --------------------
-
+torch._dynamo.config.suppress_errors = True
+# disable Dynamo/inductor checks
 import os
 # tell torch.compile to use AOT‐eager by default, never inductor
 os.environ["TORCH_COMPILE_BACKEND"] = "aot_eager"
-import torch
-import torch._dynamo
-# suppress any Dynamo/inductor errors so we always fall back cleanly
-torch._dynamo.config.suppress_errors = True
-
 import datetime, time, json, types, numpy as np
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
-from accelerate import Accelerator
-from tqdm.auto import tqdm
 from pathlib import Path
 import matplotlib.pyplot as plt
+
+import torch
+import torch.nn.functional as F
+import torch._dynamo
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torchvision import models
+from tqdm.auto import tqdm
+
 import wandb, psutil, threading
+
+from accelerate import Accelerator
+from diffusers import StableDiffusionPipeline, DDPMScheduler
 
 from cl.data.latent_webdataset import get_dataloader
 from cl.training.lora        import apply_lora
 from cl.model.architecture   import CubeDiffModel
-from cl.training.seam_loss import seam_loss 
+from cl.training.seam_loss   import seam_loss
+
 # -----------------------------------------------------------
 
 class CubeDiffTrainer:
     def __init__(self, config,
                  pretrained_model_name="runwayml/stable-diffusion-v1-5",
                  output_dir="./outputs",
-                 mixed_precision="bf16",                 # <-- default bf16
+                 mixed_precision="bf16",
                  gradient_accumulation_steps=1):
         self.config  = config
-        print(f"trainer.py - CUbeDiffTrainer - config is {self.config}")
         self.output_dir = Path(output_dir); self.output_dir.mkdir(exist_ok=True, parents=True)
         self.images_dir = self.output_dir / "samples"; self.images_dir.mkdir(exist_ok=True)
         self.logs_dir   = self.output_dir / "logs";    self.logs_dir.mkdir(exist_ok=True)
@@ -54,180 +58,238 @@ class CubeDiffTrainer:
         # build model / VAE / text-enc once
         self.setup_model(pretrained_model_name)
 
+        # ── PERCEPTUAL & BOUNDARY LOSS SETUP ──
+        self.perceptual_net = models.vgg16(pretrained=True).features.eval().to(self.accelerator.device)
+        for p in self.perceptual_net.parameters():
+            p.requires_grad = False
+        self.l1 = torch.nn.L1Loss()
+
     # --------------------------------------------------
     #  Model & tokenizer (unchanged except for LoRA hook)
     # --------------------------------------------------
-    def setup_model(self, pretrained_model_name):
-        from diffusers import StableDiffusionPipeline, DDPMScheduler
+
+
+    # def setup_model(self, pretrained_model_name):
+    #     pipe = StableDiffusionPipeline.from_pretrained(
+    #                 pretrained_model_name,
+    #                 torch_dtype=torch.bfloat16)
+
+    #     # extract & freeze
+    #     self.vae  = pipe.vae
+    #     self.text_encoder = pipe.text_encoder
+    #     self.tokenizer    = pipe.tokenizer
+    #     self.vae.requires_grad_(False)
+    #     self.text_encoder.requires_grad_(False)
+
+    #     # noise scheduler
+    #     self.noise_scheduler = DDPMScheduler.from_pretrained(
+    #         pretrained_model_name,
+    #         subfolder="scheduler",
+    #     )
+    #     dtype = torch.float16 if self.mixed_precision=="fp16" else torch.float32
+    #     for k,v in self.noise_scheduler.__dict__.items():
+    #         if isinstance(v, torch.Tensor):
+    #             setattr(self.noise_scheduler, k, v.to(dtype))
+
+    #     # build & LoRA-fine-tune UNet
+    #     self.model = CubeDiffModel(pretrained_model_name).to(dtype=torch.float32)
+    #     # self.model = apply_lora(self.model,
+    #     #                         r=self.config["lora_r"],
+    #     #                         alpha=self.config["lora_alpha"])
+
+    #     # Inject LoRA *only* into the U-Net (leave text_encoder frozen)
+    #     self.model.base_unet = apply_lora(
+    #         self.model.base_unet,
+    #         r=self.config["lora_r"],
+    #         alpha=self.config["lora_alpha"],
+    #     )
+
+
+    #     self.model.enable_gradient_checkpointing()
+    #     self.model.base_unet.enable_gradient_checkpointing()
+
+    #     # circular padding on every Conv2d in the UNet
+    #     for m in self.model.base_unet.modules():
+    #         if isinstance(m, torch.nn.Conv2d):
+    #             m.padding_mode = 'circular'
+
+    #     tot   = sum(p.numel() for p in self.model.parameters())
+    #     train = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+    #     print(f"Total params {tot/1e6:.1f}M — LoRA trainable {train/1e6:.2f}M")
+        
+    def setup_model(self, pretrained_model_name: str):
+        # 1) Load stable-diffusion pipeline just to grab VAE & text-encoder
         pipe = StableDiffusionPipeline.from_pretrained(
-                    pretrained_model_name,
-                    torch_dtype=torch.bfloat16)                    # bf16 to save vram
-
-        self.vae, self.text_encoder, self.tokenizer = pipe.vae, pipe.text_encoder, pipe.tokenizer
-        self.vae.requires_grad_(False)
-        self.text_encoder.requires_grad_(False)
-
-        # Set up noise scheduler
-        self.noise_scheduler = DDPMScheduler.from_pretrained(
             pretrained_model_name,
-            subfolder="scheduler",
+            torch_dtype=torch.bfloat16,
+            # revision="fp16", # 2025-5-1 Invalid rev id: fp16.
+            use_safetensors=True,
         )
-        dtype = torch.float16 if self.mixed_precision == "fp16" else torch.float32
-        # align scheduler buffers with chosen dtype
+        # freeze VAE + text encoder
+        self.vae          = pipe.vae.eval().requires_grad_(False)
+        self.text_encoder = pipe.text_encoder.eval().requires_grad_(False)
+        self.tokenizer    = pipe.tokenizer
+
+        # 2) Noise scheduler (bfloat16)
+        self.noise_scheduler = DDPMScheduler.from_pretrained(
+            pretrained_model_name, subfolder="scheduler"
+        )
         for k, v in self.noise_scheduler.__dict__.items():
             if isinstance(v, torch.Tensor):
-                setattr(self.noise_scheduler, k, v.to(dtype))
+                setattr(self.noise_scheduler, k, v.to(torch.bfloat16))
 
-        # build CubeDiff UNet (float32 → optimiser stability)
-        self.model = CubeDiffModel(pretrained_model_name).to(dtype=torch.float32)
-        print(f"trainer.py - CubeDiffTrainer - after build CubeDiffModel: {self.model._get_name()}")
-        
-        # … after building self.model = CubeDiffModel(...)
-        # Use our custom LoRA injection from cl/training/lora.py
-        # which directly patches the UNet’s Q/K/V/out modules.
+        # 3) Instantiate CubeDiffModel (UNet wrapper)
+        print("trainer.py - setup_model - before self.model = CubeDiffModel(pretrained_model_name)\n")
+        self.model = CubeDiffModel(pretrained_model_name)
+        print("trainer.py - setup_model - after self.model = CubeDiffModel(pretrained_model_name)\n")
 
-        print(f"trainer.py - CUbeDiffTrainer - config is {self.config}")
-        
-        self.model = apply_lora(
-          self.model,
-          r=self.config["lora_r"],
-          alpha=self.config["lora_alpha"]
+        # 4) Inject LoRA *only* into the UNet backbone
+        self.model.base_unet = apply_lora(
+            self.model.base_unet,
+            r=self.config["lora_r"],
+            alpha=self.config["lora_alpha"],
         )
-        self.model.enable_gradient_checkpointing()
+        # cast the adapted UNet to bfloat16 for memory/speed
+        self.model.base_unet = self.model.base_unet.to(torch.bfloat16)
 
-        # Try to compile with torch.compile, but fall back to eager if libcuda.so is missing.
-        # try:
-        #     # you can also do backend="eager" to disable any inductor kernels
-        #     self.model = torch.compile(self.model, backend="inductor")
-        #     self.model.base_unet = torch.compile(self.model.base_unet, backend="inductor")
-        # except AssertionError as e:
-        #     print("⚠️  torch.compile(inductor) failed (missing libcuda.so?), falling back to eager:", e)
-        #     self.model = torch.compile(self.model, backend="eager")
-        #     self.model.base_unet = torch.compile(self.model.base_unet, backend="eager")
-
-        # Enable gradient checkpointing on the U-Net
+        # 5) Enable gradient checkpoints and circular padding
+        # 5) Enable gradient checkpointing on the U-Net backbone only
+        #    (saves ~30–40% memory at the cost of ~10–20% extra compute)
+        # self.model.enable_gradient_checkpointing()
         self.model.base_unet.enable_gradient_checkpointing()
-        print("trainer.py - Enabled gradient checkpointing on base_unet")
+        for m in self.model.base_unet.modules():
+            if isinstance(m, torch.nn.Conv2d):
+                m.padding_mode = "circular"
 
-        # Compile with torch.compile() — thanks to TORCH_COMPILE_BACKEND="aot_eager",
-        # this will use the aot_eager backend (no inductor), and suppress errors.
-        # self.model = torch.compile(self.model)
-        # self.model.base_unet = torch.compile(self.model.base_unet)
-
-        tot = sum(p.numel() for p in self.model.parameters())
+        # report
+        tot   = sum(p.numel() for p in self.model.parameters())
         train = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        print(f"Total params {tot/1e6:.1f} M — LoRA trainable {train/1e6:.2f} M")
+        print(f"Total params {tot/1e6:.1f}M — LoRA trainable {train/1e6:.2f}M")
 
     # --------------------------------------------------
     # ✱✱✱  New dataloader creator  (latents, no JPEG)  ✱✱✱
     # --------------------------------------------------
     def build_dataloaders(self):
         self.train_dataloader = get_dataloader(
-                self.config["dataset"],
-                batch_size = self.config["batch_size"],
-                num_workers       = self.config.get("num_workers", 4))
-        print(f"trainer.py - CubeDiffTrainer - after train_dataloader\n")
+            self.config["dataset"],
+            batch_size    = self.config["batch_size"],
+            num_workers   = self.config.get("num_workers",4))
         if "val_dataset" in self.config:
             self.val_dataloader = get_dataloader(
-                    self.config["val_dataset"],
-                    batch_size = self.config["batch_size"],
-                    num_workers       = max(1, self.config["num_workers"]//2))
+                self.config["val_dataset"],
+                batch_size    = self.config["batch_size"],
+                num_workers   = max(1, self.config["num_workers"]//2))
         else:
             self.val_dataloader = None
 
-        # Accelerator handles DDP sharding / fp16-hooks
-        # objs = [self.model, self.train_dataloader]
-        # if self.val_dataloader: objs.append(self.val_dataloader)
-        # self.model, self.train_dataloader, *rest = self.accelerator.prepare(*objs)
-        # if rest: self.val_dataloader, = rest
-
-        # Wrap only model + train loader in Accelerator.
-        # Checking “if self.val_dataloader” would call __len__()
-        # on the WebDataset (no __len__ → TypeError), so skip it here.
-        # shard/move model + train loader to GPU (or DDP device)
+        # wrap only model + train loader
+        print(f"trainer.py - build_dataloaders - before self.accelerator.prepare\n")
         self.model, self.train_dataloader = self.accelerator.prepare(
-            self.model,
-            self.train_dataloader,
+            self.model, self.train_dataloader
         )
-        # Leave self.val_dataloader unwrapped; run it manually under
-        # torch.no_grad() in eval/sampling loop if need it.
-        # This is standard practice in multi-GPU setups.
-        # now that we've moved into GPU/DDP, also put text_encoder and VAE on that device
         self.text_encoder.to(self.accelerator.device)
         self.vae.to(self.accelerator.device)
 
+    def boundary_loss(self, x):
+        """
+        x: either
+        [B, F, C, H, W]   (5-D)
+        or
+        [B*F, C, H, W]    (4-D)
+        Returns a scalar: average L1 across all seams.
+        """
+        # detect & reshape into [B, F, C, H, W]
+        if x.dim() == 5:
+            B, F, C, H, W = x.shape
+            x5 = x
+        elif x.dim() == 4:
+            Bf, C, H, W = x.shape
+            F = self.config.get("num_faces", 6)
+            B = Bf // F
+            x5 = x.view(B, F, C, H, W)
+        else:
+            raise ValueError(f"boundary_loss: unexpected tensor dim {x.dim()}")
+
+        losses = []
+        for i in range(F):
+            # right edge of face i vs left edge of face (i+1)%F
+            r = x5[:, i, :, :, -1]      # [B, C, H]
+            l = x5[:, (i+1) % F, :, :,  0]  # [B, C, H]
+            losses.append(self.l1(r, l))
+        return sum(losses) / F
+    
     # --------------------------------------------------
     #  Training loop  (shortened & adapted to latent input)
     # --------------------------------------------------
     def train(self):
         self.build_dataloaders()
-        print(f"trainer.py - CubeDifftrainer - after build_dataloaders\n")
-        # Optimiser only sees LoRA weights
         optim = AdamW((p for p in self.model.parameters() if p.requires_grad),
                       lr=self.config["learning_rate"], betas=(0.9,0.95), weight_decay=1e-2)
         sched = CosineAnnealingLR(optim, T_max=self.config["max_steps"])
-
         optim, sched = self.accelerator.prepare(optim, sched)
 
-        sample_prompts     = ["A beautiful mountain lake at sunset with snow-capped peaks"]
+        sample_prompts        = ["A beautiful mountain lake at sunset with snow-capped peaks"]
+        eval_every_n_samples  = self.config.get("eval_every_n_samples", 100)
 
-        # add a new config param for sample‐level eval:
-        eval_every_n_samples = self.config.get("eval_every_n_samples", 100)
-
-        # counters for (a) how many raw samples we’ve processed,
-        # and (b) threshold for next eval
         processed_samples = 0
         next_eval_at      = eval_every_n_samples
-        gstep = 0
+        gstep             = 0
         train_losses, val_losses = [], []
         g_start_tm = time.time()
-        print(f"trainer.py - CubeDiffTrainer - the training loop started with batch_size as {self.config['batch_size']}, eval_every_n_samples as {eval_every_n_samples} ...")
+
         for step, batch in enumerate(self.train_dataloader):
-            print(f"---------------- training step {step} ----------------")
-            # if isinstance(batch, dict):
-            #     print(f"Batch keys: {batch.keys()}")
-            #     for k, v in batch.items():
-            #         print(f"Key: {k}, Type: {type(v)}, ", end="")
-            #         if isinstance(v, torch.Tensor):
-            #             print(f"Shape: {v.shape}")
-            #         else:
-            #             print(f"Value: {v}")
             start_tm = time.time()
             with self.accelerator.accumulate(self.model):
-                # … inside for step, batch in enumerate(self.train_dataloader):
                 lat = batch["latent"].to(self.accelerator.device)              # [B,6,4,64,64]
-                input_ids      = batch["input_ids"].to(self.accelerator.device)     # [B, L]
-                attention_mask = batch["attention_mask"].to(self.accelerator.device)# [B, L]
+                ids = batch["input_ids"].to(self.accelerator.device)
+                mask = batch["attention_mask"].to(self.accelerator.device)
 
                 noise     = torch.randn_like(lat)
-                timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps,
-                                          (lat.shape[0],), device=lat.device)
+                timesteps = torch.randint(0,
+                    self.noise_scheduler.config.num_train_timesteps,
+                    (lat.shape[0],), device=lat.device)
                 noisy_lat = self.noise_scheduler.add_noise(lat, noise, timesteps)
 
-                # 1) precompute CLIP text embeddings (frozen, no grad)
                 with torch.no_grad():
-                    clip_out = self.text_encoder(
-                        input_ids, # panorama caption token
-                        attention_mask=attention_mask
-                    )
-                    txt_emb = clip_out.last_hidden_state
+                    txt_emb = self.text_encoder(ids, attention_mask=mask).last_hidden_state
 
-                # 2) forward through CubeDiffModel via encoder_hidden_states
+                print(f"trainer.py - train() - before pred = self.model, noisy_lat shape is {noisy_lat.shape} type is {noisy_lat.dtype}, timesteps is {timesteps}, txt_emb shape is {txt_emb.shape}, type is {txt_emb.dtype}\n")
+
                 pred = self.model(
                     latents=noisy_lat,
                     timesteps=timesteps,
                     encoder_hidden_states=txt_emb
                 )
-                                
-                # print(f"trainer.py - CubeDiffTrainer - after text_encoder - after self.model(noisy_lat, timesteps, txt_emb) - get pred\n")
+                print(f"trainer.py - train() - after pred = self.model")
+                # ── NEW LOSS ──
+                mse_loss = F.mse_loss(pred.float(), noise.float())
 
-                loss = torch.nn.functional.mse_loss(pred.float(), noise.float())
-                # loss = loss + 0.1 * seam_loss(pred.float(), noise.float()) # (λ = 0.1 is the weight used by CubeDiff; adjust if needed.)
-                loss      = loss + 0.1 * seam_loss(pred)     # use new signature
-                print(f"training loss {loss}\n")
+                # boundary loss
+                # def boundary_loss(x):
+                #     B6,C,H,W = x.shape
+                #     B = B6//6
+                #     x = x.view(B,6,C,H,W)
+                #     losses=[]
+                #     for i in range(6):
+                #         r = x[:,i,:,:,-1]
+                #         l = x[:,(i+1)%6,:,:,0]
+                #         losses.append(self.l1(r, l))
+                #     return sum(losses)/6
+                
+                # bdy = boundary_loss(pred.float()) * 0.1
+                bdy = self.boundary_loss(pred) * self.config.get("boundary_weight", 0.1)
+
+                # perceptual loss
+                pred_rgb = self.decode_latents_to_rgb(pred.float())
+                true_rgb = self.decode_latents_to_rgb(noise.float())
+                fp = self.perceptual_net(pred_rgb)
+                ft = self.perceptual_net(true_rgb)
+                perc = self.l1(fp, ft) * 0.01
+
+                # loss = mse_loss + bdy + perc
+                loss = mse_loss
+
                 self.accelerator.backward(loss)
-                # print(f"trainer.py - CubeDiffTrainer - after accelerator backward\n")
-
                 if self.accelerator.sync_gradients:
                     self.accelerator.clip_grad_norm_(self.model.parameters(), 1.0)
                     optim.step(); optim.zero_grad(); sched.step()
@@ -257,7 +319,33 @@ class CubeDiffTrainer:
                     self.generate_samples(sample_prompts, processed_samples)
                     next_eval_at += eval_every_n_samples
                     print(f"in the training loop - logging and sampling - self.accelerator.is_main_process is {self.accelerator.is_main_process} - after self.generate_samples - val_loss is {val_loss}\n")
-                    
+
+                # 4) Verify your LoRA adapters are actually updating
+                # Print out a few adapter weights (e.g. model.lora_layers[0].weight) at step 0 and at step 100 to confirm 
+                # they’ve changed from their LoRA‐init zeros. If they remain near zero, your PEFT wiring might be wrong.
+                # Unwrap the model *after* optimizer.step() so weights reflect the latest update
+                    # Unwrap the accelerator‐wrapped model
+                    # unwrapped = self.accelerator.unwrap_model(self.model)
+                    # Collect all trainable params whose name contains 'lora_'
+                    # lora_params = [
+                    #     (name, param)
+                    #     for name, param in unwrapped.named_parameters()
+                    #     if "lora_" in name and param.requires_grad
+                    # ]
+                    # if lora_params:
+                    #     # pick the first one
+                    #     name, p = lora_params[0]
+                    #     mean_val = p.detach().cpu().mean().item()
+                    #     print(f"[LoRA check] Param `{name}` mean after {processed_samples} samples: {mean_val:.6f}")
+                    # else:
+                    #     print("[LoRA check] No trainable LoRA parameters found in the model!")
+
+                    # 4) Verify your U-Net’s LoRA adapters are actually updating
+                    unwrapped = self.accelerator.unwrap_model(self.model)
+                    first_adapter = unwrapped.base_unet.lora_layers[0]
+                    w = first_adapter.weight.detach().cpu().view(-1)
+                    print(f"LoRA #0 weight mean: {w.mean():.6f}  std: {w.std():.6f}")
+
             gstep += 1
         g_end_tm = time.time()
         print(f"out of the training loop - all steps done, gstep is {gstep}, cost {g_end_tm - g_start_tm:.2f} seconda\n")
@@ -293,7 +381,75 @@ class CubeDiffTrainer:
             print(f"⚠ could not plot loss curves: {e}")
         # ───────────────────────────────────────────────────────────────
 
+    # def decode_latents_to_rgb(self, lat):
+    #     """
+    #     Simple helper: feed latents through the frozen VAE decoder to get an RGB batch.
+    #     Expects lat: [B*6, C, H, W] → returns [B*6, 3, H*8, W*8] (for example).
+    #     """
+    #     # assumes you’ve got `self.pipeline` or have loaded the VAE elsewhere.
+    #     with torch.no_grad():
+    #         # insert your actual VAE-decoder call here:
+    #         return self.pipeline.vae.decode(lat).sample
+    
+    # def decode_latents_to_rgb(self, lat):
+    #     """
+    #     Decode latents [B*6, C, H, W] → RGB images [B*6, 3, H*8, W*8]
+    #     using the frozen VAE.
+    #     """
+    #     with torch.no_grad():
+    #         out = self.vae.decode(lat)
+    #         return getattr(out, "sample", out)
+        
+    # def decode_latents_to_rgb(self, lat):
+    #     """
+    #     Decode latents into RGB images via the frozen VAE.
+    #     Accepts either:
+    #       [B*F, C, H, W]  or
+    #       [B, F, C, H, W]
+    #     Returns:
+    #       [B*F, 3, H*8, W*8] float32 RGB.
+    #     """
+    #     # 1) flatten if given [B, F, C, H, W]
+    #     if lat.dim() == 5:
+    #         B, F, C, H, W = lat.shape
+    #         lat = lat.reshape(B * F, C, H, W)
 
+    #     # 2) cast to the VAE’s dtype (bfloat16) for compatibility
+    #     lat_bf16 = lat.to(self.vae.dtype)
+
+    #     # 3) decode and extract `sample` if present
+    #     with torch.no_grad():
+    #         out = self.vae.decode(lat_bf16)
+    #         rgb_bf16 = getattr(out, "sample", out)
+
+    #     # 4) return float32 for perceptual loss, plotting, etc.
+    #     return rgb_bf16.float()
+
+    def decode_latents_to_rgb(self, lat: torch.Tensor) -> torch.Tensor:
+        """
+        Decode latents → RGB images via the frozen VAE.
+        Accepts:
+        - [B*6, C, H, W]  or
+        - [B, 6, C, H, W]
+        Returns:
+        - [B*6, 3, H*8, W*8] float32 RGB
+        """
+        # flatten if needed
+        if lat.ndim == 5:
+            B, F, C, H, W = lat.shape
+            lat = lat.reshape(B * F, C, H, W)
+
+        # cast into VAE’s dtype (bfloat16)
+        lat_bf16 = lat.to(self.vae.dtype)
+        with torch.no_grad():
+            out = self.vae.decode(lat_bf16)
+            img = getattr(out, "sample", out)
+
+        # return float32 for perceptual / plotting
+        return img.float()
+
+
+        
     # --------------------------------------------------
     # ✱✱✱  generate panorama after N steps for progress  ✱✱✱
     # --------------------------------------------------
@@ -327,7 +483,7 @@ class CubeDiffTrainer:
         
         # 4) load *only* into the U-Net
         missing, unexpected = pipe.model.base_unet.load_state_dict(adapter_state, strict=False)
-        print("in generate_samples - loaded UNet adapter, missing: ", missing)
+        print("in generate_samples - loaded UNet adapter, missing size: ", len(missing))
 
         print(f"in generate_samples -  create inference pipe and generate the pnoaram based on the given prompts\n")
         for i,p in enumerate(prompts):
@@ -342,24 +498,26 @@ class CubeDiffTrainer:
             os.remove(tmp_ckpt)
         print(f"in generate_samples - prompts is {prompts}, step is {step}, pano saved at {temp}, unet tmp_ckpt {tmp_ckpt} was removed\n")
 
-        # ---------------------------------------------------------------------
-        # ✱✱✱  New: run a full pass over val_dataloader and return avg loss. ✱✱✱
+    # ---------------------------------------------------------------------
+    # ✱✱✱  New: run a full pass over val_dataloader and return avg loss. ✱✱✱
+    # reuse boundary_loss helper inside train()
+    # and decode_latents_to_rgb + self.perceptual_net
+    
     def evaluate(self):
-        """Compute average MSE on the validation set."""
+        """Compute avg. (MSE + boundary + perceptual) loss on the validation set."""
         if self.val_dataloader is None:
             return float("nan")
 
         self.model.eval()
-        total, running = 0, 0.0
+        total_loss, total_samples = 0.0, 0
+
         with torch.no_grad():
             for batch in self.val_dataloader:
                 lat = batch["latent"].to(self.accelerator.device)
                 ids = batch["input_ids"].to(self.accelerator.device)
                 mask = batch["attention_mask"].to(self.accelerator.device)
 
-                txt_emb = self.text_encoder(
-                    ids, attention_mask=mask
-                ).last_hidden_state
+                txt_emb = self.text_encoder(ids, attention_mask=mask).last_hidden_state
 
                 noise     = torch.randn_like(lat)
                 timesteps = torch.randint(
@@ -369,20 +527,42 @@ class CubeDiffTrainer:
                     device=lat.device
                 )
                 noisy_lat = self.noise_scheduler.add_noise(lat, noise, timesteps)
-                pred    = self.model(
+                print(f"trainer.py - evaluate() - before pred = self.model\n")
+                pred = self.model(
                     latents=noisy_lat,
                     timesteps=timesteps,
                     encoder_hidden_states=txt_emb
                 )
 
-                # loss = torch.nn.functional.mse_loss(pred.float(), noise.float(), reduction="mean")
-                # loss = loss + 0.1 * seam_loss(pred.float(), noise.float()) # (λ = 0.1 is the weight used by CubeDiff; adjust if needed.)
-                base = torch.nn.functional.mse_loss(pred.float(), noise.float(), reduction="mean")
-                loss = base + 0.1 * seam_loss(pred)
-                running += loss.item() * lat.size(0)
-                total   += lat.size(0)
+                # 1) MSE
+                mse = F.mse_loss(pred.float(), noise.float(), reduction="mean")
+
+                # 2) boundary (exact same boundary_loss as in train())
+                # def boundary_loss(x):
+                #     B6,C,H,W = x.shape
+                #     B = B6//6
+                #     x = x.view(B,6,C,H,W)
+                #     losses=[]
+                #     for i in range(6):
+                #         r = x[:,i,:,:,-1]
+                #         l = x[:,(i+1)%6,:,:,0]
+                #         losses.append(self.l1(r, l))
+                #     return sum(losses)/6
+                bdy = self.boundary_loss(pred.float()) * self.config.get("boundary_weight", 0.1)
+
+                # 3) perceptual
+                pred_rgb = self.decode_latents_to_rgb(pred.float())
+                true_rgb = self.decode_latents_to_rgb(noise.float())
+                fp = self.perceptual_net(pred_rgb)
+                ft = self.perceptual_net(true_rgb)
+                perc = self.l1(fp, ft) * self.config.get("perceptual_weight", 0.01)
+
+                loss = mse + bdy + perc
+
+                total_loss   += loss.item() * lat.size(0)
+                total_samples+= lat.size(0)
 
         self.model.train()
-        return running / total if total>0 else float("nan")
+        return total_loss / total_samples if total_samples > 0 else float("nan")
 
 # EOF -------------------------------------------------------------------------

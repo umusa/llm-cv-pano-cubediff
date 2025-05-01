@@ -134,7 +134,7 @@ def train(args, config):
         print(f"Validation dataset size: {len(val_dataset)}")
     
     # Initialize trainer
-    trainer = CubeDiffTrainer(
+    trainer = CubeDiffTrainer_main_bk(
         config=config,
         pretrained_model_name=config.model.pretrained_model_name,
         output_dir=output_dir,

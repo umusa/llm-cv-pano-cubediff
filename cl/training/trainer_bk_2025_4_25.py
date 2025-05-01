@@ -25,7 +25,7 @@ from cl.model.architecture import CubeDiffModel
 from cl.data.dataset import CubemapDataset
 from cl.training.lora import add_lora_to_model
 
-class CubeDiffTrainer:
+class CubeDiffTrainer_bk:
     """
     Trainer for CubeDiff model.
     """
@@ -848,6 +848,7 @@ class CubeDiffTrainer:
                 noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
                 
                 # Get model prediction
+                print("trainer.py evaluate() - before self.model(noisy_latents, timesteps, text_embeddings)\n")
                 noise_pred = self.model(noisy_latents, timesteps, text_embeddings)
                 
                 # Compute loss

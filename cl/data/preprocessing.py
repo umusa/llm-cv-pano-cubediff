@@ -1,9 +1,95 @@
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 import cv2
 import os
 from tqdm import tqdm
+from scipy.ndimage import gaussian_filter
+
+
+# ─────────────── Precompute mapping to speed up cubemap-to-panorama ───────────────
+# def init_equirect_mapping(
+#     H_face: int, W_face: int,
+#     upsample: int = 8,
+#     overlap: int = 8,
+#     sigma: float = 4.0,
+#     device: str = "cuda"
+# ):
+#     """
+#     Precompute all tables and GPU kernel needed for very fast reprojection+blend.
+#     Returns:
+#       face_idx: [H2,W2] int array
+#       ui, vi:   [H2,W2] int arrays
+#       blend_kernel: torch.Tensor [3,1,1,2*ov+1] on `device`
+#       H2, W2:   ints
+#     """
+#     # final panorama resolution
+#     H2, W2 = H_face * upsample, W_face * upsample
+
+#     # spherical coordinates
+#     theta = np.linspace(-np.pi, np.pi, W2)
+#     phi   = np.linspace(-np.pi/2, np.pi/2, H2)
+#     th, ph = np.meshgrid(theta, phi)
+
+#     # unit sphere
+#     x = np.cos(ph) * np.sin(th)
+#     y = np.sin(ph)
+#     z = np.cos(ph) * np.cos(th)
+
+#     # select face by max abs axis
+#     absx, absy, absz = np.abs(x), np.abs(y), np.abs(z)
+#     face_idx = np.argmax(np.stack([absx, absy, absz], axis=0), axis=0)
+
+#     # compute UV→pixel indices per face
+#     ui = np.zeros_like(face_idx, dtype=np.int64)
+#     vi = np.zeros_like(face_idx, dtype=np.int64)
+    
+
+#     def get_uv(face_idx, x, y, z):
+#         """
+#         Map 3D sphere coords (x,y,z) → UV ∈ [0,1] for cubemap face face_idx.
+#         """
+#         if   face_idx == 0:   # +X
+#             u = -z / x;    v = -y / x
+#         elif face_idx == 1:   # -X
+#             u =  z / -x;   v = -y / -x
+#         elif face_idx == 2:   # +Y (top)
+#             u =  x / y;    v =  z / y
+#         elif face_idx == 3:   # -Y (bottom)
+#             u =  x / -y;   v = -z / -y
+#         elif face_idx == 4:   # +Z
+#             u =  x / z;    v = -y / z
+#         elif face_idx == 5:   # -Z
+#             u = -x / -z;   v = -y / -z
+#         else:
+#             raise ValueError(f"Invalid face_idx {face_idx}")
+
+#         # normalize from [-1,1] → [0,1]
+#         return (u + 1)/2, (v + 1)/2
+
+
+#     for f in range(face_idx.max()+1):
+#         mask = face_idx == f
+#         uf, vf = get_uv(f, x[mask], y[mask], z[mask])
+#         uf = np.clip(uf, 0, 1); vf = np.clip(vf, 0, 1)
+#         ui[mask] = np.round( uf * (W_face-1) ).astype(int)
+#         vi[mask] = np.round((1-vf) * (H_face-1)).astype(int)
+
+#     # build a depthwise conv1d kernel for blending
+#     ks = 2*overlap + 1
+#     coords = torch.arange(-overlap, overlap+1, dtype=torch.float32)
+#     g = torch.exp(-(coords/sigma)**2/2)
+#     g = (g / g.sum()).view(1,1,ks)           # [1,1,ks]
+#     blend_kernel = g.repeat(3,1,1).unsqueeze(2).to(device)  # [3,1,1,ks]
+
+#     return face_idx, ui, vi, blend_kernel, H2, W2, overlap
+
+# # … call once at import or runtime:
+# _face_idx, _ui, _vi, _blend_kernel, H2, W2, _ov = init_equirect_mapping(
+#     H_face=64, W_face=64, upsample=8, overlap=8, sigma=4.0, device="cuda"
+# )
+
 
 def equirect_to_cubemap(equirect_img, face_size=512):
     """
@@ -91,122 +177,320 @@ def equirect_to_cubemap(equirect_img, face_size=512):
     
     return cube_faces
 
-def cubemap_to_equirect(cube_faces, out_h, out_w):
-    """
-    Convert 6 cubemap faces to equirectangular panorama.
+# def cubemap_to_equirect(cube_faces, out_h, out_w):
+#     """
+#     Convert 6 cubemap faces to equirectangular panorama.
     
-    Args:
-        cube_faces: List of 6 numpy arrays representing cube faces
-        out_h: Output height
-        out_w: Output width
+#     Args:
+#         cube_faces: List of 6 numpy arrays representing cube faces
+#         out_h: Output height
+#         out_w: Output width
         
-    Returns:
-        Numpy array of equirectangular panorama
+#     Returns:
+#         Numpy array of equirectangular panorama
+#     """
+#     # Implementation similar to above but in reverse
+#     # Placeholder implementation for now
+#     # equirect = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+#     """
+#     Inverse of `equirect_to_cubemap`.
+#     Args
+#     ----
+#     cube_faces : (6, H, W, 3) uint8/float32 array  – front, right, back, left, top, bottom
+#     out_h, out_w : int                              – desired panorama size
+#     Returns
+#     -------
+#     equirect : (out_h, out_w, 3) float32 in [0,1]
+#     """
+#     cube_faces = np.asarray(cube_faces)
+
+#     # normalise only if the data are uint8
+#     if cube_faces.dtype == np.uint8:
+#         cube_faces = cube_faces.astype(np.float32) / 255.0
+#     else:                                 # already float 0-1
+#         cube_faces = cube_faces.astype(np.float32)
+
+#     N  = cube_faces.shape[1]        # face resolution
+#     yy, xx = np.meshgrid(np.arange(out_h), np.arange(out_w), indexing="ij")
+
+#     # 1) spherical angles
+#     phi   = (xx / out_w  - 0.5) * 2 * np.pi        # [-π, π]
+#     theta = (0.5 - yy / out_h) * np.pi             # [-π/2, π/2]
+
+#     # 2) unit vectors
+#     cos_t = np.cos(theta)
+#     xs = cos_t * np.cos(phi)
+#     ys = cos_t * np.sin(phi)
+#     zs = np.sin(theta)
+
+#     ax, ay, az = np.abs(xs), np.abs(ys), np.abs(zs)
+
+#     # allocate output
+#     equirect = np.empty((out_h, out_w, 3), dtype=np.float32)
+
+#     # helper to sample from a face with bilinear filtering
+#     def sample(face_idx, s, t):
+#         # (s,t) in [-1,1] ⇒ pixel coords
+#         u = (s + 1) * 0.5 * (N - 1)
+#         v = (t + 1) * 0.5 * (N - 1)
+
+#         u0 = np.floor(u).astype(np.int32)
+#         v0 = np.floor(v).astype(np.int32)
+#         u1 = np.clip(u0 + 1, 0, N - 1)
+#         v1 = np.clip(v0 + 1, 0, N - 1)
+
+#         du = (u - u0)[..., None]
+#         dv = (v - v0)[..., None]
+
+#         # gather
+#         c00 = cube_faces[face_idx, v0, u0]
+#         c01 = cube_faces[face_idx, v0, u1]
+#         c10 = cube_faces[face_idx, v1, u0]
+#         c11 = cube_faces[face_idx, v1, u1]
+
+#         return (1 - du) * (1 - dv) * c00 + \
+#                du       * (1 - dv) * c01 + \
+#                (1 - du) *  dv      * c10 + \
+#                du       *  dv      * c11
+
+#     # 3) face masks & projections
+#     # --- +X (front) and –X (back)
+#     mask = (ax >= ay) & (ax >= az)
+#     front = mask & (xs > 0)
+#     back  = mask & (xs <= 0)
+
+#     equirect[front] = sample(0,
+#                               ys[front] / ax[front],
+#                              -zs[front] / ax[front])
+#     equirect[back]  = sample(2,
+#                              -ys[back] / ax[back],
+#                              -zs[back] / ax[back])
+
+#     # --- +Y (right) and –Y (left)
+#     mask = (ay > ax) & (ay >= az)
+#     right = mask & (ys > 0)
+#     left  = mask & (ys <= 0)
+
+#     equirect[right] = sample(1,
+#                              -xs[right] / ay[right],
+#                              -zs[right] / ay[right])
+#     equirect[left]  = sample(3,
+#                               xs[left] / ay[left],
+#                              -zs[left] / ay[left])
+
+#     # --- +Z (top) and –Z (bottom)
+#     mask = (az > ax) & (az > ay)
+#     top    = mask & (zs > 0)
+#     bottom = mask & (zs <= 0)
+
+#     equirect[top]    = sample(4,
+#                                ys[top] / az[top],
+#                                xs[top] / az[top])
+#     equirect[bottom] = sample(5,
+#                                ys[bottom] / az[bottom],
+#                               -xs[bottom] / az[bottom])
+
+#     return np.clip(equirect, 0, 1)
+
+
+def project_to_equirect(faces: list[np.ndarray], out_h=None, out_w=None):
     """
-    # Implementation similar to above but in reverse
-    # Placeholder implementation for now
-    # equirect = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+    Very basic cubemap→equirectangular reprojection:
+    - faces: list of 6 arrays [H, W, 3]
+    - out_h/out_w: target equirect dims. Defaults to H, 2W.
     """
-    Inverse of `equirect_to_cubemap`.
-    Args
-    ----
-    cube_faces : (6, H, W, 3) uint8/float32 array  – front, right, back, left, top, bottom
-    out_h, out_w : int                              – desired panorama size
-    Returns
-    -------
-    equirect : (out_h, out_w, 3) float32 in [0,1]
-    """
-    cube_faces = np.asarray(cube_faces)
+    H, W = faces[0].shape[:2]
+    if out_h is None: out_h = H
+    if out_w is None: out_w = 2 * W
+    # polar coords
+    theta = np.linspace(-np.pi, np.pi, out_w)
+    phi   = np.linspace(-np.pi/2, np.pi/2, out_h)
+    th, ph = np.meshgrid(theta, phi)
+    # convert to unit vectors
+    x = np.cos(ph) * np.sin(th)
+    y = np.sin(ph)
+    z = np.cos(ph) * np.cos(th)
+    # decide face by largest abs coord
+    absx, absy, absz = np.abs(x), np.abs(y), np.abs(z)
+    face_idx = np.argmax([absx, absy, absz], axis=0)
+    # and sample each face via its UV mapping
+    out = np.zeros((out_h, out_w, 3), dtype=faces[0].dtype)
+    for f in range(6):
+        mask = face_idx == f
+        # compute u,v on that face from x,y,z — see any cubemap UV tutorial
+        # ... for brevity, call a helper get_uv(f, x,y,z) → (u,v) in [0,1]
+        u, v = get_uv(f, x[mask], y[mask], z[mask])
+        # ui = (u * (W-1)).round().astype(int)
+        # vi = ((1-v) * (H-1)).round().astype(int)
+        # out[mask] = faces[f][vi, ui]
+        
+        # clamp UV to [0,1] and safely convert to integer indices
+        u = np.nan_to_num(u, nan=0.5)
+        v = np.nan_to_num(v, nan=0.5)
+        u = np.clip(u, 0.0, 1.0)
+        v = np.clip(v, 0.0, 1.0)
 
-    # normalise only if the data are uint8
-    if cube_faces.dtype == np.uint8:
-        cube_faces = cube_faces.astype(np.float32) / 255.0
-    else:                                 # already float 0-1
-        cube_faces = cube_faces.astype(np.float32)
+        ui = (u * (W-1)).round().astype(int)
+        vi = ((1 - v) * (H-1)).round().astype(int)
+        # ensure we never index out of bounds
+        ui = np.clip(ui, 0, W-1)
+        vi = np.clip(vi, 0, H-1)
 
-    N  = cube_faces.shape[1]        # face resolution
-    yy, xx = np.meshgrid(np.arange(out_h), np.arange(out_w), indexing="ij")
+        out[mask] = faces[f][vi, ui]
+    return out
 
-    # 1) spherical angles
-    phi   = (xx / out_w  - 0.5) * 2 * np.pi        # [-π, π]
-    theta = (0.5 - yy / out_h) * np.pi             # [-π/2, π/2]
 
-    # 2) unit vectors
-    cos_t = np.cos(theta)
-    xs = cos_t * np.cos(phi)
-    ys = cos_t * np.sin(phi)
-    zs = np.sin(theta)
-
-    ax, ay, az = np.abs(xs), np.abs(ys), np.abs(zs)
-
-    # allocate output
-    equirect = np.empty((out_h, out_w, 3), dtype=np.float32)
-
-    # helper to sample from a face with bilinear filtering
-    def sample(face_idx, s, t):
-        # (s,t) in [-1,1] ⇒ pixel coords
-        u = (s + 1) * 0.5 * (N - 1)
-        v = (t + 1) * 0.5 * (N - 1)
-
-        u0 = np.floor(u).astype(np.int32)
-        v0 = np.floor(v).astype(np.int32)
-        u1 = np.clip(u0 + 1, 0, N - 1)
-        v1 = np.clip(v0 + 1, 0, N - 1)
-
-        du = (u - u0)[..., None]
-        dv = (v - v0)[..., None]
-
-        # gather
-        c00 = cube_faces[face_idx, v0, u0]
-        c01 = cube_faces[face_idx, v0, u1]
-        c10 = cube_faces[face_idx, v1, u0]
-        c11 = cube_faces[face_idx, v1, u1]
-
-        return (1 - du) * (1 - dv) * c00 + \
-               du       * (1 - dv) * c01 + \
-               (1 - du) *  dv      * c10 + \
-               du       *  dv      * c11
-
-    # 3) face masks & projections
-    # --- +X (front) and –X (back)
-    mask = (ax >= ay) & (ax >= az)
-    front = mask & (xs > 0)
-    back  = mask & (xs <= 0)
-
-    equirect[front] = sample(0,
-                              ys[front] / ax[front],
-                             -zs[front] / ax[front])
-    equirect[back]  = sample(2,
-                             -ys[back] / ax[back],
-                             -zs[back] / ax[back])
-
-    # --- +Y (right) and –Y (left)
-    mask = (ay > ax) & (ay >= az)
-    right = mask & (ys > 0)
-    left  = mask & (ys <= 0)
-
-    equirect[right] = sample(1,
-                             -xs[right] / ay[right],
-                             -zs[right] / ay[right])
-    equirect[left]  = sample(3,
-                              xs[left] / ay[left],
-                             -zs[left] / ay[left])
-
-    # --- +Z (top) and –Z (bottom)
-    mask = (az > ax) & (az > ay)
-    top    = mask & (zs > 0)
-    bottom = mask & (zs <= 0)
-
-    equirect[top]    = sample(4,
-                               ys[top] / az[top],
-                               xs[top] / az[top])
-    equirect[bottom] = sample(5,
-                               ys[bottom] / az[bottom],
-                              -xs[bottom] / az[bottom])
-
-    return np.clip(equirect, 0, 1)
-
+# def cubemap_to_equirect(faces, overlap=8, sigma=4):
+#     # assume faces: list of 6 [H,W,3] arrays
+#     # pad each face horizontally by overlap from its neighbors
+#     padded = []
+#     for i in range(6):
+#         left = faces[(i-1)%6][:, -overlap:, :]
+#         right= faces[(i+1)%6][:, :overlap, :]
+#         face = np.concatenate([left, faces[i], right], axis=1)  # W+2*ov
+#         padded.append(face)
+#     # standard projection on these padded faces...
+#     eq = project_to_equirect(padded)  # yields Hx2W
+#     # then apply horizontal Gaussian smoothing to first and last overlap regions
+#     # for x in [0, overlap, eq.shape[1]-overlap, eq.shape[1]]:
+#     #     # blend across seam
+#     #     eq[:, x-overlap:x+overlap] = gaussian_filter(eq[:, x-overlap:x+overlap],
+#     #                                                   sigma=[sigma, sigma, 0])
     
+#     # then apply horizontal Gaussian smoothing to the overlap regions:
+#     for x in [0, overlap, eq.shape[1] - overlap, eq.shape[1]]:
+#         # extract patch
+#         patch = eq[:, x - overlap : x + overlap]        # dtype may be float16
+#         # cast to float32 for filtering
+#         patch32 = patch.astype(np.float32)
+#         filtered = gaussian_filter(patch32, sigma=[sigma, sigma, 0])
+#         # cast back to original dtype
+#         eq[:, x - overlap : x + overlap] = filtered.astype(eq.dtype)
+    
+    
+#     return eq    
+
+
+# def cubemap_to_equirect(
+#     faces: list[np.ndarray],
+#     out_h: int = None,
+#     out_w: int = None,
+# ):
+#     """
+#     Very fast projection + blend.
+#     faces: list of 6 arrays [H2,W2,3] (after VAE upsample).
+#     Returns: pano [H2,W2,3] NumPy.
+#     out_h/out_w are ignored (precomputed mapping drives the true H2,W2).
+#     Returns: pano [H2,W2,3] NumPy.
+#     """
+#     # 1) stack faces into [6,H2,W2,3]
+#     # 1) stack faces into [6,H2,W2,3]
+#     arr = np.stack(faces, axis=0)
+
+#     # 2) gather with precomputed indices
+#     pano = arr[_face_idx, _vi, _ui]  # [H2,W2,3]
+
+#     # 3) GPU‐blend via depthwise conv1d
+#     t = torch.from_numpy(pano).permute(2,0,1).unsqueeze(0).to(torch.float32).cuda()
+
+#     # circular pad width by overlap
+#     t = F.pad(t, (_ov,_ov,0,0), mode="circular")  # [1,3,H2,W2+2ov]
+#     t = F.conv2d(t, _blend_kernel, groups=3)       # [1,3,H2,W2]
+#     t = t[..., _ov:-_ov]                           # trim
+
+#     return t.squeeze(0).permute(1,2,0).cpu().numpy()
+
+
+def get_uv(face_idx: int, x: np.ndarray, y: np.ndarray, z: np.ndarray):
+    """
+    Map 3D sphere coords (x,y,z) → UV ∈ [0,1] for cubemap face face_idx.
+    x,y,z: 1D arrays of the same length.
+    Returns (u,v) arrays in [0,1].
+    """
+    if face_idx == 0:    # +X
+        u = -z / x
+        v = -y / x
+    elif face_idx == 1:  # -X
+        u =  z / -x
+        v = -y / -x
+    elif face_idx == 2:  # +Y (top)
+        u =  x / y
+        v =  z / y
+    elif face_idx == 3:  # -Y (bottom)
+        u =  x / -y
+        v = -z / -y
+    elif face_idx == 4:  # +Z
+        u =  x / z
+        v = -y / z
+    elif face_idx == 5:  # -Z
+        u = -x / -z
+        v = -y / -z
+    else:
+        raise ValueError(f"Invalid face_idx {face_idx}")
+
+    # normalize from [-1,1] → [0,1]
+    return (u + 1) * 0.5, (v + 1) * 0.5
+
+
+# ── 1) Precompute the cubemap→equirect mapping once ──
+_face_idx = _ui = _vi = None
+def init_cubemap_map(H, W, out_h=None, out_w=None, device="cuda"):
+    global _face_idx, _ui, _vi
+    if out_h is None: out_h = H
+    if out_w is None: out_w = 2 * W
+
+    θ = torch.linspace(-torch.pi, torch.pi, out_w, device=device)
+    φ = torch.linspace(-torch.pi/2, torch.pi/2, out_h, device=device)
+    th, ph = torch.meshgrid(θ, φ, indexing="xy")
+
+    x =  torch.cos(ph) * torch.sin(th)
+    y =  torch.sin(ph)
+    z =  torch.cos(ph) * torch.cos(th)
+
+    absx, absy, absz = x.abs(), y.abs(), z.abs()
+    face_idx = torch.argmax(torch.stack([absx, absy, absz], 0), 0)
+
+    ui = torch.zeros_like(x, dtype=torch.long)
+    vi = torch.zeros_like(x, dtype=torch.long)
+    for f in range(6):
+        m = face_idx == f
+        xf, yf, zf = x[m], y[m], z[m]
+        # spherical → face-UV
+        u, v = get_uv(f, xf, yf, zf)    # implement per-face formulas below
+        ui[m] = (u.clamp(0,1) * (W-1)).round().long()
+        vi[m] = ((1-v).clamp(0,1) * (H-1)).round().long()
+
+    _face_idx, _ui, _vi = face_idx, ui, vi
+    
+
+# ── 2) The fast GPU projector + seam-blend ──
+def cubemap_to_equirect(faces: torch.Tensor, overlap: int = 8, sigma: float = 4.0):
+    """
+    faces: Tensor[6, H, W, 3]       (already up→equirect latent→RGB size)
+    returns: Tensor[H, 2W, 3]
+    """
+    device = faces.device
+    if _face_idx is None:
+        H,W = faces.shape[1], faces.shape[2]
+        init_cubemap_map(H, W, device=device)
+
+    # gather
+    pano = faces[_face_idx, _vi, _ui]    # [H,2W,3]
+
+    # GPU seam-blend with depthwise conv1d
+    # build once per overlap/sigma
+    kernel_size = 2*overlap + 1
+    half = torch.arange(-overlap, overlap+1, device=device).float()
+    gauss = torch.exp(-0.5*(half/sigma)**2)
+    gauss /= gauss.sum()
+    gauss = gauss.view(1,1,1,-1).repeat(3,1,1,1)  # [3,1,1,K]
+
+    t = pano.permute(2,0,1).unsqueeze(0)           # [1,3,H,2W]
+    t = F.pad(t, (overlap,overlap,0,0), mode="circular")
+    t = F.conv2d(t, gauss, groups=3)               # smooth horizontally
+    t = t[..., overlap:-overlap]                  # trim
+    return t.squeeze(0).permute(1,2,0)
+
 
 import os
 import json

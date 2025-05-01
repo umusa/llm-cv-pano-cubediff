@@ -12,7 +12,7 @@ from einops import rearrange
 from cubediff_utils import add_cubemap_positional_encodings
 
 
-class CubeDiffTrainer:
+class CubeDiffTrainer_bk:
     """
     Trainer class for CubeDiff model.
     
