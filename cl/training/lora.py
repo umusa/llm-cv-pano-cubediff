@@ -21,7 +21,7 @@ def apply_lora(unet, r=4, alpha=16):
             bias="none", task_type="FEATURE_EXTRACTION")
     return peft.get_peft_model(unet, cfg)
 
-from peft.tuners.lora import LoraLayer
+# from peft.tuners.lora import LoraLayer
 
 
 # import peft, torch.nn as nn                    # make sure peft is imported

@@ -184,26 +184,17 @@ class CubeDiffPipeline:
             with torch.no_grad():
                 # Use int64 for timesteps as required by the model
                 timesteps = torch.tensor([t] * latent_model_input.shape[0], device=self.device, dtype=torch.int64)
-                print(f"pipeline.py - CubeDiffPipeline - generate() - Get model prediction - before noise_pred = self.model\n")
+                # print(f"pipeline.py - CubeDiffPipeline - generate() - Get model prediction - before noise_pred = self.model\n")
                 noise_pred = self.model(
                     latent_model_input,
                     timesteps,
                     text_embeddings,
                 )
-                # print(f"pipeline.py - CubeDiffPipeline - generate() - Get model prediction - after model inference, latent_model_input shape is {latent_model_input.shape}, latent_model_input is {latent_model_input}\n")
-                # print(f"pipeline.py - CubeDiffPipeline - generate() - Get model prediction - text_embeddings shape is {text_embeddings.shape}, text_embeddings is {text_embeddings}\n")
-                # print(f"pipeline.py - CubeDiffPipeline - generate() - Get model prediction - timesteps shape is {timesteps.shape}, timesteps is {timesteps}\n")
-                # print(f"pipeline.py - CubeDiffPipeline - generate() - Get model prediction - text_embeddings shape is {text_embeddings.shape}, text_embeddings is {text_embeddings}\n")
-
+                
             # Perform guidance
             if guidance_scale > 1.0:
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                 noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-            
-            # print(f"pipeline.py - CubeDiffPipeline - generate() - Get model prediction - noise_pred_text shape is {noise_pred_text.shape}, noise_pred_text is {noise_pred_text}\n")
-            # print(f"pipeline.py - CubeDiffPipeline - generate() - Get model prediction - noise_pred_uncond shape is {noise_pred_uncond.shape}, noise_pred_uncond is {noise_pred_text}\n")
-            # print(f"pipeline.py - CubeDiffPipeline - generate() - Get model prediction - guidance_scale is {guidance_scale}\n")
-            # print(f"pipeline.py - CubeDiffPipeline - generate() - Get model prediction - noise_pred shape is {noise_pred.shape}, noise_pred is {noise_pred}\n")
             
             # Update latents
             latents = self.scheduler.step(noise_pred, t, latents).prev_sample
@@ -251,9 +242,25 @@ class CubeDiffPipeline:
         
         # Convert to PIL image
         print(f"pipeline.py - CubeDiffPipeline - generate() - before converted to PIL image, equirect shape is {equirect.shape}\n")
-        equirect = (equirect * 255).astype(np.uint8)
+        # equirect = (equirect * 255).astype(np.uint8)
+        # Fix with tensor method:
+        if isinstance(equirect, torch.Tensor):
+            equirect = (equirect * 255).to(torch.uint8)
+        elif isinstance(equirect, np.ndarray):
+            equirect = (equirect * 255).astype(np.uint8)
         print(f"pipeline.py - CubeDiffPipeline - generate() - after equirect * 255\n")
-        equirect_pil = Image.fromarray(equirect)
+        # equirect_pil = Image.fromarray(equirect)
+        
+        if isinstance(equirect, torch.Tensor):
+            # Convert PyTorch tensor to NumPy array first
+            equirect_np = equirect.detach().cpu().numpy()
+            equirect_pil = Image.fromarray(equirect_np)
+        elif isinstance(equirect, np.ndarray):
+            # NumPy array can go directly to PIL
+            equirect_pil = Image.fromarray(equirect)
+        else:
+            raise TypeError(f"equirect must be either torch.Tensor or np.ndarray, got {type(equirect)}")
+
         print(f"pipeline.py - CubeDiffPipeline - generate() - after converted to PIL image\n")
 
         # ───────── NEW: optional down-scale preview ─────────

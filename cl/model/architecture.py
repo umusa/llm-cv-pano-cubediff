@@ -65,8 +65,10 @@ class CubeDiffModel(nn.Module):
         self,
         latents: torch.Tensor,               # [B,6,C,H,W]
         timesteps: torch.Tensor,             # [B] or [B*6]
-        encoder_hidden_states: torch.Tensor  # [B,L,D] or [B*6,L,D]
+        encoder_hidden_states: torch.Tensor,  # [B,L,D] or [B*6,L,D]
+        **kwargs   # ignored                  # Add this to catch extra parameters
     ) -> torch.Tensor:
+        # print(f"architecture.py - cubeDiffModel - forward() - kwargs is {kwargs}\n")
         B, F, C, H, W = latents.shape
         E = self.positional_encoding.embedding_dim
 
@@ -91,13 +93,13 @@ class CubeDiffModel(nn.Module):
             raise ValueError(f"Wrong embedding batch: got {encoder_hidden_states.size(0)}, expected {B*F}")
 
         # 4) Call the U-Net with exactly (sample, timestep, encoder_hidden_states)
-        print(f"architecture.py - cubeDiffModel - forward() - before unet_out = self.base_unet, lat is {lat}, encoder_hidden_states is {encoder_hidden_states}, timesteps is {timesteps} \n")
+        # print(f"architecture.py - cubeDiffModel - forward() - before unet_out = self.base_unet, lat is {lat}, encoder_hidden_states is {encoder_hidden_states}, timesteps is {timesteps} \n")
         unet_out = self.base_unet(
             sample=lat,
             timestep=timesteps,
             encoder_hidden_states=encoder_hidden_states
         )
-        print(f"architecture.py - cubeDiffModel - forward() - after unet_out = self.base_unet\n")
+        # print(f"architecture.py - cubeDiffModel - forward() - after unet_out = self.base_unet\n")
         out = unet_out.sample  # [B*6, C, H, W]
 
         # 5) reshape back → [B,6,C,H,W]
