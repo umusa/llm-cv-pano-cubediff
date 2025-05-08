@@ -37,7 +37,7 @@ def get_dataloader(wds_path, batch_size, num_workers=4):
         }
     
     dataset = (
-        wds.WebDataset(wds_path)
+        wds.WebDataset(wds_path, handler=wds.warn_and_continue, empty_check=False)
           .shuffle(1000, initial=100)   # optional
           .map(preprocess)              # now returns dict[str,Tensor]
     )
@@ -59,6 +59,7 @@ def get_dataloader(wds_path, batch_size, num_workers=4):
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
+        persistent_workers=True,  # keep workers alive
+        prefetch_factor=2,         # each worker preloads 2 batches
         collate_fn=collate_fn,
     )
-

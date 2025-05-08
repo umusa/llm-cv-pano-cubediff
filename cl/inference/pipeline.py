@@ -190,11 +190,20 @@ class CubeDiffPipeline:
                     timesteps,
                     text_embeddings,
                 )
-                
+                # print(f"pipeline.py - CubeDiffPipeline - generate() - Get model prediction - after model inference, latent_model_input shape is {latent_model_input.shape}, latent_model_input is {latent_model_input}\n")
+                # print(f"pipeline.py - CubeDiffPipeline - generate() - Get model prediction - text_embeddings shape is {text_embeddings.shape}, text_embeddings is {text_embeddings}\n")
+                # print(f"pipeline.py - CubeDiffPipeline - generate() - Get model prediction - timesteps shape is {timesteps.shape}, timesteps is {timesteps}\n")
+                # print(f"pipeline.py - CubeDiffPipeline - generate() - Get model prediction - text_embeddings shape is {text_embeddings.shape}, text_embeddings is {text_embeddings}\n")
+
             # Perform guidance
             if guidance_scale > 1.0:
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                 noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+            
+            # print(f"pipeline.py - CubeDiffPipeline - generate() - Get model prediction - noise_pred_text shape is {noise_pred_text.shape}, noise_pred_text is {noise_pred_text}\n")
+            # print(f"pipeline.py - CubeDiffPipeline - generate() - Get model prediction - noise_pred_uncond shape is {noise_pred_uncond.shape}, noise_pred_uncond is {noise_pred_text}\n")
+            # print(f"pipeline.py - CubeDiffPipeline - generate() - Get model prediction - guidance_scale is {guidance_scale}\n")
+            # print(f"pipeline.py - CubeDiffPipeline - generate() - Get model prediction - noise_pred shape is {noise_pred.shape}, noise_pred is {noise_pred}\n")
             
             # Update latents
             latents = self.scheduler.step(noise_pred, t, latents).prev_sample
@@ -262,7 +271,7 @@ class CubeDiffPipeline:
             raise TypeError(f"equirect must be either torch.Tensor or np.ndarray, got {type(equirect)}")
 
         print(f"pipeline.py - CubeDiffPipeline - generate() - after converted to PIL image\n")
-
+        
         # ───────── NEW: optional down-scale preview ─────────
         if preview_hw is not None and output_type == "pil":
             equirect_pil = equirect_pil.resize(preview_hw[::-1],  # PIL expects (w,h)

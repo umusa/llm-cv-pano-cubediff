@@ -28,9 +28,11 @@ def create_filtered_forward(original_forward, filter_params=None):
         # removed = set(kwargs.keys()) - set(filtered_kwargs.keys())
         # if removed:
         #     print(f"Filtered {removed} from {self.__class__.__name__}.forward")
-        
+        # for k,v in filtered_kwargs.items():
+            # print(f"peft_patch.py - create_filtered_forward - original_forward called with key as {k}, v dtype as {v.dtype} and args is {args}\n")
+
         return original_forward(self, *args, **filtered_kwargs)
-    
+    print(f"peft_patch.py - create_filtered_forward - filtered_forward created for {original_forward.__name__}")
     return filtered_forward
 
 def patch_peft_unet_classes():

@@ -86,3 +86,16 @@ logs/
 # Project specific
 *.log
 .env.local
+
+# Ignore data and outputs
+data/dataspace/
+notebooks/=0.8.2/
+outputs/
+=0.8.2
+
+# Ignore generated scripts and notebooks
+load_webdataset.py
+process_cubediff_data.sh
+run_train_nb.ipynb
+sample_visualizations/
+verify_simple.py

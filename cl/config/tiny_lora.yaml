@@ -1,17 +1,23 @@
 #  configure for LoRA fine-tuning of CubeDiff “tiny” model – 700 panoramas
 # --- data --------------------------------------------------
-dataset:       "../data/dataspace/polyhaven_tiny/cubediff_train.tar"    # ← train tar
-val_dataset:   "../data/dataspace/polyhaven_tiny/cubediff_val.tar"      # ← val tar
-batch_size:    2          # 2 per-GPU
-num_workers:   1 
+# dataset:       "../data/dataspace/polyhaven_tiny/cubediff_train.tar"    # ← train tar
+# val_dataset:   "../data/dataspace/polyhaven_tiny/cubediff_val.tar"      # ← val tar
+
+dataset : "/home/jupyter/mluser/git/llm-cv-pano-cubediff/cl/data/dataspace/polyhaven_tiny/cubediff_train.tar"
+val_dataset: "/home/jupyter/mluser/git/llm-cv-pano-cubediff/cl/data/dataspace/polyhaven_tiny/cubediff_val.tar"
+batch_size:    2          
+num_workers:   1
 
 # --- optimisation -----------------------------------------
 max_steps:          700 # 5000
 gradient_accum_steps: 4    # 4 × 2 × 4  = 32 global batch
-learning_rate:      1.0e-4
+learning_rate:      1.0e-3 # Most LoRA-fine-tuning recipes use 1e-3 or even 3e-4 as the adapter learning rate, so the Std Dev grow more quickly
 lora_r:             4
 lora_alpha:         16
-log_every_n_steps:      20
+
+# --- training ---------------------------------------------
+log_every_n_steps:    8 # batch_size * gradient_accum_steps
+eval_every_n_samples: 50
 sample_every_n_steps:  100
 save_every_n_steps:   500
 eval_every_n_steps:   500

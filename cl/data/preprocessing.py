@@ -1,95 +1,12 @@
 import numpy as np
 import torch
 import torch.nn.functional as F
+import math
 from PIL import Image
 import cv2
 import os
 from tqdm import tqdm
 from scipy.ndimage import gaussian_filter
-
-
-# ─────────────── Precompute mapping to speed up cubemap-to-panorama ───────────────
-# def init_equirect_mapping(
-#     H_face: int, W_face: int,
-#     upsample: int = 8,
-#     overlap: int = 8,
-#     sigma: float = 4.0,
-#     device: str = "cuda"
-# ):
-#     """
-#     Precompute all tables and GPU kernel needed for very fast reprojection+blend.
-#     Returns:
-#       face_idx: [H2,W2] int array
-#       ui, vi:   [H2,W2] int arrays
-#       blend_kernel: torch.Tensor [3,1,1,2*ov+1] on `device`
-#       H2, W2:   ints
-#     """
-#     # final panorama resolution
-#     H2, W2 = H_face * upsample, W_face * upsample
-
-#     # spherical coordinates
-#     theta = np.linspace(-np.pi, np.pi, W2)
-#     phi   = np.linspace(-np.pi/2, np.pi/2, H2)
-#     th, ph = np.meshgrid(theta, phi)
-
-#     # unit sphere
-#     x = np.cos(ph) * np.sin(th)
-#     y = np.sin(ph)
-#     z = np.cos(ph) * np.cos(th)
-
-#     # select face by max abs axis
-#     absx, absy, absz = np.abs(x), np.abs(y), np.abs(z)
-#     face_idx = np.argmax(np.stack([absx, absy, absz], axis=0), axis=0)
-
-#     # compute UV→pixel indices per face
-#     ui = np.zeros_like(face_idx, dtype=np.int64)
-#     vi = np.zeros_like(face_idx, dtype=np.int64)
-    
-
-#     def get_uv(face_idx, x, y, z):
-#         """
-#         Map 3D sphere coords (x,y,z) → UV ∈ [0,1] for cubemap face face_idx.
-#         """
-#         if   face_idx == 0:   # +X
-#             u = -z / x;    v = -y / x
-#         elif face_idx == 1:   # -X
-#             u =  z / -x;   v = -y / -x
-#         elif face_idx == 2:   # +Y (top)
-#             u =  x / y;    v =  z / y
-#         elif face_idx == 3:   # -Y (bottom)
-#             u =  x / -y;   v = -z / -y
-#         elif face_idx == 4:   # +Z
-#             u =  x / z;    v = -y / z
-#         elif face_idx == 5:   # -Z
-#             u = -x / -z;   v = -y / -z
-#         else:
-#             raise ValueError(f"Invalid face_idx {face_idx}")
-
-#         # normalize from [-1,1] → [0,1]
-#         return (u + 1)/2, (v + 1)/2
-
-
-#     for f in range(face_idx.max()+1):
-#         mask = face_idx == f
-#         uf, vf = get_uv(f, x[mask], y[mask], z[mask])
-#         uf = np.clip(uf, 0, 1); vf = np.clip(vf, 0, 1)
-#         ui[mask] = np.round( uf * (W_face-1) ).astype(int)
-#         vi[mask] = np.round((1-vf) * (H_face-1)).astype(int)
-
-#     # build a depthwise conv1d kernel for blending
-#     ks = 2*overlap + 1
-#     coords = torch.arange(-overlap, overlap+1, dtype=torch.float32)
-#     g = torch.exp(-(coords/sigma)**2/2)
-#     g = (g / g.sum()).view(1,1,ks)           # [1,1,ks]
-#     blend_kernel = g.repeat(3,1,1).unsqueeze(2).to(device)  # [3,1,1,ks]
-
-#     return face_idx, ui, vi, blend_kernel, H2, W2, overlap
-
-# # … call once at import or runtime:
-# _face_idx, _ui, _vi, _blend_kernel, H2, W2, _ov = init_equirect_mapping(
-#     H_face=64, W_face=64, upsample=8, overlap=8, sigma=4.0, device="cuda"
-# )
-
 
 def equirect_to_cubemap(equirect_img, face_size=512):
     """
@@ -255,8 +172,76 @@ def get_uv(face_idx: int, x: np.ndarray, y: np.ndarray, z: np.ndarray):
     # normalize from [-1,1] → [0,1]
     return (u + 1) * 0.5, (v + 1) * 0.5
 
+
 # ── 1) Precompute the cubemap→equirect mapping once ──
 _face_idx = _ui = _vi = None
+
+# project_to_cubemap_uv
+# It takes an (N,3) tensor of unit-sphere points and returns:
+# face_idx: LongTensor of shape (N,) with values in [0…5]
+# uv: FloatTensor of shape (N,2) with normalized UV coords in [-1,1]
+# Axis‐major selection (argmax(abs(x),abs(y),abs(z))) chooses the correct cube face for each direction.
+# Normalized UV formulas are exactly the OpenGL‐style cubemap conventions (Huerta & Kutz, 2003).
+# Output in [-1,1] plugs directly into F.grid_sample(..., align_corners=False) for perfectly seam-free, bilinear warping
+    
+def project_to_cubemap_uv(xyz: torch.Tensor, Hf: int, Wf: int):
+    """
+    Map 3D unit vectors (x,y,z) → cubemap face index [0..5] + normalized UV in [-1,1].
+    Args:
+      xyz: (N,3) tensor of unit vectors.
+      Hf,Wf: face height/width (unused here but kept for consistency).
+    Returns:
+      face_idx: (N,) long tensor of face IDs (0:+X,1:-X,2:+Y,3:-Y,4:+Z,5:-Z)
+      uv:       (N,2) float tensor with u,v in [-1,1]
+    """
+    dtype = xyz.dtype
+    device = xyz.device
+    x, y, z = xyz.unbind(-1)
+    absx, absy, absz = x.abs(), y.abs(), z.abs()
+
+    face_idx = torch.zeros_like(x, dtype=torch.long)
+    sc = torch.zeros_like(x, dtype=dtype)
+    tc = torch.zeros_like(x, dtype=dtype)
+
+    # X-major
+    mask = (absx >= absy) & (absx >= absz)
+    pos = mask & (x > 0)
+    neg = mask & (x < 0)
+    face_idx[pos] = 0  # +X
+    sc[pos] =  z[pos] / absx[pos]
+    tc[pos] =  y[pos] / absx[pos]
+    face_idx[neg] = 1  # -X
+    sc[neg] = -z[neg] / absx[neg]
+    tc[neg] =  y[neg] / absx[neg]
+
+    # Y-major
+    mask = (absy > absx) & (absy >= absz)
+    pos = mask & (y > 0)
+    neg = mask & (y < 0)
+    face_idx[pos] = 2  # +Y
+    sc[pos] =  x[pos] / absy[pos]
+    tc[pos] = -z[pos] / absy[pos]
+    face_idx[neg] = 3  # -Y
+    sc[neg] =  x[neg] / absy[neg]
+    tc[neg] =  z[neg] / absy[neg]
+
+    # Z-major
+    mask = (absz > absx) & (absz > absy)
+    pos = mask & (z > 0)
+    neg = mask & (z < 0)
+    face_idx[pos] = 4  # +Z
+    sc[pos] =  x[pos] / absz[pos]
+    tc[pos] =  y[pos] / absz[pos]
+    face_idx[neg] = 5  # -Z
+    sc[neg] = -x[neg] / absz[neg]
+    tc[neg] =  y[neg] / absz[neg]
+
+    # stack into UV
+    uv = torch.stack([sc, tc], dim=-1)
+    return face_idx, uv
+
+
+
 def init_cubemap_map(H, W, out_h=None, out_w=None, device="cuda"):
     global _face_idx, _ui, _vi
     if out_h is None: out_h = H
@@ -286,7 +271,11 @@ def init_cubemap_map(H, W, out_h=None, out_w=None, device="cuda"):
     _face_idx, _ui, _vi = face_idx, ui, vi
     
 
+
+
+
 # ── 2) The fast GPU projector + seam-blend ──
+# Replace nearest-neighbor + seam-blend with a true grid_sample reprojection.
 def cubemap_to_equirect(faces: torch.Tensor, overlap: int = 8, sigma: float = 4.0):
     """
     faces: Tensor[6, H, W, 3]       (already up→equirect latent→RGB size)
@@ -297,44 +286,47 @@ def cubemap_to_equirect(faces: torch.Tensor, overlap: int = 8, sigma: float = 4.
         faces = torch.from_numpy(faces).to('cuda' if torch.cuda.is_available() else 'cpu')
     
     device = faces.device
+    dtype = faces.dtype  # Get the dtype of the faces tensor
     if _face_idx is None:
         H,W = faces.shape[1], faces.shape[2]
         init_cubemap_map(H, W, device=device)
 
-    # gather
-    pano = faces[_face_idx, _vi, _ui]    # [H,2W,3]
+    # faces: [6, Hf, Wf, 3] → rearrange [6, C, Hf, Wf]
+    faces = faces.permute(0, 3, 1, 2)
+    _, C, Hf, Wf = faces.shape
 
-    # GPU seam-blend with depthwise conv1d
-    # build once per overlap/sigma
-    # kernel_size = 2*overlap + 1
-    # half = torch.arange(-overlap, overlap+1, device=device).float()
-    # gauss = torch.exp(-0.5*(half/sigma)**2)
+    # target equirect dims
+    He, We = Hf, Wf * 6
+    theta = torch.linspace(-math.pi, math.pi, We, device=device, dtype=dtype)
+    phi   = torch.linspace(0, math.pi,      He, device=device, dtype=dtype)
+    th, ph = torch.meshgrid(theta, phi, indexing="xy")   # (We,He)
 
-    # Ensure the Gaussian filter has the same dtype
-    # build gaussian kernel
-    overlap = 4  # Using a fixed value instead of the parameter
-    sigma = 1.5  # Using a fixed value instead of the parameter
-    ksize = overlap * 2 + 1
+    # from spherical to Cartesian
+    x = torch.sin(ph)*torch.cos(th)
+    y = torch.cos(ph)
+    z = torch.sin(ph)*torch.sin(th)
+    xyz = torch.stack([x, y, z], dim=-1).view(-1, 3)      # (We*He,3)
 
-    dtype = faces.dtype
-    x = torch.arange(ksize, device=device, dtype=dtype)
-    x = x - ksize//2
-    gauss = torch.exp(-(x * x) / (2 * sigma * sigma))    
-    gauss /= gauss.sum()
-    gauss = gauss.view(1,1,1,-1).repeat(3,1,1,1)  # [3,1,1,K]
+    # project each point onto a face + (u,v) in [-1,1]
+    face_idx, uv = project_to_cubemap_uv(xyz, Hf, Wf)     # define small helper
+
+    # build sampling grid [1,He,We,2]
+    grid = uv.view(He, We, 2).unsqueeze(0).to(dtype=dtype)  # Make sure grid has the same dtype as faces
+
+    # sample each face as a separate batch
+    sampled = F.grid_sample(
+        faces, grid.expand(6, -1, -1, -1),
+        mode="bilinear", align_corners=False
+    )   # [6, C, He, We]
+
+    # mask & merge
+    pano = torch.zeros((C, He, We), device=device, dtype=dtype)
+    for f in range(6):
+        mask = (face_idx == f).view(He, We)
+        pano[:, mask] = sampled[f][:, mask]
+
+    return pano.permute(1,2,0)  # [He,We,3]
     
-    # Process with consistent dtype
-    t = pano.permute(2,0,1).unsqueeze(0)           # [1,3,H,2W]
-    t = F.pad(t, (overlap,overlap,0,0), mode="circular")
-
-    # Ensure t has the same dtype as gauss
-    t = t.to(dtype=dtype)
-    gauss = gauss.to(dtype=dtype, device=device)
-
-    t = F.conv2d(t, gauss, groups=3)               # smooth horizontally
-    t = t[..., overlap:-overlap]                  # trim
-    return t.squeeze(0).permute(1,2,0)
-
 
 import os
 import json
@@ -611,3 +603,6 @@ def process_hdri_panoramas(download=True):
         face_size=512,
         visualize=True  # Set to True to visualize the results
     )
+
+# Example usage:
+# process_hdri_panoramas(download=True)
