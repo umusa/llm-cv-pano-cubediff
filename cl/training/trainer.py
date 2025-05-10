@@ -35,20 +35,19 @@ import math
 # Before running your training script
 os.environ["PYTORCH_CUDA_ALLOC_CONF"]="max_split_size_mb:128"
 
-import datetime, time, json, types, numpy as np
+import datetime, time, types
 from pathlib import Path
 import matplotlib.pyplot as plt
 
 import torch.nn.functional as F
-from torch.optim import AdamW
+# from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torchvision import models
-from tqdm.auto import tqdm
 import bitsandbytes as bnb
 
-from peft import get_peft_model, LoraConfig, prepare_model_for_kbit_training
+from peft import get_peft_model, LoraConfig #, prepare_model_for_kbit_training
 
-import wandb, psutil, threading
+import wandb, psutil
 
 from accelerate import Accelerator
 from accelerate.utils import set_seed
@@ -56,10 +55,10 @@ from diffusers import StableDiffusionPipeline, DDPMScheduler
 
 from cl.data.latent_webdataset import get_dataloader
 from cl.model.architecture   import CubeDiffModel
-from cl.training.seam_loss   import seam_loss
+# from cl.training.seam_loss   import seam_loss
 
 from diffusers import UNet2DConditionModel
-from peft import TaskType
+# from peft import TaskType
 import tarfile
 
 # -----------------------------------------------------------
@@ -315,11 +314,6 @@ class CubeDiffTrainer:
             # Set random seed
             set_seed(self.config.get("seed", 42))
 
-            # # Enable optimizations
-            # print("Enabling optimizations for U-Net")
-            # self.model.base_unet.enable_xformers_memory_efficient_attention()
-            # self.model.base_unet.enable_gradient_checkpointing()
-
             print("Preparing model and dataloader with accelerator")
             self.model, self.train_dataloader = self.accelerator.prepare(
                 self.model, self.train_dataloader
@@ -355,23 +349,23 @@ class CubeDiffTrainer:
         """
         # detect & reshape into [B, F, C, H, W]
         if x.dim() == 5:
-            B, F, C, H, W = x.shape
+            B, Face, C, H, W = x.shape
             x5 = x
         elif x.dim() == 4:
             Bf, C, H, W = x.shape
-            F = self.config.get("num_faces", 6)
-            B = Bf // F
-            x5 = x.view(B, F, C, H, W)
+            Face = self.config.get("num_faces", 6)
+            B = Bf // Face
+            x5 = x.view(B, Face, C, H, W)
         else:
             raise ValueError(f"boundary_loss: unexpected tensor dim {x.dim()}")
 
         losses = []
-        for i in range(F):
+        for i in range(Face):
             # right edge of face i vs left edge of face (i+1)%F
             r = x5[:, i, :, :, -1]      # [B, C, H]
-            l = x5[:, (i+1) % F, :, :,  0]  # [B, C, H]
+            l = x5[:, (i+1) % Face, :, :,  0]  # [B, C, H]
             losses.append(self.l1(r, l))
-        return sum(losses) / F
+        return sum(losses) / Face
     
     # --------------------------------------------------
     #  Training loop  (shortened & adapted to latent input)
@@ -409,10 +403,7 @@ class CubeDiffTrainer:
         true_steps   = math.ceil(train_size * epochs / global_batch)
 
         # then override your config:
-        # self.config["max_steps"] = true_steps
         sched = CosineAnnealingLR(optim, T_max=true_steps)
-
-        # sched = CosineAnnealingLR(optim, T_max=self.config["max_steps"])
         optim, sched = self.accelerator.prepare(optim, sched)
 
         sample_prompts        = ["A beautiful mountain lake at sunset with snow-capped peaks"]
@@ -432,7 +423,8 @@ class CubeDiffTrainer:
             epoch_processed = 0
             print(f"▶️ Starting epoch {epoch}/{num_epochs}")
             for batch_indx, batch in enumerate(self.train_dataloader):
-                print(f"\t*** rank {rank} - epoch {epoch} - train loop - Batch {batch_indx}: batch size is {batch['latent'].size(0)}")
+                real_batch_size = batch["latent"].size(0)
+                print(f"\t*** rank {rank} - epoch {epoch} - train loop - Batch {batch_indx}: real_batch_size is {real_batch_size}\n")
                 # how many samples this GPU just got?
                 micro_bs = batch["latent"].size(0)
                 print(
@@ -491,8 +483,6 @@ class CubeDiffTrainer:
                     # Convert perceptual_net to use the same precision as the model
                     self.perceptual_net = self.perceptual_net.to(dtype=torch.bfloat16)
 
-                    # Then in the training loop:
-                    # with torch.cuda.amp.autocast(dtype=torch.bfloat16):  # Use the same dtype as the model
                     with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
                         # perceptual loss
                         pred_rgb = self.decode_latents_to_rgb(pred)
@@ -506,7 +496,11 @@ class CubeDiffTrainer:
                     
                     # collect loss                    
                     self.accelerator.backward(loss)  # ← compute gradients
-                    
+                    #  collect total steps
+                    processed_samples += real_batch_size
+                    processed_samples = torch.tensor(processed_samples, device=self.accelerator.device)
+                    total_processed_samples = self.accelerator.reduce(processed_samples, reduction="sum")
+                
                     if self.accelerator.sync_gradients:
                         # here all replicas have the fully synchronized, accumulated grads
                         # see each adapter’s true gradient (after accumulation + all‐GPU sync) exactly once per update, 
@@ -525,14 +519,16 @@ class CubeDiffTrainer:
                         # 3) only main process turns sums into the global average
                         if self.accelerator.is_main_process:
                             avg_train_loss = (loss_sum / loss_count).item()
-                            train_losses.append((processed_samples, avg_train_loss))
+                            total_processed_samples = total_processed_samples.item()
+                            train_losses.append((total_processed_samples, avg_train_loss))
 
                         # Log LoRA adapter weight stats to verify fine-tuning —
                         if (self.global_iter%self.config["log_lora_every_n_steps"])==0:
                             # print(f"\t\tRank {rank} - trainer.py - CubeDiffTrainer - train - log lora - epoch {epoch} - self.global_iter is {self.global_iter}")
                             self.lora_logger.record_batch(self.model, self.accelerator, self.global_iter)
-                            self.lora_logger.plot_up_to(self.global_iter)
-                            print(f"\t\tRank {rank} - train - self.lora_logger.record_batch done for epoch {epoch}, self.global_iter { self.global_iter}, plot_up_to done")
+                            if self.accelerator.is_main_process:
+                                self.lora_logger.plot_up_to(self.global_iter, total_processed_samples)
+                                print(f"\t\tRank {rank} - train - self.lora_logger.record_batch done for epoch {epoch}, self.global_iter { self.global_iter}, plot_up_to done")
 
                         # 1) gradient clipping
                         self.accelerator.clip_grad_norm_(self.model.parameters(), 1.0)
@@ -556,23 +552,16 @@ class CubeDiffTrainer:
 
                 # peak = torch.cuda.max_memory_allocated() / (1024 ** 3)
                 # print(f"\tRank {rank} epoch {epoch} - batch_indx {batch_indx} - gstep {gstep} - time: {end_tm - start_tm:.2f} seconds - Peak CUDA memory this batch: {peak:.2f} GB")
-                
-                # if self.accelerator.is_main_process:
-                    # print(f"\tRank {rank} - epoch {epoch} - batch_indx {batch_indx} -t rainer.py - CubeDiffTrainer - train - logging and sampling")
-                    # 1) update sample count
-                # ---- logging & sampling ----------------
-                batch_size = batch["latent"].size(0)
-                processed_samples += batch_size
-                epoch_processed += batch_size
-                
+                    
+                # ---- logging & sampling ----------------              
+                epoch_processed += real_batch_size                
                 pct_epoch = epoch_processed / samples_per_rank * 100
                 pct_total = (processed_samples * world_size) / total_samples * 100
 
                 # collect loss
                 if self.accelerator.is_main_process:
                     print(f"rank {rank} - Epoch {epoch}/{num_epochs} ▶ {pct_epoch:.1f}% | Overall ▶ {pct_total:.1f}%")
-                    
-                # print(f"\tRank {rank} - epoch {epoch} - batch_indx {batch_indx} - self.accelerator.is_main_process is {self.accelerator.is_main_process} - processed_samples is {processed_samples}, next_eval_at is {next_eval_at}, global_iter is {self.global_iter}")
+                
                 prev_evaL_at = next_eval_at
                 if (processed_samples >= next_eval_at) or (batch_indx == batch_num_per_rank - 1):
                     # 1) every rank hits this barrier
@@ -588,34 +577,25 @@ class CubeDiffTrainer:
                         val_loss = self.evaluate(rank) # this cost some time
                         temp_e_time = time.time()
                         if self.accelerator.is_main_process:
-                            val_losses.append((processed_samples, val_loss.item()))
+                            val_losses.append((total_processed_samples, val_loss))
                             print(f"\tRank {rank} - epoch {epoch} - batch_indx {batch_indx} - → val‐loss @ {processed_samples} samples: {val_loss:.4f}, eval_every_n_samples is {eval_every_n_samples} - evaluation done - cost {temp_e_time - temp_s_time:.2f} seconds")
-                    next_eval_at += eval_every_n_samples
-                    
+                    next_eval_at += eval_every_n_samples                    
+                
                 # only rank 0 actually runs eval & sampling
                 # update sample count on the main rank (only it tracks & saves losses)
                 if self.accelerator.is_main_process:                    
                     # 1) log train loss every N steps
                     if gstep % self.config["log_loss_every_n_steps"] == 0:
                         # train_losses.append((processed_samples, loss.item()))
-                        # live‐plot up to this step
-                        self._plot_loss_curves(processed_samples, train_losses, val_losses)
+                        self._plot_loss_curves(total_processed_samples, train_losses, val_losses)
                         print(f"\tRank {rank} - epoch {epoch} - batch_indx {batch_indx} - plotted loss - gstep {gstep} - self.accelerator.is_main_process is {self.accelerator.is_main_process} - log_loss_every_n_steps is {self.config['log_loss_every_n_steps']} - global_iter is {self.global_iter-1} - batch_size is {batch_size}, samples {processed_samples:>4}  train-loss {loss.item():.4f}")
                     # 2) every `eval_every_n_samples`, first sync _all_ ranks…
                     #  eval + sample‐gen
                     if (eval_every_n_samples and processed_samples >= prev_evaL_at) or (batch_indx == batch_num_per_rank - 1):
-                        # …then only the main rank does eval + sample gen
-                        # print(f"\tRank {rank} - epoch {epoch} - batch_indx {batch_indx} - eval_every_n_samples is {eval_every_n_samples} - evaluating ...")
-                        # temp_s_time = time.time()
-                        # val_loss = self.evaluate() # this cost some time
-                        # temp_e_time = time.time()
-                        # val_losses.append((processed_samples, val_loss))
-                        # print(f"\tRank {rank} - epoch {epoch} - batch_indx {batch_indx} - → val‐loss @ {processed_samples} samples: {val_loss:.4f}, eval_every_n_samples is {eval_every_n_samples} - evaluation done - cost {temp_e_time - temp_s_time:.2f} seconds")
-                        
                         # generate panorama from current LoRA checkpoint
                         print(f"\tRank {rank} - epoch {epoch} - batch_indx {batch_indx} - generate_samples ...")
                         temp_s_time = time.time()
-                        self.generate_samples(rank, sample_prompts, gstep)
+                        self.generate_samples(rank, sample_prompts, total_processed_samples)
                         temp_e_time = time.time()
                         print(f"\tRank {rank} - epoch {epoch} - batch_indx {batch_indx} - generate_samples done - cost {temp_e_time - temp_s_time:.2f} seconds")    
                         
@@ -640,7 +620,7 @@ class CubeDiffTrainer:
                             # Option 2: Original approach (fallback)
                             elif hasattr(unwrapped.base_unet, "lora_layers") and len(unwrapped.base_unet.lora_layers) > 0:
                                 lora_params = unwrapped.base_unet.lora_layers[0].weight
-                                print(f"\tRank {rank} - epoch {epoch} - batch_indx {batch_indx} - trainer.py - Verify U-Net’s LoRA are actually updating")
+                                print(f"\tRank {rank} - epoch {epoch} - batch_indx {batch_indx} - trainer.py - Verify U-Net’s LoRA are actually updating - base_unet has lora_layers with size>0")
 
                             # Option 3: Search for any LoRA-like parameters
                             else:
@@ -682,9 +662,30 @@ class CubeDiffTrainer:
             # ───────────────────────────────────────────────────────────────
             # after all training, plot train & val curves
             try:
+                # steps_tr, loss_tr = zip(*train_losses) if train_losses else ([],[])
+                # steps_va, loss_va = zip(*val_losses)   if val_losses   else ([],[])
+                
+                # unpack
                 steps_tr, loss_tr = zip(*train_losses) if train_losses else ([],[])
                 steps_va, loss_va = zip(*val_losses)   if val_losses   else ([],[])
-                
+                # coerce EVERY element to a host‐side Python scalar
+                steps_tr = [
+                    int(s.item()) if torch.is_tensor(s) else int(s)
+                    for s in steps_tr
+                ]
+                loss_tr  = [
+                    float(l.item()) if torch.is_tensor(l) else float(l)
+                    for l in loss_tr
+                ]
+                steps_va = [
+                    int(s.item()) if torch.is_tensor(s) else int(s)
+                    for s in steps_va
+                ]
+                loss_va  = [
+                    float(l.item()) if torch.is_tensor(l) else float(l)
+                    for l in loss_va
+                ]
+
                 plt.figure(figsize=(6,4))
                 plt.plot(steps_tr, loss_tr, label="train")
                 if steps_va:
@@ -711,8 +712,8 @@ class CubeDiffTrainer:
         """
         # flatten if needed
         if lat.ndim == 5:
-            B, F, C, H, W = lat.shape
-            lat = lat.reshape(B * F, C, H, W)
+            B, Face, C, H, W = lat.shape
+            lat = lat.reshape(B * Face, C, H, W)
 
         # cast into VAE’s dtype (bfloat16)
         lat_bf16 = lat.to(self.vae.dtype)
@@ -783,15 +784,6 @@ class CubeDiffTrainer:
         if self.val_dataloader is None:
             return float("nan")
 
-        # for i, batch in enumerate(self.val_dataloader):
-        #     print(f"trainer.py - evaluate() - batch {i} - batch size is {batch['latent'].size(0)}\n", flush=True)
-        
-        # val_iter = iter(self.val_dataloader)
-        # print("→ Accelerate gave me only one batch?")    
-        # first = next(val_iter, None)
-        # second = next(val_iter, None)
-        # print("  first:", bool(first), "second:", bool(second))
-            
         import torch._dynamo
         torch._dynamo.disable()
         torch._dynamo.config.suppress_errors = True
@@ -863,8 +855,6 @@ class CubeDiffTrainer:
                 total_samples+= lat.size(0)
                 # print(f"trainer.py - evaluate() - after pred = self.model, total_loss is {total_loss}, total_sample is {total_samples}\n")
 
-        # self.model.train()
-        # return total_loss / total_samples if total_samples > 0 else float("nan")
         # 1) make local-sum & count tensors
         device       = self.accelerator.device
         loss_sum     = torch.tensor(total_loss,   device=device)
@@ -876,7 +866,7 @@ class CubeDiffTrainer:
 
         # 3) only the main process turns into a scalar avg
         if self.accelerator.is_main_process:
-            avg = loss_sum / loss_count
+            avg = (loss_sum / loss_count).item()
             print(f"\trank {rank} - evaluate() - avg loss is {avg}, count_sum is {loss_count}\n")
         else:
             avg = None
@@ -884,28 +874,42 @@ class CubeDiffTrainer:
         self.model.train()        
         return avg
 
-    def _plot_loss_curves(self, up_to: int, train_losses, val_losses):
-        """Plot & save train/val losses up to `up_to` samples."""
+    def _plot_loss_curves(self, total_processed_samples: int, train_losses, val_losses):
+        """Plot & save train/val losses up to `up_to` total_processed_samples."""
         # unpack
         steps_tr, loss_tr = zip(*train_losses) if train_losses else ([],[])
         steps_va, loss_va = zip(*val_losses)   if val_losses   else ([],[])
-        # ensure floats (in case any tensor slipped through)
-        loss_tr = [float(l) for l in loss_tr]
-        loss_va = [float(l) for l in loss_va]
+        # coerce EVERY element to a host‐side Python scalar
+        steps_tr = [
+            int(s.item()) if torch.is_tensor(s) else int(s)
+            for s in steps_tr
+        ]
+        loss_tr  = [
+            float(l.item()) if torch.is_tensor(l) else float(l)
+            for l in loss_tr
+        ]
+        steps_va = [
+            int(s.item()) if torch.is_tensor(s) else int(s)
+            for s in steps_va
+        ]
+        loss_va  = [
+            float(l.item()) if torch.is_tensor(l) else float(l)
+            for l in loss_va
+        ]
 
         plt.figure(figsize=(6,4))
         plt.plot(steps_tr, loss_tr, label="train")
         if steps_va:
             plt.plot(steps_va, loss_va, label="val")
-        plt.title(f"Training & Validation Loss up to {up_to} samples")
+        plt.title(f"Training & Validation Loss up to {total_processed_samples} samples")
         plt.xlabel("samples")
         plt.ylabel("loss")
         plt.legend()
         plt.tight_layout()
-        out = self.output_dir / f"loss_curve_up_to_processed_examples.png"
+        out = self.output_dir / f"loss_curve_up_to_total_processed_examples.png"
         plt.savefig(out)
         plt.close()
-        print(f"✔ live loss‐curve up to processed_examples {up_to} → {out}")
+        print(f"✔ live loss‐curve up to total_processed_samples {total_processed_samples} → {out}")
 
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -923,29 +927,47 @@ class LoRALogger:
         iteration: your global iteration counter (e.g. batch_idx + epoch*len(dataloader))
         """
         unet = accelerator.unwrap_model(model).base_unet
+        # 1) loop every LoRA param on GPU
         for full_name, param in unet.named_parameters():
             if not (param.requires_grad and ".lora_" in full_name):
                 continue
-            module_key = full_name.rsplit(".lora_",1)[0]
-            w = param.detach().cpu().view(-1).float()
-            w_mean, w_std = w.mean().item(), w.std().item()
-            if param.grad is None:
-                g_mean = float("nan")
-                g_std  = float("nan")
-            else:
-                g = param.grad.detach().cpu().view(-1).float()
-                g_mean, g_std = g.mean().item(), g.std().item()
-            self._records.append({
-                "iter":      iteration,
-                "module":    module_key,
-                "full_name": full_name,
-                "W_mean":    w_mean,
-                "W_std":     w_std,
-                "G_mean":    g_mean,
-                "G_std":     g_std,
-            })
+            module_key = full_name.rsplit(".lora_", 1)[0]
 
-    def plot_up_to(self, iteration: int):
+            # 2) local stats on device
+            p_data = param.detach()
+            flat_p = p_data.view(-1)
+            w_mean_t = flat_p.mean()
+            w_std_t  = flat_p.std(unbiased=False)
+
+            if param.grad is not None:
+                g_data = param.grad.detach()
+                flat_g = g_data.view(-1)
+                g_mean_t = flat_g.mean()
+                g_std_t  = flat_g.std(unbiased=False)
+            else:
+                # ensure a tensor for reduction
+                g_mean_t = torch.tensor(float("nan"), device=accelerator.device)
+                g_std_t  = torch.tensor(float("nan"), device=accelerator.device)
+
+            # 3) all-reduce across all GPUs (average)
+            w_mean = accelerator.reduce(w_mean_t, reduction="mean")
+            w_std  = accelerator.reduce(w_std_t,  reduction="mean")
+            g_mean = accelerator.reduce(g_mean_t, reduction="mean")
+            g_std  = accelerator.reduce(g_std_t, reduction="mean")
+
+            # 4) only record on the main process
+            if accelerator.is_main_process:
+                self._records.append({
+                    "iter":      iteration,
+                    "module":    module_key,
+                    "full_name": full_name,
+                    "W_mean":    w_mean.item(),
+                    "W_std":     w_std.item(),
+                    "G_mean":    g_mean.item(),
+                    "G_std":     g_std.item(),
+                })
+
+    def plot_up_to(self, iteration: int, total_processed_samples: int = None):
         """
         Re-compute the per-iteration aggregates up to “iteration” (inclusive)
         and overwrite the four summary plots on disk.
@@ -979,7 +1001,7 @@ class LoRALogger:
             # ax.plot(summary["iter"], summary[cols[1]], label=cols[1])
             ax.plot(summary["iter"], summary[cols[0]], marker="o", label=cols[0])
             ax.plot(summary["iter"], summary[cols[1]], marker="x", label=cols[1])
-            ax.set_title(f"{title} up to iter {iteration}")
+            ax.set_title(f"{title} up to iter {iteration} with total_processed_samples {total_processed_samples}")
             ax.set_xlabel("Iteration")
             ax.set_ylabel(ylabel)
             ax.legend(loc="upper right", fontsize="small")
@@ -1010,7 +1032,7 @@ class LoRALogger:
         })
         summary.index.name = "iter"
         summary.reset_index(inplace=True)
-        summary_csv = self.output_dir / "lora_summary.csv"
+        summary_csv = self.output_dir / "lora_final_summary.csv"
         summary.to_csv(summary_csv, index=False)
         print(f"[LoRALogger] summary → {summary_csv}")
 

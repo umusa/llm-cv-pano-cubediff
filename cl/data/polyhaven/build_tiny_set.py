@@ -14,12 +14,12 @@ The script:
 import pathlib
 import argparse
 import json
-import torch
+# import torch
 import tqdm
 import os
 import sys
 import logging
-from typing import List, Dict, Tuple, Optional
+# from typing import List, Dict, Tuple, Optional
 from pathlib import Path
 
 # Configure logging
@@ -215,11 +215,6 @@ def main():
     # Create output directories
     try:
         logger.info(f"Creating output directories in {args.out}")
-        # tmp = pathlib.Path(args.out) / "raw"
-        # erp_dir = tmp / "erp"
-        # faces_dir = tmp / "faces"
-        # latent_dir = pathlib.Path(args.out) / "latents"
-        
         tmp = pathlib.Path(args.out) / "raw"
         erp_dir = tmp / "erp"
         # we want raw/faces and raw/panoramas, so point conversion at tmp
@@ -256,10 +251,6 @@ def main():
         sys.exit(1)
         
     # Convert to cubemap faces
-    # try:
-    #     logger.info("Converting equirectangular panoramas to cubemap faces...")
-    #     num_converted = batch_convert(erp_dir, faces_dir, face_px=512)
-    #     logger.info(f"Converted {num_converted} panoramas to cubemap faces")
     try:
         logger.info("Converting equirectangular panoramas to cubemap faces...")
         num_converted = batch_convert(erp_dir, conversion_root, face_px=512)
