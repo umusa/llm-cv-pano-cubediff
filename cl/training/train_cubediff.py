@@ -6,6 +6,10 @@ It simply:
   • instantiates CubeDiffTrainer,
   • calls trainer.train().
 """
+import torch
+import torch.multiprocessing as _mp
+_mp.set_sharing_strategy("file_system")   # <— avoid /dev/shm exhaustion on many workers
+
 import fix_attention_dtype
 # Import and apply fixes first, before ANY other imports
 # import fix_pytorch_issues 
@@ -30,7 +34,7 @@ import fix_attention_dtype
 #     print("Warning: Some patches are not applied correctly")
 
 # =======================================================================
-import torch
+
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.allow_tf32 = True

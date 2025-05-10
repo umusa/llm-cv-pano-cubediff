@@ -1,0 +1,38 @@
+# config/accelerate_config.yaml
+
+# 1) Where are we running?
+compute_environment: LOCAL_MACHINE
+
+# 2) What kind of distributed?
+#    MULTI_GPU will do DDP over all GPUs on this node
+distributed_type: MULTI_GPU
+
+# 3) How many GPUs (processes) in total?
+num_processes: 8
+
+# 4) How many machines, and which one is this?
+num_machines: 1
+machine_rank: 0
+
+# 5) (Leave these null to auto-pick a free port)
+main_process_ip: null
+main_process_port: null
+
+# 6) Mixed precision mode: bf16 on L4, or fp16 if you prefer
+mixed_precision: bf16
+
+# 7) Don’t force downcast beyond your choice
+downcast_bf16: no
+
+# 8) No CPU-only fallback, no FSDP, no DeepSpeed here
+use_cpu: false
+fsdp_config: {}
+deepspeed_config: {}
+
+
+# Tell Accelerate to drive the DataLoader harder
+# dispatch_batches: true        # prefetch next batches across ranks
+# dataloader_num_workers: 8     # same 8 workers per process
+# dataloader_prefetch_factor: 8 # match your tiny_lora setting
+# dataloader_pin_memory: true   # host→device overlap
+
