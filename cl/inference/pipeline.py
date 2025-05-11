@@ -166,34 +166,53 @@ class CubeDiffPipeline:
             # For classifier-free guidance
             text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
         
-        # Generate random latent vectors for each face
+        # Generate random latent vectors for each face (4 latent dims)
         num_faces = 6
         latents = torch.randn(
             (1, num_faces, 4, height // 8, width // 8),
             device=self.device,
             dtype=model_dtype,
         )
+        # ── Append mask channel so conv_in sees 4+9+1=14 channels ──
+        # CFG: Classifier-free guidance mask: 1 = text‐conditioned
+        mask = torch.ones(
+            (1, num_faces, 1, height // 8, width // 8),
+            device=self.device,
+            dtype=model_dtype,
+        )
+        latents = torch.cat([latents, mask], dim=2)  # → [1,6,5,H/8,W/8]
         print(f"pipeline.py - CubeDiffPipeline - generate() - before Denoise latents, latents shape is {latents.shape}, latents type is {type(latents)}\n")
 
         # Denoise latents
         for t in self.scheduler.timesteps:
             # Expand latents for classifier-free guidance
-            latent_model_input = latents.repeat(2, 1, 1, 1, 1) if guidance_scale > 1.0 else latents
+            # latent_model_input = latents.repeat(2, 1, 1, 1, 1) if guidance_scale > 1.0 else latents
             
-            # Get model prediction
+            # # Get model prediction
+            # with torch.no_grad():
+            #     # Use int64 for timesteps as required by the model
+            #     timesteps = torch.tensor([t] * latent_model_input.shape[0], device=self.device, dtype=torch.int64)
+            #     # print(f"pipeline.py - CubeDiffPipeline - generate() - Get model prediction - before noise_pred = self.model\n")
+            #     noise_pred = self.model(
+            #         latent_model_input,
+            #         timesteps,
+            #         text_embeddings,
+            #     )
+            #     # print(f"pipeline.py - CubeDiffPipeline - generate() - Get model prediction - after model inference, latent_model_input shape is {latent_model_input.shape}, latent_model_input is {latent_model_input}\n")
+            #     # print(f"pipeline.py - CubeDiffPipeline - generate() - Get model prediction - text_embeddings shape is {text_embeddings.shape}, text_embeddings is {text_embeddings}\n")
+            #     # print(f"pipeline.py - CubeDiffPipeline - generate() - Get model prediction - timesteps shape is {timesteps.shape}, timesteps is {timesteps}\n")
+            #     # print(f"pipeline.py - CubeDiffPipeline - generate() - Get model prediction - text_embeddings shape is {text_embeddings.shape}, text_embeddings is {text_embeddings}\n")
+
+        
+            # — 1) Prepare input to U-Net (with mask still attached) —
+            latent_model_input = latents.repeat(2,1,1,1,1) if guidance_scale>1.0 else latents
+
+            # — 2) Predict noise on the 4 real channels (model strips mask internally) —
             with torch.no_grad():
-                # Use int64 for timesteps as required by the model
-                timesteps = torch.tensor([t] * latent_model_input.shape[0], device=self.device, dtype=torch.int64)
-                # print(f"pipeline.py - CubeDiffPipeline - generate() - Get model prediction - before noise_pred = self.model\n")
-                noise_pred = self.model(
-                    latent_model_input,
-                    timesteps,
-                    text_embeddings,
-                )
-                # print(f"pipeline.py - CubeDiffPipeline - generate() - Get model prediction - after model inference, latent_model_input shape is {latent_model_input.shape}, latent_model_input is {latent_model_input}\n")
-                # print(f"pipeline.py - CubeDiffPipeline - generate() - Get model prediction - text_embeddings shape is {text_embeddings.shape}, text_embeddings is {text_embeddings}\n")
-                # print(f"pipeline.py - CubeDiffPipeline - generate() - Get model prediction - timesteps shape is {timesteps.shape}, timesteps is {timesteps}\n")
-                # print(f"pipeline.py - CubeDiffPipeline - generate() - Get model prediction - text_embeddings shape is {text_embeddings.shape}, text_embeddings is {text_embeddings}\n")
+                timesteps = torch.tensor([t] * latent_model_input.shape[0],
+                                        device=self.device,
+                                        dtype=torch.int64)
+                noise_pred = self.model(latent_model_input, timesteps, text_embeddings)
 
             # Perform guidance
             if guidance_scale > 1.0:
@@ -206,28 +225,53 @@ class CubeDiffPipeline:
             # print(f"pipeline.py - CubeDiffPipeline - generate() - Get model prediction - noise_pred shape is {noise_pred.shape}, noise_pred is {noise_pred}\n")
             
             # Update latents
-            latents = self.scheduler.step(noise_pred, t, latents).prev_sample
+            # latents = self.scheduler.step(noise_pred, t, latents).prev_sample
             # print(f"pipeline.py - CubeDiffPipeline - generate() - Get model prediction - after update latents - latents shape is {latents.shape}, latents is {latents}\n")
+        
+            # — 3) Do DDIM step on just the 4 real channels —
+            #    split latents → [B,6,4,H/8,W/8] + [B,6,1,H/8,W/8]
+            real_lat, mask = latents[:, :, :4], latents[:, :, 4:].clone()
+            
+            # scheduler.step requires model_output and sample to share the same shape. By slicing off the mask channel, ensure both are [B,6,4,H/8,W/8]
+            updated_real = self.scheduler.step(noise_pred, t, real_lat).prev_sample
 
+            # — 4) re-attach the mask for the next iteration —
+            # Maintaining mask: re-attach the mask each iteration so the next U-Net call still sees the 5-channel input it expects.
+            latents = torch.cat([updated_real, mask], dim=2)
+    
+        # At this point `latents` is [1,6,5,H/8,W/8]
         print(f"pipeline.py - CubeDiffPipeline - generate() - after Denoise latents, latents shape is {latents.shape}, latents type is {type(latents)}\n")
+        
         # Decode latents
+
+        # with torch.no_grad():
+        #     cube_faces = []
+        #     for i in range(num_faces):
+        #         # face_latent = latents[0, i]
+        #         # with torch.cuda.amp.autocast(enabled=True):
+        #         #     face_image = self.vae.decode(face_latent / 0.18215).sample
+        #         # cube_faces.append(face_image)
+                
+        #         # 1) add the missing batch dim
+        #         face_latent = latents[0, i].unsqueeze(0)           # → [1, C, H, W]
+            
+        #         # 2) decode with batch dim, then strip it off
+        #         with torch.amp.autocast(enabled=True, device_type="cuda"):
+        #             out = self.vae.decode(face_latent / 0.18215)
+        #             sample = out.sample                            # → [1, 3, h, w]
+        #         cube_faces.append(sample[0])                       # → [3, h, w]
+
+        # 5) Drop mask before decoding with VAE
         with torch.no_grad():
             cube_faces = []
             for i in range(num_faces):
-                # face_latent = latents[0, i]
-                # with torch.cuda.amp.autocast(enabled=True):
-                #     face_image = self.vae.decode(face_latent / 0.18215).sample
-                # cube_faces.append(face_image)
-                
-                # 1) add the missing batch dim
-                face_latent = latents[0, i].unsqueeze(0)           # → [1, C, H, W]
-            
-                # 2) decode with batch dim, then strip it off
+                # keep only the 4 latent channels, drop the mask
+                # VAE decode: The VAE always expects exactly 4 latent channels; dropping the mask channel here prevents another shape mismatch.
+                face_latent = latents[0, i, :4].unsqueeze(0)     # → [1,4,H/8,W/8]
                 with torch.amp.autocast(enabled=True, device_type="cuda"):
-                    out = self.vae.decode(face_latent / 0.18215)
-                    sample = out.sample                            # → [1, 3, h, w]
-                cube_faces.append(sample[0])                       # → [3, h, w]
-            
+                    out = self.vae.decode(face_latent / 0.18215) 
+                cube_faces.append(out.sample[0])                 # → [3, h, w]
+
             # Stack cube faces
             cube_faces = torch.stack(cube_faces, dim=0)  # [6, 3, H, W]
         

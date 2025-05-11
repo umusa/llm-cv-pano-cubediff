@@ -19,7 +19,7 @@ lora_r:             4
 lora_alpha:         16
 
 # --- training ---------------------------------------------
-num_epochs:          40 # 18 # 2
+num_epochs:          40 # 40 # 18 # 2
 log_loss_every_n_steps:    1 # 8 # batch_size * gradient_accum_steps
 log_lora_every_n_steps: 1 
 eval_every_n_samples: 50 # 8

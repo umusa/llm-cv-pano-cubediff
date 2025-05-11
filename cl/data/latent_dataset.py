@@ -56,8 +56,13 @@ def get_dataloader(
                 if isinstance(tensor, torch.Tensor):
                     print(f"Loaded tensor with shape: {tensor.shape}")
                     # Your tensor should be [6, 4, 64, 64] 
-                    if tensor.shape != (6, 4, 64, 64):
-                        print(f"Warning: Unexpected tensor shape {tensor.shape}, expected (6, 4, 64, 64)")
+                    # if tensor.shape != (6, 4, 64, 64):
+                    #     print(f"Warning: Unexpected tensor shape {tensor.shape}, expected (6, 4, 64, 64)")
+
+                    # the tensor should now be [6, 5, 64, 64] (6 faces × (4 latent dims + 1 mask))
+                    expected = (6, 5, 64, 64)
+                    if tensor.shape != expected:
+                        print(f"Warning: Unexpected tensor shape {tensor.shape}, expected {expected}")
                 else:
                     print(f"Error: Loaded object is not a tensor, got {type(tensor)}")
                     return None
@@ -118,8 +123,15 @@ def get_dataloader(
         if len(batch) == 0:
             print("Warning: Empty batch encountered")
             # Return empty tensors instead of None
+            # return {
+            #     "latent": torch.zeros((0, 6, 4, 64, 64)),
+            #     "input_ids": torch.zeros((0, MAX_LEN), dtype=torch.long),
+            #     "attention_mask": torch.zeros((0, MAX_LEN), dtype=torch.long)
+            # }
+
             return {
-                "latent": torch.zeros((0, 6, 4, 64, 64)),
+                # now include the mask channel
+                "latent": torch.zeros((0, 6, 5, 64, 64)),
                 "input_ids": torch.zeros((0, MAX_LEN), dtype=torch.long),
                 "attention_mask": torch.zeros((0, MAX_LEN), dtype=torch.long)
             }
@@ -147,8 +159,15 @@ def get_dataloader(
                     else:
                         print(f"  {k}: type={type(v)}")
             # Return empty tensors instead of None
+            # return {
+            #     "latent": torch.zeros((0, 6, 4, 64, 64)),
+            #     "input_ids": torch.zeros((0, MAX_LEN), dtype=torch.long),
+            #     "attention_mask": torch.zeros((0, MAX_LEN), dtype=torch.long)
+            # }
+
             return {
-                "latent": torch.zeros((0, 6, 4, 64, 64)),
+                # now include the mask channel
+                "latent": torch.zeros((0, 6, 5, 64, 64)),
                 "input_ids": torch.zeros((0, MAX_LEN), dtype=torch.long),
                 "attention_mask": torch.zeros((0, MAX_LEN), dtype=torch.long)
             }

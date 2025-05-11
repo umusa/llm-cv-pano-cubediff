@@ -37,7 +37,7 @@ def get_dataloader(wds_path, batch_size, data_size, num_workers=8):
             return_tensors="pt"
         )
         return {
-            "latent":         tensor,
+            "latent":         tensor,   # [6,4,H,W]
             "input_ids":      toks.input_ids.squeeze(0),
             "attention_mask": toks.attention_mask.squeeze(0),
         }
@@ -55,15 +55,47 @@ def get_dataloader(wds_path, batch_size, data_size, num_workers=8):
         .slice(data_size)
     )
 
+    # def collate_fn(batch):
+    #     latents        = torch.stack([b["latent"]         for b in batch], dim=0)  # → [B, 6, 4, H, W]
+    #     # ── CubeDiff requires a 1-channel “mask” (1=clean/text conditioning)
+    #     #     so that conv_in (patched for uv_dim=9 + mask_ch=1) sees 14 channels
+    #     B, F, C, H, W = latents.shape
+    #     mask = torch.ones((B, F, 1, H, W), 
+    #                       dtype=latents.dtype, 
+    #                       device=latents.device)
+    #     latents = torch.cat([latents, mask], dim=2)             # → [B, 6, 5, H, W]
+    #     input_ids      = torch.stack([b["input_ids"]      for b in batch], dim=0)
+    #     attention_mask = torch.stack([b["attention_mask"] for b in batch], dim=0)
+    #     return {
+    #         "latent":         latents,
+    #         "input_ids":      input_ids,
+    #         "attention_mask": attention_mask,
+    #     }
+
     def collate_fn(batch):
-        latents        = torch.stack([b["latent"]         for b in batch], dim=0)
+        # Stack per-sample tensors into a batch
+        latents        = torch.stack([b["latent"]         for b in batch], dim=0)  # → [B, 6, 4, H, W]
+
+        # ── CubeDiff requires a 1-channel “mask” indicating which latents
+        #     are clean (text-conditioned) vs. noisy.  Without it, the U-Net
+        #     falls back to an unconditional prior and you get pure noise.
+        B, F, C, H, W = latents.shape
+        # make a mask of all ones (text-only setting)
+        mask = torch.ones((B, F, 1, H, W),
+                          dtype=latents.dtype,
+                          device=latents.device)
+        # append as a 5th channel per face → [B, 6, 5, H, W]
+        latents = torch.cat([latents, mask], dim=2)
+
         input_ids      = torch.stack([b["input_ids"]      for b in batch], dim=0)
         attention_mask = torch.stack([b["attention_mask"] for b in batch], dim=0)
+
         return {
-            "latent":         latents,
+            "latent":         latents,        # [B,6,5,H,W]
             "input_ids":      input_ids,
             "attention_mask": attention_mask,
         }
+
 
     return DataLoader(
         dataset,

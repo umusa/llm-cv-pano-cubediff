@@ -77,24 +77,49 @@ class CubeDiffModel(nn.Module):
         # print(f"after positional_encoding\n")
         # self.check_dtypes()
 
+        # -------------------------------------------------------
         # — 5) Patch conv_in to accept the UV channels
-        in_ch   = self.base_unet.conv_in.in_channels
+        # in_ch   = self.base_unet.conv_in.in_channels
+        # out_ch  = self.base_unet.conv_in.out_channels
+        # kernel, stride, pad = (
+        #     self.base_unet.conv_in.kernel_size,
+        #     self.base_unet.conv_in.stride,
+        #     self.base_unet.conv_in.padding,
+        # )
+        # new_in = nn.Conv2d(in_ch + uv_dim, out_ch, kernel, stride, pad)
+        # with torch.no_grad():
+        #     new_in.weight[:, :in_ch].copy_(self.base_unet.conv_in.weight)
+        #     new_in.bias.copy_(self.base_unet.conv_in.bias)
+
+        # # print(f"after replacing conv_in, before self.base_unet.conv_in = new_in, new_in type is {type(new_in)}\n")
+        # # self.check_dtypes()
+        # # Explicitly cast to the same dtype BEFORE assigning
+        # new_in = new_in.to(dtype=self.model_dtype, device=self.device)
+        # self.base_unet.conv_in = new_in
+        # -------------------------------------------------------
+        # CubeDiff concatenates a 1-channel binary mask to the 4-channel latent map before UV positional encoding. 
+        # This tells the model which faces (or regions) to preserve during denoising . 
+        # Without it, the network simply learns an unconditional prior and will ignore your text.
+
+        # — 5) Patch conv_in to accept UV + mask channels
+        in_ch   = self.base_unet.conv_in.in_channels    # originally 4
+        mask_ch = 1
         out_ch  = self.base_unet.conv_in.out_channels
         kernel, stride, pad = (
             self.base_unet.conv_in.kernel_size,
             self.base_unet.conv_in.stride,
             self.base_unet.conv_in.padding,
         )
-        new_in = nn.Conv2d(in_ch + uv_dim, out_ch, kernel, stride, pad)
+        new_in = nn.Conv2d(in_ch + uv_dim + mask_ch, out_ch, kernel, stride, pad)
         with torch.no_grad():
+            # 1) copy original latent→feature weights
             new_in.weight[:, :in_ch].copy_(self.base_unet.conv_in.weight)
+            # 2) zero-init UV & mask weights so model can learn from scratch
+            new_in.weight[:, in_ch:].zero_()
             new_in.bias.copy_(self.base_unet.conv_in.bias)
-
-        # print(f"after replacing conv_in, before self.base_unet.conv_in = new_in, new_in type is {type(new_in)}\n")
-        # self.check_dtypes()
-        # Explicitly cast to the same dtype BEFORE assigning
         new_in = new_in.to(dtype=self.model_dtype, device=self.device)
         self.base_unet.conv_in = new_in
+
 
         # print(f"after replacing conv_in, Patch conv_in to accept the UV channels\n")
         # self.check_dtypes()

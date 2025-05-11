@@ -475,6 +475,20 @@ class CubeDiffTrainer:
                         # print("Parameter filtering through model path is working!")
 
                     # ── NEW LOSS ──
+                    # mse_loss = F.mse_loss(pred.float(), noise.float())
+                    # The model predicts only the 4 “true” latent channels;
+                    # our `noise` still has 5 (4 + mask). Drop the mask so shapes align.
+                    # reasons: 
+                    # CubeDiff’s U-Net output (pred) has shape [B,6,4,H,W] (only the original 4 latent dims) 
+                    # noise was sampled to match the 5-channel input (latent + mask), giving [B,6,5,H,W].
+                    # By slicing off the last (mask) channel—noise[:, :, :pred.size(2), ...]—you restore a [B,6,4,H,W] tensor that 
+                    # lines up perfectly with pred for the mean-squared‐error.
+                    # benifits:
+                    # keeps your mask channel around for conditioning but prevents it from polluting your denoising loss. After this update, 
+                    # your MSE, boundary, and perceptual losses will all compute correctly, and you’ll begin to see your training curves converge 
+                    # rather than erroring out.
+                    if noise.size(2) != pred.size(2):
+                        noise = noise[:, :, : pred.size(2), :, :]
                     mse_loss = F.mse_loss(pred.float(), noise.float())
 
                     # boundary loss
@@ -831,8 +845,13 @@ class CubeDiffTrainer:
                     )
 
                 # 1) MSE
-                mse = F.mse_loss(pred.float(), noise.float(), reduction="mean")
+                # mse = F.mse_loss(pred.float(), noise.float(), reduction="mean")
                 # print(f"trainer.py - evaluate() - after pred = self.model, mse is {mse}\n")
+                # The model predicts only the 4 “true” latent channels;
+                # our `noise` still has 5 (4 + mask). Drop the mask so shapes align.
+                if noise.size(2) != pred.size(2):
+                    noise = noise[:, :, : pred.size(2), :, :]
+                mse_loss = F.mse_loss(pred.float(), noise.float())
 
                 # 2) boundary (exact same boundary_loss as in train())
                 bdy = self.boundary_loss(pred.float()) * self.config.get("boundary_weight", 0.1)
@@ -849,7 +868,7 @@ class CubeDiffTrainer:
                     # perc = self.l1(fp, ft) * 0.01
                     perc = self.l1(fp, ft) * self.config.get("perceptual_weight", 0.01)
 
-                loss = mse + bdy + perc
+                loss = mse_loss + bdy + perc
 
                 total_loss   += loss.item() * lat.size(0)
                 total_samples+= lat.size(0)

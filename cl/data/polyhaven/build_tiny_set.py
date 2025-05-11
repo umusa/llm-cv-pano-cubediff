@@ -180,6 +180,14 @@ def encode_faces(face_dir, latent_dir, batch=6):
                         lat.append(vae.encode(f).latent_dist.sample() * 0.18215)
                 
                 lat = torch.stack(lat, 1).cpu()  # Shape: (B,6,4,64,64)
+                # must append the mask when save latents, and likewise load it as part of each sample.
+                # Build a mask channel: 1 for “clean” (conditioning) faces if want image conditioning,
+                # or all ones if doing text-only. Here we do text-only so set all-one mask:
+                # when save each sample: torch.save(l, latent_dir / f"{pano_name}.pt")
+                # will in fact have tensors of shape [6,5,64,64], matching the new conv_in above.
+
+                mask = torch.ones(lat.shape[0], lat.shape[1], 1, lat.shape[3], lat.shape[4])
+                lat = torch.cat([lat, mask], dim=2)  # → [B,6,5,64,64]
                 
                 # Save each latent tensor
                 for k, l in enumerate(lat):
