@@ -109,7 +109,14 @@ class CubeDiffTrainer:
 
         # ── PERCEPTUAL & BOUNDARY LOSS SETUP ──
         # self.perceptual_net = models.vgg16(pretrained=True).features.eval().to(self.accelerator.device)
-        self.perceptual_net = models.vgg16(pretrained=True).features[:16].eval().to(dtype=torch.float16)
+
+        # Without enough weight on seam and perceptual terms, the model ignores overlap learning; and running VGG in bf16 loses detail.
+        # The VGG16 perceptual network, however, must stay in full precision to provide stable gradient signals for texture and seam consistency
+        # run VGG in full-precision for stable texture/perceptual gradients
+        # it is faithful to CubeDiff’s paper (§3.2–3.4) and its ablations (A.11), 
+        # and they mesh with industry best practices in multi-view diffusion and low-rank adaptation.
+        self.perceptual_net = models.vgg16(pretrained=True).features[:16].eval().to(torch.float32)
+        # self.perceptual_net = models.vgg16(pretrained=True).features[:16].eval().to(dtype=torch.float16)
         for p in self.perceptual_net.parameters():
             p.requires_grad = False
         self.l1 = torch.nn.L1Loss()
@@ -205,9 +212,11 @@ class CubeDiffTrainer:
 
         # 5) Inject PEFT‐LoRA adapters (Hu et al. 2021)
         lora_cfg = LoraConfig(
-            r=self.config["lora_r"], # 4, 
-            lora_alpha=self.config["lora_alpha"], # 16,
-            # target_modules=["to_q.0","to_k.0","to_v.0","to_out.0"], # That will ensure I am actually injecting adapters into all the Q/K/V and output projections .
+            # If your LoRA weight‐std plateaus ~0.02 but grads stay ~1e-6, increase its step size.
+            r=self.config.get("lora_r", 4),
+            # bump alpha to 32 for larger effective LR in LoRA subspace
+            lora_alpha=self.config.get("lora_alpha", 32),
+            # That will ensure I am actually injecting adapters into all the Q/K/V and output projections .
             target_modules=[
                             "to_q",       # matches every q-proj Linear/Conv
                             "to_k",       # matches every k-proj
@@ -324,12 +333,21 @@ class CubeDiffTrainer:
                     self.model, self.val_dataloader
                 )
             # Move components to device
+            # device = self.accelerator.device
+            # dtype = self.model_dtype
+            # # print(f"Moving components to {device} with dtype {dtype}")
+            # self.perceptual_net = self.perceptual_net.to(device, dtype=dtype)
+            # self.text_encoder = self.text_encoder.to(device)
+            # self.vae = self.vae.to(device)
+
+            # Move components to device (preserve FP32 for perceptual_net)
+            # U-Net, VAE, and text encoder benefit from BF16 for speed/memory.
+            # Move components to device (preserve FP32 for perceptual_net)
             device = self.accelerator.device
-            dtype = self.model_dtype
-            print(f"Moving components to {device} with dtype {dtype}")
-            self.perceptual_net = self.perceptual_net.to(device, dtype=dtype)
-            self.text_encoder = self.text_encoder.to(device)
-            self.vae = self.vae.to(device)
+            print(f"Moving components to {device}; keeping perceptual_net in FP32")
+            self.perceptual_net = self.perceptual_net.to(device)                  # keep FP32
+            self.text_encoder   = self.text_encoder.to(device, dtype=self.model_dtype)
+            self.vae            = self.vae.to(device, dtype=self.model_dtype)
             
             print("Dataloader building completed successfully")
         except Exception as e:
@@ -379,7 +397,7 @@ class CubeDiffTrainer:
         batch_size      = self.config["batch_size"]
         batch_num_per_rank = samples_per_rank // batch_size
 
-        print(f"trainer.py - CubeDiffTrainer - train data - samples_per_rank is {samples_per_rank}, total_samples is {total_samples}, batch_size is {batch_size}, batch_num_per_rank is {batch_num_per_rank}\n")
+        print(f"trainer.py - CubeDiffTrainer - train data - self.train_size is {self.train_size}, world_size is {world_size}, samples_per_rank is {samples_per_rank}, num_epochs is {num_epochs}, total_samples is {total_samples}, batch_size is {batch_size}, batch_num_per_rank is {batch_num_per_rank}\n")
         # only update the small LoRA adapter params
         lora_params = [p for p in self.model.parameters() if p.requires_grad]
         # ← switch from AdamW to 8-bit Adam for much smaller optimizer state
@@ -492,21 +510,46 @@ class CubeDiffTrainer:
                     mse_loss = F.mse_loss(pred.float(), noise.float())
 
                     # boundary loss
-                    bdy = self.boundary_loss(pred) * self.config.get("boundary_weight", 0.1)
+                    # Without enough weight on seam and perceptual terms, the model ignores overlap learning; and running VGG in bf16 loses detail.
+                    # bdy = self.boundary_loss(pred) * self.config.get("boundary_weight", 0.1)
+                    # boundary loss (upweight to 1.0 to really force seam consistency)
+                    # it is faithful to CubeDiff’s paper (§3.2–3.4) and its ablations (A.11), 
+                    # and they mesh with industry best practices in multi-view diffusion and low-rank adaptation.
+                    bdy = self.boundary_loss(pred) * self.config.get("boundary_weight", 1.0)
 
-                    # Convert perceptual_net to use the same precision as the model
-                    self.perceptual_net = self.perceptual_net.to(dtype=torch.bfloat16)
+                    # # Convert perceptual_net to use the same precision as the model
+                    # # self.perceptual_net = self.perceptual_net.to(dtype=torch.bfloat16)
+                    # # keep perceptual net in fp32, move preds to fp32
+                    # with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    #     # perceptual loss
+                    #     # pred_rgb = self.decode_latents_to_rgb(pred)
+                    #     # true_rgb = self.decode_latents_to_rgb(noise)
+                    #     # fp = self.perceptual_net(pred_rgb)
+                    #     # ft = self.perceptual_net(true_rgb)
+                    #     # perc = self.l1(fp, ft) * 0.01
+                    #     # perc = self.l1(fp, ft) * self.config.get("perceptual_weight", 0.01)
 
-                    with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-                        # perceptual loss
-                        pred_rgb = self.decode_latents_to_rgb(pred)
-                        true_rgb = self.decode_latents_to_rgb(noise)
+                    #     pred_rgb = self.decode_latents_to_rgb(pred).to(torch.float32)
+                    #     true_rgb = self.decode_latents_to_rgb(noise).to(torch.float32)
+                    #     fp = self.perceptual_net(pred_rgb)
+                    #     ft = self.perceptual_net(true_rgb)
+                    #     # upweight to 0.1 for stronger semantic guidance
+                    #     perc = self.l1(fp, ft) * self.config.get("perceptual_weight", 0.1)
+
+                    # ── Perceptual loss in FULL FP32 ──
+                    # Disable autocast so VGG stays in FP32 and gradients are stable.
+                    with torch.amp.autocast(device_type="cuda", enabled=False):
+                        # Decode latents → RGB in FP32
+                        pred_rgb = self.decode_latents_to_rgb(pred).float()
+                        true_rgb = self.decode_latents_to_rgb(noise).float()
+                        # Perceptual features & L1 in FP32
                         fp = self.perceptual_net(pred_rgb)
                         ft = self.perceptual_net(true_rgb)
-                        # perc = self.l1(fp, ft) * 0.01
-                        perc = self.l1(fp, ft) * self.config.get("perceptual_weight", 0.01)
+                        perc = self.l1(fp, ft) * self.config.get("perceptual_weight", 0.1)
 
-                    loss = mse_loss + bdy + perc
+                    # loss = mse_loss + bdy + perc
+                    # Ensure all three terms are FP32 before summing
+                    loss = mse_loss.float() + bdy.float() + perc.float()
                     
                     # collect loss                    
                     self.accelerator.backward(loss)  # ← compute gradients
@@ -866,7 +909,7 @@ class CubeDiffTrainer:
                     fp = self.perceptual_net(pred_rgb)
                     ft = self.perceptual_net(true_rgb)
                     # perc = self.l1(fp, ft) * 0.01
-                    perc = self.l1(fp, ft) * self.config.get("perceptual_weight", 0.01)
+                    perc = self.l1(fp, ft) * self.config.get("perceptual_weight", 0.1)
 
                 loss = mse_loss + bdy + perc
 

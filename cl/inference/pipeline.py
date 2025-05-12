@@ -185,25 +185,6 @@ class CubeDiffPipeline:
 
         # Denoise latents
         for t in self.scheduler.timesteps:
-            # Expand latents for classifier-free guidance
-            # latent_model_input = latents.repeat(2, 1, 1, 1, 1) if guidance_scale > 1.0 else latents
-            
-            # # Get model prediction
-            # with torch.no_grad():
-            #     # Use int64 for timesteps as required by the model
-            #     timesteps = torch.tensor([t] * latent_model_input.shape[0], device=self.device, dtype=torch.int64)
-            #     # print(f"pipeline.py - CubeDiffPipeline - generate() - Get model prediction - before noise_pred = self.model\n")
-            #     noise_pred = self.model(
-            #         latent_model_input,
-            #         timesteps,
-            #         text_embeddings,
-            #     )
-            #     # print(f"pipeline.py - CubeDiffPipeline - generate() - Get model prediction - after model inference, latent_model_input shape is {latent_model_input.shape}, latent_model_input is {latent_model_input}\n")
-            #     # print(f"pipeline.py - CubeDiffPipeline - generate() - Get model prediction - text_embeddings shape is {text_embeddings.shape}, text_embeddings is {text_embeddings}\n")
-            #     # print(f"pipeline.py - CubeDiffPipeline - generate() - Get model prediction - timesteps shape is {timesteps.shape}, timesteps is {timesteps}\n")
-            #     # print(f"pipeline.py - CubeDiffPipeline - generate() - Get model prediction - text_embeddings shape is {text_embeddings.shape}, text_embeddings is {text_embeddings}\n")
-
-        
             # — 1) Prepare input to U-Net (with mask still attached) —
             latent_model_input = latents.repeat(2,1,1,1,1) if guidance_scale>1.0 else latents
 
@@ -218,16 +199,7 @@ class CubeDiffPipeline:
             if guidance_scale > 1.0:
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                 noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-            
-            # print(f"pipeline.py - CubeDiffPipeline - generate() - Get model prediction - noise_pred_text shape is {noise_pred_text.shape}, noise_pred_text is {noise_pred_text}\n")
-            # print(f"pipeline.py - CubeDiffPipeline - generate() - Get model prediction - noise_pred_uncond shape is {noise_pred_uncond.shape}, noise_pred_uncond is {noise_pred_text}\n")
-            # print(f"pipeline.py - CubeDiffPipeline - generate() - Get model prediction - guidance_scale is {guidance_scale}\n")
-            # print(f"pipeline.py - CubeDiffPipeline - generate() - Get model prediction - noise_pred shape is {noise_pred.shape}, noise_pred is {noise_pred}\n")
-            
-            # Update latents
-            # latents = self.scheduler.step(noise_pred, t, latents).prev_sample
-            # print(f"pipeline.py - CubeDiffPipeline - generate() - Get model prediction - after update latents - latents shape is {latents.shape}, latents is {latents}\n")
-        
+                        
             # — 3) Do DDIM step on just the 4 real channels —
             #    split latents → [B,6,4,H/8,W/8] + [B,6,1,H/8,W/8]
             real_lat, mask = latents[:, :, :4], latents[:, :, 4:].clone()
@@ -242,25 +214,6 @@ class CubeDiffPipeline:
         # At this point `latents` is [1,6,5,H/8,W/8]
         print(f"pipeline.py - CubeDiffPipeline - generate() - after Denoise latents, latents shape is {latents.shape}, latents type is {type(latents)}\n")
         
-        # Decode latents
-
-        # with torch.no_grad():
-        #     cube_faces = []
-        #     for i in range(num_faces):
-        #         # face_latent = latents[0, i]
-        #         # with torch.cuda.amp.autocast(enabled=True):
-        #         #     face_image = self.vae.decode(face_latent / 0.18215).sample
-        #         # cube_faces.append(face_image)
-                
-        #         # 1) add the missing batch dim
-        #         face_latent = latents[0, i].unsqueeze(0)           # → [1, C, H, W]
-            
-        #         # 2) decode with batch dim, then strip it off
-        #         with torch.amp.autocast(enabled=True, device_type="cuda"):
-        #             out = self.vae.decode(face_latent / 0.18215)
-        #             sample = out.sample                            # → [1, 3, h, w]
-        #         cube_faces.append(sample[0])                       # → [3, h, w]
-
         # 5) Drop mask before decoding with VAE
         with torch.no_grad():
             cube_faces = []

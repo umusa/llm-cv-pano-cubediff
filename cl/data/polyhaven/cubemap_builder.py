@@ -82,8 +82,18 @@ def equirect_to_cubemap_torch(equi: np.ndarray, face_size: int) -> List[np.ndarr
         equi_tensor = equi_tensor.permute(2, 0, 1).unsqueeze(0)  # [1, 3, H, W]
     
     # Create meshgrid for pixel coordinates
-    xs = torch.linspace(-1, 1, face_size, device=torch_device)
-    ys = torch.linspace(-1, 1, face_size, device=torch_device)
+    # xs = torch.linspace(-1, 1, face_size, device=torch_device)
+    # ys = torch.linspace(-1, 1, face_size, device=torch_device)
+
+    # Expands the meshgrid by ~5.56%, then crops back to the central 90° window, exactly as in CubeDiff §3.2 .
+    # expand to 95° FOV (add ±2.5° overlap): expand grid by factor 95/90 ~1.0556
+    # CubeDiff generates each face at 95° FOV (±2.5° overlap) then crops to 90° so that the network learns seamless edges .
+    
+    overlap = 0.0556  # (95°/90° − 1)
+    lo, hi = -1 - overlap, 1 + overlap
+    xs = torch.linspace(lo, hi, face_size, device=torch_device)
+    ys = torch.linspace(lo, hi, face_size, device=torch_device)
+
     ys_grid, xs_grid = torch.meshgrid(ys, xs, indexing='ij')
     
     faces = []
@@ -150,7 +160,11 @@ def equirect_to_cubemap_torch(equi: np.ndarray, face_size: int) -> List[np.ndarr
         face = face_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy().astype(np.uint8)
         faces.append(face)
     
-    return faces
+    # return faces
+    # Now crop each face from 95°→90° by removing the outer overlap region:
+    crop = int(overlap / (hi - lo) * face_size)  # number of pixels to cut on each side
+    cropped = [f[crop:-crop, crop:-crop] for f in faces]
+    return cropped
 
 def equirect_to_cubemap_cupy(equi: np.ndarray, face_size: int) -> List[np.ndarray]:
     """

@@ -104,7 +104,11 @@ def replace_group_norms(module, in_place=True):
     if not in_place:
         module = copy.deepcopy(module)
     
-    for name, child in module.named_children():
+    # for name, child in module.named_children():
+    # Recursively replace in all submodules
+    # CubeDiff uses synchronized GroupNorm over both faces and spatial dims to remove color shifts 
+    # Recursively replaces every nn.GroupNorm in the U-Net (down/mid/up) with my SynchronizedGroupNorm, ensuring color‐consistency across faces
+    for name, child in list(module.named_children()):
         if isinstance(child, nn.GroupNorm):
             setattr(module, name, SynchronizedGroupNorm(
                 child.num_groups,
@@ -117,6 +121,7 @@ def replace_group_norms(module, in_place=True):
                 getattr(module, name).weight.data.copy_(child.weight.data)
                 getattr(module, name).bias.data.copy_(child.bias.data)
         else:
+            # recurse
             replace_group_norms(child, in_place=True)
     
     return module

@@ -8,7 +8,7 @@ val_dataset: "/home/jupyter/mluser/git/llm-cv-pano-cubediff/cl/data/dataspace/po
 batch_size:    2         # keep this at 2 per GPU process 
 
 # bump these to drive more CPU‐side throughput
-num_workers:   8         # ideally ≈ (physical vCPUs per node) / num_processes, but for more gpus (e.g. >=4), too many workers can cause the problem of too many worker processes accessing tar files at the same time
+num_workers:   1         # ideally ≈ (physical vCPUs per node) / num_processes, but for more gpus (e.g. >=4), too many workers can cause the problem of too many worker processes accessing tar files at the same time
                          # got error: RuntimeError: unable to write to file </torch_9439_1841599264_9>: No space left on device (28) 
                          # so, for 8 GPUs, 2 workers is a good number
 # --- optimisation -----------------------------------------
@@ -16,10 +16,12 @@ num_workers:   8         # ideally ≈ (physical vCPUs per node) / num_processes
 gradient_accum_steps: 4    # 4 × 2 × 4  = 32 global batch
 learning_rate:      1.0e-3 # Most LoRA-fine-tuning recipes use 1e-3 or even 3e-4 as the adapter learning rate, so the Std Dev grow more quickly
 lora_r:             4
-lora_alpha:         16
+lora_alpha:         32
+boundary_weight:    1.0
+perceptual_weight:  0.1
 
 # --- training ---------------------------------------------
-num_epochs:          40 # 40 # 18 # 2
+num_epochs:          20 # 40 # 18 # 2
 log_loss_every_n_steps:    1 # 8 # batch_size * gradient_accum_steps
 log_lora_every_n_steps: 1 
 eval_every_n_samples: 50 # 8
