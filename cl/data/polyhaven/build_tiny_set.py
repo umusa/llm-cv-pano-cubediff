@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 # Use absolute imports instead of relative
 from cl.data.polyhaven.api_client import list_hdris, parallel_download
 from cl.data.polyhaven.cubemap_builder import batch_convert
+from cl.model.normalization import replace_group_norms
 
 def encode_faces(face_dir, latent_dir, batch=6):
     """
@@ -155,6 +156,12 @@ def encode_faces(face_dir, latent_dir, batch=6):
         except Exception as e:
             logger.error(f"Failed to load Stable Diffusion VAE: {e}")
             return False
+
+        # ─── Swap all GroupNorm → SyncGroupNorm so encoded latents have a joint color stat
+        # The CubeDiff paper requires synchronized normalization across all six faces to avoid color shifts at seams. 
+        # Without this, the latents carry independent stats, leading to patchy colors in generation
+        replace_group_norms(vae, in_place=True)
+        logger.info("✅ Replaced VAE GroupNorms with synchronized GroupNorms")
 
         # Set up dataset and loader
         face_dir = Path(face_dir)

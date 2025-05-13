@@ -1,121 +1,133 @@
+# File: cl/model/attention.py
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from diffusers.models.attention import Attention
+from diffusers.models.attention import Attention  # type: ignore
 
 class InflatedAttention(nn.Module):
     """
-    Inflated attention mechanism for cubemap faces.
-    This extends the standard attention to work across cube faces.
+    Inflated multi-head attention for cubemap faces.
+    Takes input [B, N, C] where N = 6 * num_patches_per_face,
+    splits N→(6 faces × L patches), attends across all faces,
+    and returns [B, N, C].
     """
     def __init__(self, query_dim, heads=8, dim_head=64, dropout=0.0):
         super().__init__()
-        inner_dim = dim_head * heads
         self.heads = heads
         self.scale = dim_head ** -0.5
-        
+        inner_dim = heads * dim_head
+
+        # Q/K/V projections
         self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
         self.to_k = nn.Linear(query_dim, inner_dim, bias=False)
         self.to_v = nn.Linear(query_dim, inner_dim, bias=False)
-        
+
+        # Output projection
         self.to_out = nn.Sequential(
             nn.Linear(inner_dim, query_dim),
-            nn.Dropout(dropout)
+            nn.Dropout(dropout),
         )
-        
-    def forward(self, x, context=None, mask=None):
-        """
-        Args:
-            x: Input tensor of shape [batch, num_faces, seq_len, channels]
-            context: Context tensor (optional)
-            mask: Attention mask (optional)
-            
-        Returns:
-            Attention output of same shape as input
-        """
-        # If no context is provided, use x
-        context = context if context is not None else x
-        
-        # Get batch size, number of faces, and sequence length
-        batch_size, num_faces, seq_len, _ = x.shape
-        
-        # Reshape to process all faces together
-        x_reshaped = x.reshape(batch_size * num_faces, seq_len, -1)
-        
-        # If context is provided with face dimension, reshape it similarly
-        if context.ndim == 4:  # [batch, num_faces, seq_len, channels]
-            context_reshaped = context.reshape(batch_size * num_faces, context.shape[2], -1)
-        else:  # Context without face dimension
-            context_reshaped = context
-        
-        # Standard attention computation first
-        q = self.to_q(x_reshaped)
-        k = self.to_k(context_reshaped)
-        v = self.to_v(context_reshaped)
-        
-        # Reshape for multi-head attention
-        q = q.reshape(batch_size * num_faces, seq_len, self.heads, -1).permute(0, 2, 1, 3)
-        k = k.reshape(batch_size * num_faces, k.shape[1], self.heads, -1).permute(0, 2, 1, 3)
-        v = v.reshape(batch_size * num_faces, v.shape[1], self.heads, -1).permute(0, 2, 1, 3)
-        
-        # Reshape again to enable cross-face attention
-        q = q.reshape(batch_size, num_faces, self.heads, seq_len, -1)
-        k = k.reshape(batch_size, num_faces, self.heads, k.shape[2], -1)
-        v = v.reshape(batch_size, num_faces, self.heads, v.shape[2], -1)
-        
-        # Stack across faces to allow cross-face attention
-        q_stacked = q.reshape(batch_size, num_faces * self.heads, seq_len, -1)
-        k_stacked = k.reshape(batch_size, num_faces * self.heads, k.shape[3], -1)
-        v_stacked = v.reshape(batch_size, num_faces * self.heads, v.shape[3], -1)
-        
-        # Compute attention scores
-        attn_weights = torch.matmul(q_stacked, k_stacked.transpose(-1, -2)) * self.scale
-        
-        # Apply attention mask if provided
-        if mask is not None:
-            attn_weights = attn_weights.masked_fill(mask == 0, -1e9)
-        
-        # Softmax for attention weights
-        attn_weights = F.softmax(attn_weights, dim=-1)
-        
-        # Apply attention weights to values
-        out = torch.matmul(attn_weights, v_stacked)
-        
-        # Reshape back to original format
-        out = out.reshape(batch_size, num_faces, self.heads, seq_len, -1)
-        out = out.permute(0, 1, 3, 2, 4).reshape(batch_size, num_faces, seq_len, -1)
-        
-        # Apply output projection
-        out = self.to_out(out.reshape(batch_size * num_faces, seq_len, -1))
-        out = out.reshape(batch_size, num_faces, seq_len, -1)
-        
-        return out
 
-def inflate_attention_layer(original_attn):
+    def forward(
+        self,
+        hidden_states: torch.FloatTensor,              # [B×6, L, C]
+        encoder_hidden_states: torch.FloatTensor = None,
+        attention_mask: torch.BoolTensor    = None,
+        **kwargs
+    ) -> torch.FloatTensor:
+        # 1) Recover original batch B and 6 faces
+        total, L, C = hidden_states.shape
+        FACES = 6
+        if total % FACES != 0:
+            raise ValueError(f"Batch size {total} not divisible by {FACES} faces")
+        B = total // FACES
+
+        # 2) Reshape into (B,6,L,C)
+        x = hidden_states.view(B, FACES, L, C)
+        if encoder_hidden_states is not None:
+            ctx = encoder_hidden_states.view(B, FACES, L, C)
+        else:
+            ctx = x
+
+        # 3) Merge faces back into tokens: [B, 6×L, C]
+        x   = x.reshape(B, FACES * L, C)
+        ctx = ctx.reshape(B, FACES * L, C)
+
+        # 4) Standard multi-head attention on [B, N=6L, C]
+        # replace the explicit q @ k^T → softmax → (attn @ v) with PyTorch’s fused, block-wise attention. 
+        # This never materializes the full [B, H, N, N] tensor on GPU.
+        # 4) Memory-efficient scaled dot-product attention
+        q = self.to_q(x).view(B, -1, self.heads, C//self.heads).permute(0,2,1,3)
+        k = self.to_k(ctx).view(B, -1, self.heads, C//self.heads).permute(0,2,1,3)
+        v = self.to_v(ctx).view(B, -1, self.heads, C//self.heads).permute(0,2,1,3)
+
+        # PyTorch 2.0+ fused attention — blocks internally, avoids OOM
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attention_mask,
+            dropout_p=self.to_out[1].p if len(self.to_out)>1 else 0.0,
+            is_causal=False,
+        )  # → [B, H, N, D]
+        out = out.permute(0,2,1,3).reshape(B, FACES * L, C)
+
+        # 5) Project back to C and split into batch of 6 faces again
+        out = self.to_out(out)                         # [B,6L,C]
+        return out.reshape(B * FACES, L, C)            # [B×6,L,C]
+
+
+def inflate_attention_layer(
+    original_attn: Attention,
+    skip_copy: bool = False
+) -> InflatedAttention:
     """
-    Inflate a standard attention layer to work with cubemap faces.
-    
-    Args:
-        original_attn: Original attention layer from Stable Diffusion
-        
-    Returns:
-        Inflated attention layer
+    Replace a HuggingFace SD Attention with our InflatedAttention.
+    When skip_copy=False, dequantize() and copy the 320×320 on-face weights
+    into the InflatedAttention’s to_q/to_k/to_v/to_out[0] for the diagonal blocks.
+    When skip_copy=True, leave them at random init (fast 4-bit path).
     """
-    # Create inflated attention with same parameters
-    inflated_attn = InflatedAttention(
-        query_dim=original_attn.to_q.in_features,
-        heads=original_attn.heads,
-        dim_head=original_attn.to_q.out_features // original_attn.heads,
-        dropout=original_attn.to_out[1].p if len(original_attn.to_out) > 1 else 0.0,
+    # Build the inflated module
+    query_dim = original_attn.to_q.in_features
+    dropout   = getattr(original_attn.to_out[1], "p", 0.0)
+    heads     = original_attn.heads
+    dim_head  = query_dim // heads
+
+    inflated = InflatedAttention(
+        query_dim=query_dim,
+        heads=heads,
+        dim_head=dim_head,
+        dropout=dropout,
     )
-    
-    # Copy weights from original attention
-    inflated_attn.to_q.weight.data.copy_(original_attn.to_q.weight.data)
-    inflated_attn.to_k.weight.data.copy_(original_attn.to_k.weight.data)
-    inflated_attn.to_v.weight.data.copy_(original_attn.to_v.weight.data)
-    inflated_attn.to_out[0].weight.data.copy_(original_attn.to_out[0].weight.data)
-    
-    if hasattr(original_attn.to_out[0], 'bias') and original_attn.to_out[0].bias is not None:
-        inflated_attn.to_out[0].bias.data.copy_(original_attn.to_out[0].bias.data)
-    
-    return inflated_attn
+
+    if not skip_copy:
+        # helper to extract the full [320×320] weight for both FP and 4-bit layers
+        def get_weight(module: nn.Module):
+            if hasattr(module, "dequantize"):
+                return module.dequantize()
+            if hasattr(module, "weight"):
+                return module.weight.data
+            if hasattr(module, "qweight"):
+                return module.qweight.data
+            raise RuntimeError(f"No weight found in {module}")
+
+        # Extract and copy
+        wq = get_weight(original_attn.to_q)
+        wk = get_weight(original_attn.to_k)
+        wv = get_weight(original_attn.to_v)
+        wo = get_weight(original_attn.to_out[0])
+
+        # Transpose if shapes mismatch
+        if inflated.to_q.weight.shape != wq.shape:
+            wq = wq.t().view_as(inflated.to_q.weight)
+
+        inflated.to_q.weight.data.copy_(wq)
+        inflated.to_k.weight.data.copy_(wk)
+        inflated.to_v.weight.data.copy_(wv)
+        inflated.to_out[0].weight.data.copy_(wo)
+
+        # Copy bias if present
+        b = getattr(original_attn.to_out[0], "bias", None)
+        if b is not None:
+            inflated.to_out[0].bias.data.copy_(b.data)
+
+    return inflated

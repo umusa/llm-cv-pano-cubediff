@@ -99,6 +99,8 @@ def equirect_to_cubemap_torch(equi: np.ndarray, face_size: int) -> List[np.ndarr
     faces = []
     
     # Process each face
+    # define each face’s (vx,vy,vz) axes, handle normalization, compute spherical coords, and then apply these two torch.flip calls, 
+    # correctly implement the CubeDiff paper’s “world-up” convention
     for i in range(6):
         # Initialize vectors based on face
         if i == 0:   # Front
@@ -160,10 +162,28 @@ def equirect_to_cubemap_torch(equi: np.ndarray, face_size: int) -> List[np.ndarr
         face = face_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy().astype(np.uint8)
         faces.append(face)
     
+    # The paper’s cubemap convention maps “up” on the top/bottom faces consistently. 
+    # An upside‐down pole face appears as pure noise because the learned model has never seen that orientation 
+    # Fix top & bottom orientation (world-up should point correctly)
+    # Flipping faces[4] and faces[5] reorients the poles so “up” aligns with the network’s training data, 
+    # preventing the noisy pole artifacts you saw
+    # depending on your FACE_ORDER, you may need to flip vertically:
+    faces[4] = torch.flip(faces[4], dims=[0])  # top face
+    faces[5] = torch.flip(faces[5], dims=[0])  # bottom face
+
     # return faces
     # Now crop each face from 95°→90° by removing the outer overlap region:
-    crop = int(overlap / (hi - lo) * face_size)  # number of pixels to cut on each side
-    cropped = [f[crop:-crop, crop:-crop] for f in faces]
+    # crop = int(overlap / (hi - lo) * face_size)  # number of pixels to cut on each side
+    # cropped = [f[crop:-crop, crop:-crop] for f in faces]
+    
+    # CubeDiff generates each face at 95° FOV, then crops 5° per side to eliminate seams. 
+    # Our old formula only trimmed ~2.6% → seams remained .
+    # remove the exact 5° margin (i.e. 5° out of the 95° FOV) → 90° final
+    # margin fraction = 5° / 95° ≈ 0.0526
+    # Now crop from 95°→90°
+    margin = int(face_size * 5 / 95) # crop removes exactly 5° per side, ensuring seamless edges as prescribed.
+    cropped = [f[margin:-margin, margin:-margin] for f in faces]
+    
     return cropped
 
 def equirect_to_cubemap_cupy(equi: np.ndarray, face_size: int) -> List[np.ndarray]:

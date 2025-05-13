@@ -21,7 +21,7 @@ boundary_weight:    1.0
 perceptual_weight:  0.1
 
 # --- training ---------------------------------------------
-num_epochs:          20 # 40 # 18 # 2
+num_epochs:          10 # 40 # 18 # 2
 log_loss_every_n_steps:    1 # 8 # batch_size * gradient_accum_steps
 log_lora_every_n_steps: 1 
 eval_every_n_samples: 50 # 8
@@ -33,3 +33,8 @@ eval_every_n_steps:   500
 use_wandb:          false
 output_dir:         "outputs/cubediff_tiny_lora"
 seed:               1337
+
+# --- quantization / inflation tweaks ----------------------
+# When U-Net is 4-bit, skip copying pretrained weights into the inflated layers
+# (so we avoid all dequantize/view_as hacks).
+skip_weight_copy: true

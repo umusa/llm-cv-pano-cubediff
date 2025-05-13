@@ -4,6 +4,8 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.allow_tf32 = True
 
+torch.cuda.empty_cache()
+
 import torch.multiprocessing as _mp
 _mp.set_sharing_strategy("file_system")   # <— avoid /dev/shm exhaustion on many workers
 
@@ -51,6 +53,7 @@ import wandb, psutil
 
 from accelerate import Accelerator
 from accelerate.utils import set_seed
+from accelerate.utils import DeepSpeedPlugin
 from diffusers import StableDiffusionPipeline, DDPMScheduler
 
 from cl.data.latent_webdataset import get_dataloader
@@ -88,12 +91,26 @@ class CubeDiffTrainer:
         self.model_dtype = torch.bfloat16 if mixed_precision == "bf16" else torch.float16
 
         # Accelerator
+        # Create DeepSpeed plugin with CPU offloading
+        # deepspeed_plugin = DeepSpeedPlugin(
+        #     zero_stage=3,  # ZeRO stage 2 for good balance of memory vs speed
+        #     offload_optimizer_device="cpu",  # Offload optimizer states to CPU
+        #     offload_param_device="cpu",  # Offload parameters to CPU when not needed
+        #     gradient_accumulation_steps=gradient_accumulation_steps
+        # )
         self.accelerator = Accelerator(mixed_precision=mixed_precision,
                                        gradient_accumulation_steps=gradient_accumulation_steps,
+                                       # offload parameters/buffers & optimizer state → CPU to free GPU RAM
                                     #    dataloader_pin_memory=True,
                                     #    offload_state=True,            # buffers & optimizer states → CPU
                                     #    offload_optimizer=True,        # optimizer state → CPU
                                     #    offload_parameters=True        # model weights → CPU when unused
+                                        # cpu_offload_models=True,  # Offload model weights to CPU when not in use
+                                    #     device_placement=True,
+                                    #     dispatch_batches=True,
+                                    #     split_batches=False,  # Setting to False can help with memory
+                                        # deepspeed_plugin=deepspeed_plugin,
+                                        # kwargs_handlers=[deepspeed_plugin]
                                     )
 
         # optional offline-wandb
@@ -162,8 +179,12 @@ class CubeDiffTrainer:
                 setattr(self.noise_scheduler, k, v.to(torch.bfloat16))
 
         # 3) Instantiate CubeDiffModel (UNet wrapper)
-        self.model = CubeDiffModel(pretrained_model_name)
-        
+        # self.model = CubeDiffModel(pretrained_model_name)
+        self.model = CubeDiffModel(
+            pretrained_model_name,
+            skip_weight_copy=self.config["skip_weight_copy"]
+        )
+
         # using BitsAndBytesConfig(load_in_4bit) so no need for prepare_model_for_kbit_training
         # 4) Inject LoRA *only* into the UNet backbone
         # optional 8-bit kbit training (saves VRAM)
@@ -469,8 +490,24 @@ class CubeDiffTrainer:
                         txt_emb = self.text_encoder(ids, attention_mask=mask).last_hidden_state
                         # ← CAST TO bfloat16 so K/V come out in bf16
                         txt_emb = txt_emb.to(self.accelerator.device, dtype=self.model_dtype)
-
+                        del ids  # Free memory as soon as possible
                     # print(f"trainer.py - train() - before pred = self.model, lat shape is {lat.shape} and dtype is {lat.dtype}, noisy_lat shape is {noisy_lat.shape} type is {noisy_lat.dtype}, timesteps is {timesteps}, txt_emb shape is {txt_emb.shape}, type is {txt_emb.dtype}\n")
+
+                    # CubeDiff requires randomly dropping each modality 10 % of the time during training so the model learns text-only, image-only, 
+                    # and joint modes . Without this, it overfits to always having both conditions and fails to generalize.
+                    # each micro-batch randomly drops text or image conditioning at 10 % each
+                    # — Classifier-Free Guidance drops (§4.5):
+                    #   10% drop text, 10% drop image, 80% full cond
+                    bs = txt_emb.size(0)
+                    rnd = torch.rand(bs, device=txt_emb.device)
+                    # drop text embeddings
+                    drop_txt = rnd < 0.1
+                    if drop_txt.any():
+                        txt_emb[drop_txt] = 0
+                    # drop image conditioning mask
+                    drop_img = (rnd >= 0.1) & (rnd < 0.2)
+                    if drop_img.any():
+                        mask[drop_img] = 0
 
                     with self.accelerator.autocast():
                         pred = self.model(
@@ -482,14 +519,14 @@ class CubeDiffTrainer:
                     # print(f"trainer.py - train() - after pred = self.model")
 
                     # Add at the start of the first training iteration
-                    if batch_indx==0:
-                        test_result = self.model(
-                                latents=noisy_lat,
-                                timesteps=timesteps,
-                                encoder_hidden_states=txt_emb,
-                                input_ids=ids,  # This should be filtered out
-                                attention_mask=mask  # This should be filtered out
-                            )
+                    # if batch_indx==0:
+                    #     test_result = self.model(
+                    #             latents=noisy_lat,
+                    #             timesteps=timesteps,
+                    #             encoder_hidden_states=txt_emb,
+                    #             input_ids=ids,  # This should be filtered out
+                    #             attention_mask=mask  # This should be filtered out
+                    #         )
                         # print("Parameter filtering through model path is working!")
 
                     # ── NEW LOSS ──
@@ -553,10 +590,11 @@ class CubeDiffTrainer:
                     
                     # collect loss                    
                     self.accelerator.backward(loss)  # ← compute gradients
+
                     #  collect total steps
                     processed_samples += real_batch_size
-                    processed_samples = torch.tensor(processed_samples, device=self.accelerator.device)
-                    total_processed_samples = self.accelerator.reduce(processed_samples, reduction="sum")
+                    local_count = torch.tensor(processed_samples, device=self.accelerator.device)
+                    total_processed_samples = self.accelerator.reduce(local_count, reduction="sum")
                 
                     if self.accelerator.sync_gradients:
                         # here all replicas have the fully synchronized, accumulated grads

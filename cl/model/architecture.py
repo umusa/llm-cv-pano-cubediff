@@ -15,25 +15,26 @@ if not hasattr(torch, "xpu"):
     torch.xpu = _XPU
 
 from diffusers import UNet2DConditionModel
+from diffusers.models.attention import Attention  # <— true SD attention class  
 from cl.model.positional_encoding import CubemapPositionalEncoding
 from cl.model.attention        import inflate_attention_layer
 from cl.model.normalization    import replace_group_norms
 from transformers import BitsAndBytesConfig
+
 
 class CubeDiffModel(nn.Module):
     def __init__(
         self,
         pretrained_model_name: str,
         num_faces: int = 6,
-        uv_dim: int   = 9
+        uv_dim: int   = 9,
+        skip_weight_copy: bool = False # When U-Net is 4-bit, skip copying pretrained weights into the inflated layers
+                                        # (so avoid all dequantize/view_as hacks).
     ):
         super().__init__()
+
         # — 1) Load only the U-Net
-        # self.base_unet = UNet2DConditionModel.from_pretrained(
-        #     pretrained_model_name,
-        #     subfolder="unet",
-        #     torch_dtype=torch.float32
-        # )
+        self.skip_weight_copy = skip_weight_copy
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
@@ -47,60 +48,40 @@ class CubeDiffModel(nn.Module):
             torch_dtype=torch.bfloat16,
             use_safetensors=True,
         )
-        # print(f"after loading base_unet\n")
-        # self.check_dtypes()
-
+        
         self.model_dtype = torch.bfloat16
         self.device = next(self.base_unet.parameters()).device
         
-        # — 2) Inflate its attention to cross‐face
+        # — 2) Inflate Stable Diffusion’s Attention → cross‐face Attention  
         for name, module in list(self.base_unet.named_modules()):
-            if isinstance(module, nn.MultiheadAttention):
+            # Only inflate Stable Diffusion’s ention _self_-attention, skip text cross-attention
+            if isinstance(module, Attention) and module.cross_attention_dim is None:
                 parent = self.base_unet
                 parts  = name.split(".")
                 for p in parts[:-1]:
                     parent = getattr(parent, p)
-                setattr(parent, parts[-1], inflate_attention_layer(module))
-        # print(f"after inflating attention layers\n")
-        # self.check_dtypes()
+                setattr(
+                    parent,
+                    parts[-1],
+                    inflate_attention_layer(
+                        original_attn=module,
+                        skip_copy=self.skip_weight_copy # all 4-bit copy logic is bypassed and keep memory footprint low and training fast
+                    )
+                )
 
         # — 3) Sync GroupNorm
         replace_group_norms(self.base_unet, in_place=True)
         print(f"after replacing group norms\n")
-        # self.check_dtypes()
-
+        
         # — 4) Positional encoding (adds UV channels)
         self.positional_encoding = CubemapPositionalEncoding(
             num_faces=num_faces,
             embedding_dim=uv_dim
         )
-        # print(f"after positional_encoding\n")
-        # self.check_dtypes()
-
-        # -------------------------------------------------------
-        # — 5) Patch conv_in to accept the UV channels
-        # in_ch   = self.base_unet.conv_in.in_channels
-        # out_ch  = self.base_unet.conv_in.out_channels
-        # kernel, stride, pad = (
-        #     self.base_unet.conv_in.kernel_size,
-        #     self.base_unet.conv_in.stride,
-        #     self.base_unet.conv_in.padding,
-        # )
-        # new_in = nn.Conv2d(in_ch + uv_dim, out_ch, kernel, stride, pad)
-        # with torch.no_grad():
-        #     new_in.weight[:, :in_ch].copy_(self.base_unet.conv_in.weight)
-        #     new_in.bias.copy_(self.base_unet.conv_in.bias)
-
-        # # print(f"after replacing conv_in, before self.base_unet.conv_in = new_in, new_in type is {type(new_in)}\n")
-        # # self.check_dtypes()
-        # # Explicitly cast to the same dtype BEFORE assigning
-        # new_in = new_in.to(dtype=self.model_dtype, device=self.device)
-        # self.base_unet.conv_in = new_in
-        # -------------------------------------------------------
+        
         # CubeDiff concatenates a 1-channel binary mask to the 4-channel latent map before UV positional encoding. 
         # This tells the model which faces (or regions) to preserve during denoising . 
-        # Without it, the network simply learns an unconditional prior and will ignore your text.
-
+        # Without it, the network simply learns an unconditional prior and will ignore the given text prompt.
         # — 5) Patch conv_in to accept UV + mask channels
         in_ch   = self.base_unet.conv_in.in_channels    # originally 4
         mask_ch = 1
@@ -120,23 +101,14 @@ class CubeDiffModel(nn.Module):
         new_in = new_in.to(dtype=self.model_dtype, device=self.device)
         self.base_unet.conv_in = new_in
 
-
-        # print(f"after replacing conv_in, Patch conv_in to accept the UV channels\n")
-        # self.check_dtypes()
-
         # — 6) Gradient checkpointing on the U-Net
         self.base_unet.enable_gradient_checkpointing()
-
-        # print(f"after enabling gradient checkpointing\n")
-        # self.check_dtypes()
 
         # — 7) Circular padding everywhere
         for m in self.base_unet.modules():
             if isinstance(m, nn.Conv2d):
                 m.padding_mode = "circular"
 
-        # print(f"after circular padding everywhere\n")
-        # self.check_dtypes()
         # — 8) Spherical positional & face-ID embeddings (Esteves et al 2021)
         self.face_emb = nn.Embedding(num_faces, uv_dim)
         self.sph_emb = nn.Sequential(
@@ -144,9 +116,7 @@ class CubeDiffModel(nn.Module):
             nn.SiLU(),
             nn.Linear(uv_dim, uv_dim),
         )
-        # print(f"after spherical positional & face-ID embeddings\n")
-        # self.check_dtypes()
-
+        
     def check_dtypes(self):
         """Debug helper to check tensor dtypes in the model"""
         print("\nChecking dtypes in CubeDiffModel:")
@@ -175,7 +145,6 @@ class CubeDiffModel(nn.Module):
         encoder_hidden_states: torch.Tensor,  # [B,L,D] or [B*6,L,D]
         **kwargs   # ignored                  # Add this to catch extra parameters
     ) -> torch.Tensor:
-        # print(f"architecture.py - cubeDiffModel - forward() - kwargs is {kwargs}\n")
         B, F, C, H, W = latents.shape
         E = self.positional_encoding.embedding_dim
 
@@ -224,10 +193,8 @@ class CubeDiffModel(nn.Module):
             raise ValueError(f"Wrong embedding batch: got {encoder_hidden_states.size(0)}, expected {B*F}")
 
         # 4) Call the U-Net with exactly (sample, timestep, encoder_hidden_states)
-        # print(f"architecture.py - cubeDiffModel - forward() - before unet_out = self.base_unet, lat is {lat}, encoder_hidden_states is {encoder_hidden_states}, timesteps is {timesteps} \n")
-        
         # — cast everything *before* it ever hits the attention kernels —
-        # Right before calling self.base_unet(...), now ensure both the latent inputs (which become your query) 
+        # Right before calling self.base_unet(...), now ensure both the latent inputs (which become the query) 
         # and the text embeddings (which become key & value) are all torch.bfloat16 on the GPU. 
         # That satisfies xFormers’ requirement that Q, K, and V share the same dtype.
 
@@ -235,14 +202,12 @@ class CubeDiffModel(nn.Module):
         encoder_hidden_states = encoder_hidden_states.to(dtype=self.model_dtype, device=self.device)
         # now we know Q (latents), K,V (k and v are text embedding) all come in as bfloat16
         # wrap the entire call in an autocast context as a last resort
-        # print(f"architecture.py - cubeDiffModel - forward() - before unet_out = self.base_unet, lat dtype is {lat.dtype}, encoder_hidden_states dtype is {encoder_hidden_states.dtype}, timesteps dtype is {timesteps.dtype} \n")
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=True):
             unet_out = self.base_unet(
                 sample=lat,
                 timestep=timesteps,
                 encoder_hidden_states=encoder_hidden_states
             )
-        # print(f"architecture.py - cubeDiffModel - forward() - after unet_out = self.base_unet\n")
         out = unet_out.sample  # [B*6, C, H, W]
 
         # 5) reshape back → [B,6,C,H,W]
