@@ -15,7 +15,7 @@ num_workers:   1         # ideally ≈ (physical vCPUs per node) / num_processes
 # max_steps:          700 # 5000
 gradient_accum_steps: 4    # 4 × 2 × 4  = 32 global batch
 learning_rate:      1.0e-3 # Most LoRA-fine-tuning recipes use 1e-3 or even 3e-4 as the adapter learning rate, so the Std Dev grow more quickly
-lora_r:             4
+lora_r:             8 # 4 # If LoRA weight‐std plateaus ~0.02 but grads stay ~1e-6, increase its step size.
 lora_alpha:         32
 boundary_weight:    1.0
 perceptual_weight:  0.1

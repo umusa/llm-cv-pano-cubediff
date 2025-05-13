@@ -9,16 +9,7 @@ torch.cuda.empty_cache()
 import torch.multiprocessing as _mp
 _mp.set_sharing_strategy("file_system")   # <— avoid /dev/shm exhaustion on many workers
 
-# import ctypes
-# adjust to your actual path if needed
-# ctypes.CDLL("/usr/local/nvidia/lib64/libcuda.so", mode=ctypes.RTLD_GLOBAL)
-
-# import torch._dynamo
 import os
-#------- completely disable Dynamo/inductor so no libcuda.so check ever happens
-# torch._dynamo.disable()
-# torch._dynamo.config.suppress_errors = True
-# ----------------------------
 
 # Update LD_LIBRARY_PATH to include where libcuda.so actually is
 os.environ["LD_LIBRARY_PATH"] = "/usr/local/nvidia/lib64:" + os.environ.get("LD_LIBRARY_PATH", "")
@@ -29,10 +20,6 @@ os.environ["TORCH_COMPILE_BACKEND"] = "inductor"
 # disable Dynamo/inductor checks
 import types
 import math
-# import inspect
-
-# tell torch.compile to use AOT‐eager by default, never inductor
-# os.environ["TORCH_COMPILE_BACKEND"] = "aot_eager"
 
 # Before running your training script
 os.environ["PYTORCH_CUDA_ALLOC_CONF"]="max_split_size_mb:128"
@@ -42,7 +29,6 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 
 import torch.nn.functional as F
-# from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torchvision import models
 import bitsandbytes as bnb
@@ -58,7 +44,6 @@ from diffusers import StableDiffusionPipeline, DDPMScheduler
 
 from cl.data.latent_webdataset import get_dataloader
 from cl.model.architecture   import CubeDiffModel
-# from cl.training.seam_loss   import seam_loss
 
 from diffusers import UNet2DConditionModel
 # from peft import TaskType
@@ -72,7 +57,6 @@ def _patched_unet_forward(self, sample, timestep, encoder_hidden_states, *args, 
     Accept the three required args, ignore anything else.
     Guards against 'decoder_input_ids', 'use_cache', etc.
     """
-    # print(f"trainer.py - _patched_unet_forward - sample dtype is {sample.dtype}, timestep dtype is {timestep.dtype}, encoder_hidden_states dtype is {encoder_hidden_states.dtype}\n")
     return orig_unet_forward(self, sample, timestep, encoder_hidden_states)
 
 UNet2DConditionModel.forward = _patched_unet_forward
@@ -90,27 +74,8 @@ class CubeDiffTrainer:
         self.mixed_precision = mixed_precision
         self.model_dtype = torch.bfloat16 if mixed_precision == "bf16" else torch.float16
 
-        # Accelerator
-        # Create DeepSpeed plugin with CPU offloading
-        # deepspeed_plugin = DeepSpeedPlugin(
-        #     zero_stage=3,  # ZeRO stage 2 for good balance of memory vs speed
-        #     offload_optimizer_device="cpu",  # Offload optimizer states to CPU
-        #     offload_param_device="cpu",  # Offload parameters to CPU when not needed
-        #     gradient_accumulation_steps=gradient_accumulation_steps
-        # )
         self.accelerator = Accelerator(mixed_precision=mixed_precision,
                                        gradient_accumulation_steps=gradient_accumulation_steps,
-                                       # offload parameters/buffers & optimizer state → CPU to free GPU RAM
-                                    #    dataloader_pin_memory=True,
-                                    #    offload_state=True,            # buffers & optimizer states → CPU
-                                    #    offload_optimizer=True,        # optimizer state → CPU
-                                    #    offload_parameters=True        # model weights → CPU when unused
-                                        # cpu_offload_models=True,  # Offload model weights to CPU when not in use
-                                    #     device_placement=True,
-                                    #     dispatch_batches=True,
-                                    #     split_batches=False,  # Setting to False can help with memory
-                                        # deepspeed_plugin=deepspeed_plugin,
-                                        # kwargs_handlers=[deepspeed_plugin]
                                     )
 
         # optional offline-wandb
@@ -125,15 +90,12 @@ class CubeDiffTrainer:
         self.setup_model(pretrained_model_name)
 
         # ── PERCEPTUAL & BOUNDARY LOSS SETUP ──
-        # self.perceptual_net = models.vgg16(pretrained=True).features.eval().to(self.accelerator.device)
-
         # Without enough weight on seam and perceptual terms, the model ignores overlap learning; and running VGG in bf16 loses detail.
         # The VGG16 perceptual network, however, must stay in full precision to provide stable gradient signals for texture and seam consistency
         # run VGG in full-precision for stable texture/perceptual gradients
         # it is faithful to CubeDiff’s paper (§3.2–3.4) and its ablations (A.11), 
         # and they mesh with industry best practices in multi-view diffusion and low-rank adaptation.
         self.perceptual_net = models.vgg16(pretrained=True).features[:16].eval().to(torch.float32)
-        # self.perceptual_net = models.vgg16(pretrained=True).features[:16].eval().to(dtype=torch.float16)
         for p in self.perceptual_net.parameters():
             p.requires_grad = False
         self.l1 = torch.nn.L1Loss()
@@ -179,31 +141,12 @@ class CubeDiffTrainer:
                 setattr(self.noise_scheduler, k, v.to(torch.bfloat16))
 
         # 3) Instantiate CubeDiffModel (UNet wrapper)
-        # self.model = CubeDiffModel(pretrained_model_name)
         self.model = CubeDiffModel(
             pretrained_model_name,
             skip_weight_copy=self.config["skip_weight_copy"]
         )
 
-        # using BitsAndBytesConfig(load_in_4bit) so no need for prepare_model_for_kbit_training
         # 4) Inject LoRA *only* into the UNet backbone
-        # optional 8-bit kbit training (saves VRAM)
-        # — Quantize U-Net to 8-bit for both speed & <16 GB memory
-        # PEFT’s helper expects an 8-bit-loaded model, freezes its weights, and wraps them in BNB’s 8-bit linear layers.
-        # self.model.base_unet = prepare_model_for_kbit_training(self.model.base_unet)
-        # print("[setup_model] UNet quantized to 8-bit")
-
-        # do not compile it due to errors and no significant memory savings and speedup
-        # — JIT-compile U-Net via inductor for ~2–3× faster steps
-        # print(f"trainer.py - cubeDiffTrainer - setuop_model - before torch.compile(self.model.base_unet, backend='nvfuser')\n")
-        # self.model.base_unet = torch.compile(self.model.base_unet, backend="inductor")
-        # self.model.base_unet = torch.compile(
-        #                                         self.model.base_unet,
-        #                                         backend="nvfuser",
-        #                                         fullgraph=True,
-        #                                     )
-        # print(f"trainer.py - cubeDiffTrainer - setuop_model - after torch.compile(self.model.base_unet, backend='nvfuser')\n")
-        
         unet = self.model.base_unet
 
         # stub prepare_inputs_for_generation(sample, timestep, encoder_hidden_states)
@@ -233,7 +176,7 @@ class CubeDiffTrainer:
 
         # 5) Inject PEFT‐LoRA adapters (Hu et al. 2021)
         lora_cfg = LoraConfig(
-            # If your LoRA weight‐std plateaus ~0.02 but grads stay ~1e-6, increase its step size.
+            # If LoRA weight‐std plateaus ~0.02 but grads stay ~1e-6, increase its step size.
             r=self.config.get("lora_r", 4),
             # bump alpha to 32 for larger effective LR in LoRA subspace
             lora_alpha=self.config.get("lora_alpha", 32),
@@ -247,8 +190,8 @@ class CubeDiffTrainer:
             lora_dropout=0.05,
             bias="none"            
         )
+
         # PEFT-LoRA: target the first (Linear) element inside each ModuleList
-        
         self.model.base_unet = get_peft_model(self.model.base_unet, lora_cfg)
         print(f"[LoRA] trainable params: {sum(p.numel() for p in self.model.parameters() if p.requires_grad)}")
 
@@ -272,7 +215,6 @@ class CubeDiffTrainer:
         # 5) Enable gradient checkpoints and circular padding
         #   Enable gradient checkpointing on the U-Net backbone only
         #    (saves ~30–40% memory at the cost of ~10–20% extra compute)
-        # self.model.enable_gradient_checkpointing()
         print(f"trainer.py - CubeDiffTrainer - CubeDiff Model enabled gradient checkpointing\n")
         self.model.base_unet.enable_gradient_checkpointing()
         # if diffusers>=0.18, which shards attention internals to slash peak usage.
@@ -353,14 +295,7 @@ class CubeDiffTrainer:
                 _, self.val_dataloader = self.accelerator.prepare(
                     self.model, self.val_dataloader
                 )
-            # Move components to device
-            # device = self.accelerator.device
-            # dtype = self.model_dtype
-            # # print(f"Moving components to {device} with dtype {dtype}")
-            # self.perceptual_net = self.perceptual_net.to(device, dtype=dtype)
-            # self.text_encoder = self.text_encoder.to(device)
-            # self.vae = self.vae.to(device)
-
+            
             # Move components to device (preserve FP32 for perceptual_net)
             # U-Net, VAE, and text encoder benefit from BF16 for speed/memory.
             # Move components to device (preserve FP32 for perceptual_net)
@@ -456,8 +391,7 @@ class CubeDiffTrainer:
         g_start_tm = time.time()
         ep_g_start_tm = time.time()
         
-        # (you already have an Accelerator instance called self.accelerator)
-        rank = self.accelerator.local_process_index  # 0 or 1 on two GPUs
+        rank = self.accelerator.local_process_index  
         for epoch in range(num_epochs):
             epoch_processed = 0
             print(f"▶️ Starting epoch {epoch}/{num_epochs}")
@@ -493,7 +427,7 @@ class CubeDiffTrainer:
                         del ids  # Free memory as soon as possible
                     # print(f"trainer.py - train() - before pred = self.model, lat shape is {lat.shape} and dtype is {lat.dtype}, noisy_lat shape is {noisy_lat.shape} type is {noisy_lat.dtype}, timesteps is {timesteps}, txt_emb shape is {txt_emb.shape}, type is {txt_emb.dtype}\n")
 
-                    # CubeDiff requires randomly dropping each modality 10 % of the time during training so the model learns text-only, image-only, 
+                    # CubeDiff requires randomly dropping each modality 10% of the time during training so the model learns text-only, image-only, 
                     # and joint modes . Without this, it overfits to always having both conditions and fails to generalize.
                     # each micro-batch randomly drops text or image conditioning at 10 % each
                     # — Classifier-Free Guidance drops (§4.5):
@@ -518,19 +452,7 @@ class CubeDiffTrainer:
 
                     # print(f"trainer.py - train() - after pred = self.model")
 
-                    # Add at the start of the first training iteration
-                    # if batch_indx==0:
-                    #     test_result = self.model(
-                    #             latents=noisy_lat,
-                    #             timesteps=timesteps,
-                    #             encoder_hidden_states=txt_emb,
-                    #             input_ids=ids,  # This should be filtered out
-                    #             attention_mask=mask  # This should be filtered out
-                    #         )
-                        # print("Parameter filtering through model path is working!")
-
                     # ── NEW LOSS ──
-                    # mse_loss = F.mse_loss(pred.float(), noise.float())
                     # The model predicts only the 4 “true” latent channels;
                     # our `noise` still has 5 (4 + mask). Drop the mask so shapes align.
                     # reasons: 
@@ -548,30 +470,10 @@ class CubeDiffTrainer:
 
                     # boundary loss
                     # Without enough weight on seam and perceptual terms, the model ignores overlap learning; and running VGG in bf16 loses detail.
-                    # bdy = self.boundary_loss(pred) * self.config.get("boundary_weight", 0.1)
                     # boundary loss (upweight to 1.0 to really force seam consistency)
                     # it is faithful to CubeDiff’s paper (§3.2–3.4) and its ablations (A.11), 
                     # and they mesh with industry best practices in multi-view diffusion and low-rank adaptation.
                     bdy = self.boundary_loss(pred) * self.config.get("boundary_weight", 1.0)
-
-                    # # Convert perceptual_net to use the same precision as the model
-                    # # self.perceptual_net = self.perceptual_net.to(dtype=torch.bfloat16)
-                    # # keep perceptual net in fp32, move preds to fp32
-                    # with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    #     # perceptual loss
-                    #     # pred_rgb = self.decode_latents_to_rgb(pred)
-                    #     # true_rgb = self.decode_latents_to_rgb(noise)
-                    #     # fp = self.perceptual_net(pred_rgb)
-                    #     # ft = self.perceptual_net(true_rgb)
-                    #     # perc = self.l1(fp, ft) * 0.01
-                    #     # perc = self.l1(fp, ft) * self.config.get("perceptual_weight", 0.01)
-
-                    #     pred_rgb = self.decode_latents_to_rgb(pred).to(torch.float32)
-                    #     true_rgb = self.decode_latents_to_rgb(noise).to(torch.float32)
-                    #     fp = self.perceptual_net(pred_rgb)
-                    #     ft = self.perceptual_net(true_rgb)
-                    #     # upweight to 0.1 for stronger semantic guidance
-                    #     perc = self.l1(fp, ft) * self.config.get("perceptual_weight", 0.1)
 
                     # ── Perceptual loss in FULL FP32 ──
                     # Disable autocast so VGG stays in FP32 and gradients are stable.
@@ -584,7 +486,6 @@ class CubeDiffTrainer:
                         ft = self.perceptual_net(true_rgb)
                         perc = self.l1(fp, ft) * self.config.get("perceptual_weight", 0.1)
 
-                    # loss = mse_loss + bdy + perc
                     # Ensure all three terms are FP32 before summing
                     loss = mse_loss.float() + bdy.float() + perc.float()
                     
@@ -681,7 +582,6 @@ class CubeDiffTrainer:
                 if self.accelerator.is_main_process:                    
                     # 1) log train loss every N steps
                     if gstep % self.config["log_loss_every_n_steps"] == 0:
-                        # train_losses.append((processed_samples, loss.item()))
                         self._plot_loss_curves(total_processed_samples, train_losses, val_losses)
                         print(f"\tRank {rank} - epoch {epoch} - batch_indx {batch_indx} - plotted loss - gstep {gstep} - self.accelerator.is_main_process is {self.accelerator.is_main_process} - log_loss_every_n_steps is {self.config['log_loss_every_n_steps']} - global_iter is {self.global_iter-1} - batch_size is {batch_size}, samples {processed_samples:>4}  train-loss {loss.item():.4f}")
                     # 2) every `eval_every_n_samples`, first sync _all_ ranks…
@@ -694,8 +594,6 @@ class CubeDiffTrainer:
                         temp_e_time = time.time()
                         print(f"\tRank {rank} - epoch {epoch} - batch_indx {batch_indx} - generate_samples done - cost {temp_e_time - temp_s_time:.2f} seconds")    
                         
-                        # next_eval_at += eval_every_n_samples
-
                         # 4) Verify your U-Net’s LoRA adapters are actually updating
                         # Replace with this more robust version:
                         unwrapped = self.accelerator.unwrap_model(self.model)
@@ -757,9 +655,6 @@ class CubeDiffTrainer:
             # ───────────────────────────────────────────────────────────────
             # after all training, plot train & val curves
             try:
-                # steps_tr, loss_tr = zip(*train_losses) if train_losses else ([],[])
-                # steps_va, loss_va = zip(*val_losses)   if val_losses   else ([],[])
-                
                 # unpack
                 steps_tr, loss_tr = zip(*train_losses) if train_losses else ([],[])
                 steps_va, loss_va = zip(*val_losses)   if val_losses   else ([],[])
@@ -898,7 +793,6 @@ class CubeDiffTrainer:
                     print(f"Warning: Processed {processed_batches} validation batches, expected only {max_val_batches}. Breaking out of loop.")
                     break
                     
-                    
                 # cast to the same dtype the U-Net was compiled for
                 lat = batch["latent"].to(self.accelerator.device, dtype=self.model_dtype)
                 # print(f"trainer.py - evaluate() - after batch[latent].to(self.accelerator.device,  dtype=self.model_dtype), lat dtype is {lat.dtype}\n")
@@ -926,7 +820,6 @@ class CubeDiffTrainer:
                     )
 
                 # 1) MSE
-                # mse = F.mse_loss(pred.float(), noise.float(), reduction="mean")
                 # print(f"trainer.py - evaluate() - after pred = self.model, mse is {mse}\n")
                 # The model predicts only the 4 “true” latent channels;
                 # our `noise` still has 5 (4 + mask). Drop the mask so shapes align.
@@ -946,11 +839,9 @@ class CubeDiffTrainer:
                     true_rgb = self.decode_latents_to_rgb(noise)
                     fp = self.perceptual_net(pred_rgb)
                     ft = self.perceptual_net(true_rgb)
-                    # perc = self.l1(fp, ft) * 0.01
                     perc = self.l1(fp, ft) * self.config.get("perceptual_weight", 0.1)
 
                 loss = mse_loss + bdy + perc
-
                 total_loss   += loss.item() * lat.size(0)
                 total_samples+= lat.size(0)
                 # print(f"trainer.py - evaluate() - after pred = self.model, total_loss is {total_loss}, total_sample is {total_samples}\n")
