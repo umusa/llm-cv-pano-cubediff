@@ -168,10 +168,13 @@ def equirect_to_cubemap_torch(equi: np.ndarray, face_size: int) -> List[np.ndarr
     # Flipping faces[4] and faces[5] reorients the poles so “up” aligns with the network’s training data, 
     # preventing the noisy pole artifacts you saw
     # depending on your FACE_ORDER, you may need to flip vertically:
-    faces[4] = torch.flip(faces[4], dims=[0])  # top face
-    faces[5] = torch.flip(faces[5], dims=[0])  # bottom face
+    # faces[4] = torch.flip(faces[4], dims=[0])  # top face
+    # faces[5] = torch.flip(faces[5], dims=[0])  # bottom face
 
-    # return faces
+    # For top (+Y) and bottom (–Y), flip vertically so sky is up
+    faces[4] = np.flipud(faces[4])  # ‘top’
+    faces[5] = np.flipud(faces[5])  # ‘bottom’
+
     # Now crop each face from 95°→90° by removing the outer overlap region:
     # crop = int(overlap / (hi - lo) * face_size)  # number of pixels to cut on each side
     # cropped = [f[crop:-crop, crop:-crop] for f in faces]
@@ -181,6 +184,7 @@ def equirect_to_cubemap_torch(equi: np.ndarray, face_size: int) -> List[np.ndarr
     # remove the exact 5° margin (i.e. 5° out of the 95° FOV) → 90° final
     # margin fraction = 5° / 95° ≈ 0.0526
     # Now crop from 95°→90°
+    # This guarantees the UNet sees the ±2.5° overlap during training and learns seam-free edges .
     margin = int(face_size * 5 / 95) # crop removes exactly 5° per side, ensuring seamless edges as prescribed.
     cropped = [f[margin:-margin, margin:-margin] for f in faces]
     

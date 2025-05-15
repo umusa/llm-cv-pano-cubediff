@@ -33,7 +33,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torchvision import models
 import bitsandbytes as bnb
 
-from peft import get_peft_model, LoraConfig #, prepare_model_for_kbit_training
+# from peft import get_peft_model, LoraConfig #, prepare_model_for_kbit_training
 
 import wandb, psutil
 
@@ -46,6 +46,7 @@ from cl.data.latent_webdataset import get_dataloader
 from cl.model.architecture   import CubeDiffModel
 
 from diffusers import UNet2DConditionModel
+from transformers import get_linear_schedule_with_warmup
 # from peft import TaskType
 import tarfile
 
@@ -100,9 +101,9 @@ class CubeDiffTrainer:
             p.requires_grad = False
         self.l1 = torch.nn.L1Loss()
 
-        self.lora_logger = LoRALogger(
-            output_dir=Path(self.config["output_dir"]) / "lora_logs"
-        )
+        # self.lora_logger = LoRALogger(
+        #     output_dir=Path(self.config["output_dir"]) / "lora_logs"
+        # )
         self.global_iter = 0
     
     # --------------------------------------------------
@@ -114,11 +115,11 @@ class CubeDiffTrainer:
         # Import the patching module - this applies the patches automatically
         # filter out unneeded arguments for forward() of peft
         # Note: This import should be done only once
-        try:
-            print(f"trainer.py - CubeDiffTrainer - setup - importing peft_patch")
-            from cl.training import peft_patch  # This is the revised_peft_patch.py you created
-        except ImportError:
-            print("⚠️ peft_patch module not found, continuing without patching")
+        # try:
+        #     print(f"trainer.py - CubeDiffTrainer - setup - importing peft_patch")
+        #     from cl.training import peft_patch  # This is the revised_peft_patch.py you created
+        # except ImportError:
+        #     print("⚠️ peft_patch module not found, continuing without patching")
             
         # 1) Load stable-diffusion pipeline just to grab VAE & text-encoder
         pipe = StableDiffusionPipeline.from_pretrained(
@@ -145,59 +146,90 @@ class CubeDiffTrainer:
             pretrained_model_name,
             skip_weight_copy=self.config["skip_weight_copy"]
         )
+        # ─── Move the *entire* CubeDiffModel onto GPU ───
+        # This ensures positional_encoding, attention layers, etc. all live on self.device
+        # self.model = self.model.to(self.device)
 
+        # That will reproduce the CubeDiff authors’ ∼17 M trainable parameters and ensure meaningful gradients.
+        # — 3.A: drop LoRA; enable full-rank tuning on only the inflated-attn layers
+        for name, p in self.model.base_unet.named_parameters():
+            # keep only the Q/K/V/O projections trainable
+            # UNet was loaded in 4-bit quantized form (int4/int8 tensors), and you then try to call p.requires_grad = True on those integer-typed weights. 
+            # Only floating-point Tensors can track gradients.
+            if p.dtype.is_floating_point and any(seg in name for seg in ("to_q", "to_k", "to_v", "to_out")):
+                p.requires_grad = True
+            else:
+                p.requires_grad = False
+        # quick sanity check
+        total, trainable = 0, 0
+        for p in self.model.base_unet.parameters():
+            total += p.numel()
+            if p.requires_grad:
+                trainable += p.numel()
+        print(f"👉 Full-rank tuning: {trainable/1e6:.2f}M / {total/1e6:.1f}M params")
+
+        # -------------------------------------------------------
         # 4) Inject LoRA *only* into the UNet backbone
-        unet = self.model.base_unet
+        # unet = self.model.base_unet
 
-        # stub prepare_inputs_for_generation(sample, timestep, encoder_hidden_states)
-        if not hasattr(unet, "prepare_inputs_for_generation"):
-            def _prepare_inputs_for_generation(self, sample, timestep, encoder_hidden_states, **kwargs):
-                return {
-                    "sample": sample,
-                    "timestep": timestep,
-                    "encoder_hidden_states": encoder_hidden_states
-                }
-            unet.prepare_inputs_for_generation = types.MethodType(
-                _prepare_inputs_for_generation, unet
-            )
+        # # stub prepare_inputs_for_generation(sample, timestep, encoder_hidden_states)
+        # if not hasattr(unet, "prepare_inputs_for_generation"):
+        #     def _prepare_inputs_for_generation(self, sample, timestep, encoder_hidden_states, **kwargs):
+        #         return {
+        #             "sample": sample,
+        #             "timestep": timestep,
+        #             "encoder_hidden_states": encoder_hidden_states
+        #         }
+        #     unet.prepare_inputs_for_generation = types.MethodType(
+        #         _prepare_inputs_for_generation, unet
+        #     )
 
-        # stub _prepare_encoder_decoder_kwargs_for_generation(decoder_input_ids, **kwargs)
-        if not hasattr(unet, "_prepare_encoder_decoder_kwargs_for_generation"):
-            def _prepare_encoder_decoder_kwargs_for_generation(self, decoder_input_ids, **kwargs):
-                # for UNet, we don’t need extra kwargs—return empty dict
-                return {}
-            unet._prepare_encoder_decoder_kwargs_for_generation = types.MethodType(
-                _prepare_encoder_decoder_kwargs_for_generation, unet
-            )
-
+        # # stub _prepare_encoder_decoder_kwargs_for_generation(decoder_input_ids, **kwargs)
+        # if not hasattr(unet, "_prepare_encoder_decoder_kwargs_for_generation"):
+        #     def _prepare_encoder_decoder_kwargs_for_generation(self, decoder_input_ids, **kwargs):
+        #         # for UNet, we don’t need extra kwargs—return empty dict
+        #         return {}
+        #     unet._prepare_encoder_decoder_kwargs_for_generation = types.MethodType(
+        #         _prepare_encoder_decoder_kwargs_for_generation, unet
+        #     )
         # reassign back
-        self.model.base_unet = unet
+        # self.model.base_unet = unet
         # — end stub —
+        # # -------------------------------------------------------
 
+        # CubeDiff authors fine-tune all ∼17 M inflated-attention weights directly, not adapters. 
+        # The LoRA stats (attach 4) show near-zero updates—which explains the seams and noise in panorama.
         # 5) Inject PEFT‐LoRA adapters (Hu et al. 2021)
-        lora_cfg = LoraConfig(
-            # If LoRA weight‐std plateaus ~0.02 but grads stay ~1e-6, increase its step size.
-            r=self.config.get("lora_r", 4),
-            # bump alpha to 32 for larger effective LR in LoRA subspace
-            lora_alpha=self.config.get("lora_alpha", 32),
-            # That will ensure I am actually injecting adapters into all the Q/K/V and output projections .
-            target_modules=[
-                            "to_q",       # matches every q-proj Linear/Conv
-                            "to_k",       # matches every k-proj
-                            "to_v",       # matches every v-proj
-                            "to_out.0",   # matches ONLY the Linear inside the ModuleList
-                            ],
-            lora_dropout=0.05,
-            bias="none"            
-        )
+        # lora_cfg = LoraConfig(
+        #     # If LoRA weight‐std plateaus ~0.02 but grads stay ~1e-6, increase its step size.
+        #     r=self.config.get("lora_r", 4),
+        #     # bump alpha to 32 for larger effective LR in LoRA subspace
+        #     lora_alpha=self.config.get("lora_alpha", 32),
+        #     # That will ensure I am actually injecting adapters into all the Q/K/V and output projections .
+        #     target_modules=[
+        #                     "to_q",       # matches every q-proj Linear/Conv
+        #                     "to_k",       # matches every k-proj
+        #                     "to_v",       # matches every v-proj
+        #                     "to_out.0",   # matches ONLY the Linear inside the ModuleList
+        #                     ],
+        #     lora_dropout=0.05,
+        #     bias="none"            
+        # ) ----------------------------------
 
-        # PEFT-LoRA: target the first (Linear) element inside each ModuleList
-        self.model.base_unet = get_peft_model(self.model.base_unet, lora_cfg)
-        print(f"[LoRA] trainable params: {sum(p.numel() for p in self.model.parameters() if p.requires_grad)}")
+        # # PEFT-LoRA: target the first (Linear) element inside each ModuleList
+        # self.model.base_unet = get_peft_model(self.model.base_unet, lora_cfg)
+        # print(f"[LoRA] trainable params: {sum(p.numel() for p in self.model.parameters() if p.requires_grad)}")
 
         # Ensure all model components use the same precision
         # Cast all model components to the same dtype
-        self.model.base_unet = self.model.base_unet.to(dtype=self.model_dtype)
+        # self.model.base_unet = self.model.base_unet.to(dtype=self.model_dtype)
+        # self.model.base_unet = UNet2DConditionModel.from_pretrained(
+        #     pretrained_model_name,
+        #     subfolder="unet",
+        #     torch_dtype=self.model_dtype,          # <— tell HF to load as fp16 or bf16/float32
+        #     revision=self.config.get("revision", None)
+        #     # remove any load_in_4bit / load_in_8bit flags here
+        # )
         self.text_encoder = self.text_encoder.to(dtype=self.model_dtype)
         self.vae = self.vae.to(dtype=self.model_dtype)
 
@@ -210,7 +242,7 @@ class CubeDiffTrainer:
         print(f"trainer.py - CubeDiffTrainer- CubeDiff Model components cast to {self.model_dtype}")
 
         # cast the adapted UNet to bfloat16 for memory/speed
-        self.model.base_unet = self.model.base_unet.to(torch.bfloat16)
+        # self.model.base_unet = self.model.base_unet.to(torch.bfloat16)
 
         # 5) Enable gradient checkpoints and circular padding
         #   Enable gradient checkpointing on the U-Net backbone only
@@ -377,8 +409,11 @@ class CubeDiffTrainer:
         true_steps   = math.ceil(train_size * epochs / global_batch)
 
         # then override your config:
-        sched = CosineAnnealingLR(optim, T_max=true_steps)
-        optim, sched = self.accelerator.prepare(optim, sched)
+        # sched = CosineAnnealingLR(optim, T_max=true_steps)
+        # sched = CosineAnnealingLR(optim, T_max=true_steps, eta_min=1e-6)
+        warmup     = self.config.get("warmup_steps", 1000)
+        # optim, sched = self.accelerator.prepare(optim, sched)
+        sched = get_linear_schedule_with_warmup( optim,  num_warmup_steps=warmup, num_training_steps=true_steps)
 
         sample_prompts        = ["A beautiful mountain lake at sunset with snow-capped peaks"]
         print(f"trainer.py - CubeDiffTrainer - train - sample_prompts is {sample_prompts}\n")
@@ -519,12 +554,12 @@ class CubeDiffTrainer:
                             train_losses.append((total_processed_samples, avg_train_loss))
 
                         # Log LoRA adapter weight stats to verify fine-tuning —
-                        if (self.global_iter%self.config["log_lora_every_n_steps"])==0:
+                        # if (self.global_iter%self.config["log_lora_every_n_steps"])==0:
                             # print(f"\t\tRank {rank} - trainer.py - CubeDiffTrainer - train - log lora - epoch {epoch} - self.global_iter is {self.global_iter}")
-                            self.lora_logger.record_batch(self.model, self.accelerator, self.global_iter)
-                            if self.accelerator.is_main_process:
-                                self.lora_logger.plot_up_to(self.global_iter, total_processed_samples)
-                                print(f"\t\tRank {rank} - train - self.lora_logger.record_batch done for epoch {epoch}, self.global_iter { self.global_iter}, plot_up_to done")
+                            # self.lora_logger.record_batch(self.model, self.accelerator, self.global_iter)
+                            # if self.accelerator.is_main_process:
+                                # self.lora_logger.plot_up_to(self.global_iter, total_processed_samples)
+                                # print(f"\t\tRank {rank} - train - self.lora_logger.record_batch done for epoch {epoch}, self.global_iter { self.global_iter}, plot_up_to done")
 
                         # 1) gradient clipping
                         self.accelerator.clip_grad_norm_(self.model.parameters(), 1.0)
@@ -649,7 +684,7 @@ class CubeDiffTrainer:
             unet_sd = unwrapped.base_unet.state_dict()
             torch.save(unet_sd, path)
             print(f"\nRank {rank} - ✔ saved U-Net adapter to {path}")
-            self.lora_logger.finalize()
+            # self.lora_logger.finalize()
             print(f"Rank {rank} - trainer.py - CubeDiffTrainer - train - lora final logging done")
 
             # ───────────────────────────────────────────────────────────────
@@ -1007,7 +1042,7 @@ class LoRALogger:
         # 1) save raw history
         csv_path = self.output_dir / "lora_full_history.csv"
         df.to_csv(csv_path, index=False)
-        print(f"[LoRALogger] raw history → {csv_path}")
+        # print(f"[LoRALogger] raw history → {csv_path}")
 
         # 2) compute per-iteration summary
         grp = df.groupby("iter")

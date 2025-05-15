@@ -90,37 +90,55 @@ class SynchronizedGroupNorm(nn.Module):
             
             return x_reshaped
 
-def replace_group_norms(module, in_place=True):
-    """
-    Replace all GroupNorm layers with SynchronizedGroupNorm layers.
+# def replace_group_norms(module, in_place=True):
+#     """
+#     Replace all GroupNorm layers with SynchronizedGroupNorm layers.
     
-    Args:
-        module: PyTorch module
-        in_place: Whether to modify the module in-place
+#     Args:
+#         module: PyTorch module
+#         in_place: Whether to modify the module in-place
         
-    Returns:
-        Module with replaced normalization layers
-    """
-    if not in_place:
-        module = copy.deepcopy(module)
+#     Returns:
+#         Module with replaced normalization layers
+#     """
+#     if not in_place:
+#         module = copy.deepcopy(module)
     
-    # Recursively replace in all submodules
-    # CubeDiff uses synchronized GroupNorm over both faces and spatial dims to remove color shifts 
-    # Recursively replaces every nn.GroupNorm in the U-Net (down/mid/up) with my SynchronizedGroupNorm, ensuring color‐consistency across faces
+#     # Recursively replace in all submodules
+#     # CubeDiff uses synchronized GroupNorm over both faces and spatial dims to remove color shifts 
+#     # Recursively replaces every nn.GroupNorm in the U-Net (down/mid/up) with my SynchronizedGroupNorm, ensuring color‐consistency across faces
+#     for name, child in list(module.named_children()):
+#         if isinstance(child, nn.GroupNorm):
+#             setattr(module, name, SynchronizedGroupNorm(
+#                 child.num_groups,
+#                 child.num_channels,
+#                 child.eps,
+#                 child.affine
+#             ))
+#             # Copy weights if applicable
+#             if child.affine:
+#                 getattr(module, name).weight.data.copy_(child.weight.data)
+#                 getattr(module, name).bias.data.copy_(child.bias.data)
+#         else:
+#             # recurse
+#             replace_group_norms(child, in_place=True)
+    
+#     return module
+
+def replace_group_norms(module: torch.nn.Module, in_place: bool = False):
     for name, child in list(module.named_children()):
-        if isinstance(child, nn.GroupNorm):
-            setattr(module, name, SynchronizedGroupNorm(
-                child.num_groups,
+        if isinstance(child, torch.nn.GroupNorm):
+            new_gn = SynchronizedGroupNorm(
+                child.num_groups, 
                 child.num_channels,
-                child.eps,
+                child.eps,      
                 child.affine
-            ))
-            # Copy weights if applicable
+            )
             if child.affine:
-                getattr(module, name).weight.data.copy_(child.weight.data)
-                getattr(module, name).bias.data.copy_(child.bias.data)
+                new_gn.weight.data.copy_(child.weight.data)
+                new_gn.bias.data.copy_(child.bias.data)
+            # move to same device
+            new_gn = new_gn.to(child.weight.device)
+            setattr(module, name, new_gn)
         else:
-            # recurse
             replace_group_norms(child, in_place=True)
-    
-    return module

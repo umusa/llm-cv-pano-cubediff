@@ -1,0 +1,42 @@
+#  configure for LoRA fine-tuning of CubeDiff “tiny” model – 700 panoramas
+# --- data --------------------------------------------------
+# dataset:       "../data/dataspace/polyhaven_tiny/cubediff_train.tar"    # ← train tar
+# val_dataset:   "../data/dataspace/polyhaven_tiny/cubediff_val.tar"      # ← val tar
+
+dataset : "/home/jupyter/mluser/git/llm-cv-pano-cubediff/cl/data/dataspace/polyhaven_tiny/cubediff_train.tar"
+val_dataset: "/home/jupyter/mluser/git/llm-cv-pano-cubediff/cl/data/dataspace/polyhaven_tiny/cubediff_val.tar"
+batch_size:    2         # keep this at 2 per GPU process 
+
+# bump these to drive more CPU‐side throughput
+num_workers:   1         # ideally ≈ (physical vCPUs per node) / num_processes, but for more gpus (e.g. >=4), too many workers can cause the problem of too many worker processes accessing tar files at the same time
+                         # got error: RuntimeError: unable to write to file </torch_9439_1841599264_9>: No space left on device (28) 
+                         # so, for 8 GPUs, 2 workers is a good number
+# --- optimisation -----------------------------------------
+# With 700 samples, 20 epochs × 700 = 14 000 samples; at global-batch = 32 that’s ~440 updates—ample to converge in ~6 hr.
+# max_steps:          700 # 5000
+gradient_accum_steps: 4    # 4 × 2 × 4  = 32 global batch
+learning_rate:      1.0e-4 # # CubeDiff’s peak LR # Most LoRA-fine-tuning recipes use 1e-3 or even 3e-4 as the adapter learning rate, so the Std Dev grow more quickly
+lora_r:             0 # 4 # If LoRA weight‐std plateaus ~0.02 but grads stay ~1e-6, increase its step size.
+lora_alpha:         0 # 32
+boundary_weight:    1.0
+perceptual_weight:  0.1
+
+# --- training ---------------------------------------------
+num_epochs:          1 # 40 # 18 # 2
+log_loss_every_n_steps:    1 # 8 # batch_size * gradient_accum_steps
+log_lora_every_n_steps: 1 
+eval_every_n_samples: 50 # 8
+sample_every_n_steps:  100
+save_every_n_steps:   500
+eval_every_n_steps:   500
+warmup_steps:  1000
+
+# --- misc --------------------------------------------------
+use_wandb:          false
+output_dir:         "outputs/cubediff_tiny_lora"
+seed:               1337
+
+# --- quantization / inflation tweaks ----------------------
+# When U-Net is 4-bit, skip copying pretrained weights into the inflated layers
+# (so we avoid all dequantize/view_as hacks).
+skip_weight_copy: true

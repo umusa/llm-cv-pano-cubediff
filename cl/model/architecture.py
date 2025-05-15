@@ -27,34 +27,28 @@ class CubeDiffModel(nn.Module):
         self,
         pretrained_model_name: str,
         num_faces: int = 6,
-        uv_dim: int   = 9,
+        uv_dim: int   = 10,
         skip_weight_copy: bool = False # When U-Net is 4-bit, skip copying pretrained weights into the inflated layers
                                         # (so avoid all dequantize/view_as hacks).
     ):
         super().__init__()
 
-        # — 1) Load only the U-Net
+        # — 1) Load only the U-Net in BF16
         self.skip_weight_copy = skip_weight_copy
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True
-        )
         self.base_unet = UNet2DConditionModel.from_pretrained(
             pretrained_model_name,
             subfolder="unet",
-            quantization_config=bnb_config,
             torch_dtype=torch.bfloat16,
             use_safetensors=True,
         )
-        
+
+        # — 2) Move the U-Net onto CUDA and record device/dtype
         self.model_dtype = torch.bfloat16
-        self.device = next(self.base_unet.parameters()).device
-        
-        # — 2) Inflate Stable Diffusion’s Attention → cross‐face Attention  
+        self.base_unet = self.base_unet.to("cuda", dtype=self.model_dtype)
+        self.device    = next(self.base_unet.parameters()).device
+
+        # — 3) Inflate only the UNet’s self‐attention layers
         for name, module in list(self.base_unet.named_modules()):
-            # Only inflate Stable Diffusion’s ention _self_-attention, skip text cross-attention
             if isinstance(module, Attention) and module.cross_attention_dim is None:
                 parent = self.base_unet
                 parts  = name.split(".")
@@ -65,58 +59,65 @@ class CubeDiffModel(nn.Module):
                     parts[-1],
                     inflate_attention_layer(
                         original_attn=module,
-                        skip_copy=self.skip_weight_copy # all 4-bit copy logic is bypassed and keep memory footprint low and training fast
+                        skip_copy=skip_weight_copy
                     )
                 )
 
-        # — 3) Sync GroupNorm
+        # — 4) Replace all GroupNorms with Sync GroupNorm
         replace_group_norms(self.base_unet, in_place=True)
-        print(f"after replacing group norms\n")
-        
-        # — 4) Positional encoding (adds UV channels)
+        assert not any(isinstance(m, nn.GroupNorm) for m in self.base_unet.modules()), \
+            "GroupNorm still present!"
+
+        # — 5) Positional encoding (UV channels)
         self.positional_encoding = CubemapPositionalEncoding(
             num_faces=num_faces,
             embedding_dim=uv_dim
-        )
-        
-        # CubeDiff concatenates a 1-channel binary mask to the 4-channel latent map before UV positional encoding. 
-        # This tells the model which faces (or regions) to preserve during denoising . 
-        # Without it, the network simply learns an unconditional prior and will ignore the given text prompt.
-        # — 5) Patch conv_in to accept UV + mask channels
-        in_ch   = self.base_unet.conv_in.in_channels    # originally 4
-        mask_ch = 1
-        out_ch  = self.base_unet.conv_in.out_channels
-        kernel, stride, pad = (
-            self.base_unet.conv_in.kernel_size,
-            self.base_unet.conv_in.stride,
-            self.base_unet.conv_in.padding,
-        )
-        new_in = nn.Conv2d(in_ch + uv_dim + mask_ch, out_ch, kernel, stride, pad)
-        with torch.no_grad():
-            # 1) copy original latent→feature weights
-            new_in.weight[:, :in_ch].copy_(self.base_unet.conv_in.weight)
-            # 2) zero-init UV & mask weights so model can learn from scratch
-            new_in.weight[:, in_ch:].zero_()
-            new_in.bias.copy_(self.base_unet.conv_in.bias)
-        new_in = new_in.to(dtype=self.model_dtype, device=self.device)
-        self.base_unet.conv_in = new_in
+        ).to(self.device)  # ensure it lives on GPU as well
 
-        # — 6) Gradient checkpointing on the U-Net
+        # — 6) Patch conv_in to accept [latent(4) + mask(1) + uv_dim] channels
+        old_conv = self.base_unet.conv_in
+        in_ch    = old_conv.in_channels             # typically 4
+        mask_ch  = 1
+        out_ch   = old_conv.out_channels            # typically 320
+        k, s, p  = old_conv.kernel_size, old_conv.stride, old_conv.padding
+
+        new_conv = nn.Conv2d(
+            in_channels=in_ch + mask_ch + uv_dim,
+            out_channels=out_ch,
+            kernel_size=k,
+            stride=s,
+            padding=p,
+            bias=(old_conv.bias is not None),
+        )
+
+        # copy the old latent weights & biases, zero‐init new channels
+        with torch.no_grad():
+            if not skip_weight_copy:
+                new_conv.weight[:, :in_ch].copy_(old_conv.weight)
+            new_conv.weight[:, in_ch:].zero_()
+            if old_conv.bias is not None:
+                new_conv.bias.copy_(old_conv.bias)
+
+        # move the new conv to the same device/dtype
+        new_conv = new_conv.to(device=self.device, dtype=self.model_dtype)
+        self.base_unet.conv_in = new_conv
+
+        # — 7) Enable gradient checkpointing on the U-Net
         self.base_unet.enable_gradient_checkpointing()
 
-        # — 7) Circular padding everywhere
+        # — 8) Switch all convs to circular padding for seamless cubemaps
         for m in self.base_unet.modules():
             if isinstance(m, nn.Conv2d):
                 m.padding_mode = "circular"
 
-        # — 8) Spherical positional & face-ID embeddings (Esteves et al 2021)
-        self.face_emb = nn.Embedding(num_faces, uv_dim)
-        self.sph_emb = nn.Sequential(
+        # — 9) Face-ID & spherical embeddings
+        self.face_emb = nn.Embedding(num_faces,    uv_dim).to(self.device, self.model_dtype)
+        self.sph_emb  = nn.Sequential(
             nn.Linear(2, uv_dim),
             nn.SiLU(),
             nn.Linear(uv_dim, uv_dim),
-        )
-        
+        ).to(self.device, self.model_dtype)
+
     def check_dtypes(self):
         """Debug helper to check tensor dtypes in the model"""
         print("\nChecking dtypes in CubeDiffModel:")
@@ -145,71 +146,99 @@ class CubeDiffModel(nn.Module):
         encoder_hidden_states: torch.Tensor,  # [B,L,D] or [B*6,L,D]
         **kwargs   # ignored                  # Add this to catch extra parameters
     ) -> torch.Tensor:
+        """
+        latents: [B, F, 4, H, W]
+        timesteps: [B*F] or [B] → will be broadcast
+        encoder_hidden_states: [B*F, C_text] or [B, C_text]
+        """
+
+        # ─── 0) Move to correct device & dtype ───
+        latents = latents.to(device=self.device, dtype=self.model_dtype)
+        timesteps = timesteps.to(device=self.device)
+        encoder_hidden_states = encoder_hidden_states.to(
+            device=self.device, dtype=self.model_dtype
+        )
+
+        # unpack shapes
         B, F, C, H, W = latents.shape
-        E = self.positional_encoding.embedding_dim
+        E = self.positional_encoding.embedding_dim  # your uv_dim
+        print(f"architecture.py - cubediffmodel - forward - latents.shape is {latents.shape}, E = {E}, B = {B}, F = {F}, C = {C}, H = {H}, W = {W}")
+        # collapse B×F to batch for conv_in
+        lat = latents.view(B * F, C, H, W)  # [B*F,4,H,W]
+        print(f"architecture.py - cubediffmodel - forward - lat.shape = {lat.shape}, which shoiuld be [B*F,4,H,W]")
 
-        # 1) Add UV enc & flatten → [B*6, C+E, H, W]
-        # tiling of latents and encoder_hidden_states into a [B*F,…]
-        lat = self.positional_encoding(latents)
-        lat = lat.view(B * F, C + E, H, W)
-
-        # — 1.5) Inject face-ID & spherical coords into the UV channels only
-        # Split into original latent channels vs. UV embedding channels
-        orig = lat[:, :C, :, :]              # [B*F, C, H, W]
-        uv   = lat[:, C:, :, :]              # [B*F, E, H, W]
-
-        # face-ID embedding (per face index)
-        face_ids = torch.arange(F, device=lat.device).unsqueeze(0).repeat(B,1).view(-1)
-        fe = self.face_emb(face_ids).view(B*F, E,1,1)
-
-        # spherical coordinate embedding
-        theta = (torch.arange(W, device=lat.device)/W)*2*math.pi - math.pi
-        phi   = (torch.arange(H, device=lat.device)/H)*math.pi
-        th, ph = torch.meshgrid(theta, phi, indexing="xy")
-        coords = torch.stack([th,ph], -1).view(-1, 2)      # [H*W,2]
-        sph_emb = self.sph_emb(coords)                     # [H*W, E]
-        sph = sph_emb.view(1, E, H, W).expand(B*F, -1, -1, -1)
-
-        # add only to the UV slice
-        uv = uv + fe + sph
-
-        # recombine to full [C+E] channel map
-        lat = torch.cat([orig, uv], dim=1)                 # [B*F, C+E, H, W]
-
-        # 2) Tile timesteps if needed → [B*6]
-        if timesteps.dim()==1 and timesteps.numel()==B:
-            timesteps = timesteps.unsqueeze(1).repeat(1, F).view(-1)
-
-        # 3) Tile text embeddings if needed → [B*6, L, D]
-        if encoder_hidden_states.dim()==3 and encoder_hidden_states.size(0)==B:
-            B2, L, D = encoder_hidden_states.shape
+        # …then make sure timesteps and text embeddings are length B*F…
+        if timesteps.ndim == 1 and timesteps.shape[0] == B:
+            # e.g. [2] → [2*6=12]
+            # repeat each timestep for the F faces in that batch
+            timesteps = timesteps.repeat_interleave(F)       # → [B*F]
+        
+        # ——— tile text embeddings to B*F ———
+        # if your encoder_hidden_states came in as [B, C_text]:
+        if encoder_hidden_states.ndim == 2 and encoder_hidden_states.shape[0] == B:
             encoder_hidden_states = (
                 encoder_hidden_states
-                  .unsqueeze(1)     # [B,1,L,D]
-                  .expand(B, F, L, D)
-                  .reshape(B * F, L, D)
+                .unsqueeze(1)               # [B,1,C_text]
+                .expand(-1, F, -1)          # [B,F,C_text]
+                .reshape(B*F, -1)           # [B*F,C_text]
             )
-        elif encoder_hidden_states.size(0) != B * F:
-            raise ValueError(f"Wrong embedding batch: got {encoder_hidden_states.size(0)}, expected {B*F}")
+            
+        # ─── 1) Build the 1-channel mask ───
+        mask = torch.ones((B * F, 1, H, W),
+                        device=self.device,
+                        dtype=self.model_dtype)
 
-        # 4) Call the U-Net with exactly (sample, timestep, encoder_hidden_states)
-        # — cast everything *before* it ever hits the attention kernels —
-        # Right before calling self.base_unet(...), now ensure both the latent inputs (which become the query) 
-        # and the text embeddings (which become key & value) are all torch.bfloat16 on the GPU. 
-        # That satisfies xFormers’ requirement that Q, K, and V share the same dtype.
+        # ─── 2) Face-ID positional embedding ───
+        # make a repeated 0,1,2..F-1 vector of length B*F
+        face_ids = (
+            torch.arange(F, device=self.device)
+                .unsqueeze(0)
+                .repeat(B, 1)
+                .view(-1)
+        )  # [B*F]
+        fe = self.face_emb(face_ids)               # [B*F, E]
+        fe = fe.view(B * F, E, 1, 1).expand(-1, -1, H, W)
+        # [B*F, E, H, W]
 
-        lat = lat.to(dtype=self.model_dtype, device=self.device)
-        encoder_hidden_states = encoder_hidden_states.to(dtype=self.model_dtype, device=self.device)
-        # now we know Q (latents), K,V (k and v are text embedding) all come in as bfloat16
-        # wrap the entire call in an autocast context as a last resort
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=True):
+        # ─── 3) Spherical (u,v) embedding ───
+        # build a single [H,W,2] UV grid on device
+        theta = (torch.arange(W, device=self.device) / W) * 2 * math.pi - math.pi
+        phi   = (torch.arange(H, device=self.device) / H) * math.pi
+        ph, th = torch.meshgrid(phi, theta, indexing="ij")  # both [H,W]
+        coords = torch.stack([th, ph], dim=-1).view(-1, 2)   # [H*W,2]
+
+        # cast them to BF16 so your MLP weights match
+        coords = coords.to(device=self.device, dtype=self.model_dtype)
+
+        # run the small MLP in BF16
+        sph = self.sph_emb(coords)          # [H*W, E]
+
+        # reshape → [E, H, W]
+        sph = sph.view(H, W, E).permute(2, 0, 1)  # [E,H,W]
+
+        # expand to [B*F, E, H, W]
+        sph = sph.unsqueeze(0).expand(B * F, -1, -1, -1)
+
+        # ─── 4) Concatenate into a single 15‐channel tensor ───
+        # order: 4 latent + 1 mask + E faceID + E sph? 
+        # (If you only have one E block total, do latent+mask+fe+sph→ latent+mask+(fe+sph)=4+1+2E)
+        # 4 (latent) + 1 (mask) + E (uv channels)  = 4 + 1 + 9 = 14
+        uv = fe + sph                  # → [B*F, E, H, W]
+        # now cat exactly 4+1+E channels
+        lat_input = torch.cat([lat, mask, uv], dim=1) # → shape: [B*F, 4 + 1 + E, H, W], where E=10, so 4 + 1  + 10 = 15 channels
+        print(f"architecture.py - cubediffmodel - forward - lat_input.shape = {lat_input.shape}, lat shape = {lat.shape}, mask shape = {mask.shape}, uv shape= {uv.shape}, fe shape = {fe.shape}, sph shape = {sph.shape}")
+        
+        # ─── 5) Run UNet under mixed precision ───
+        with torch.autocast("cuda", dtype=self.model_dtype):
             unet_out = self.base_unet(
-                sample=lat,
-                timestep=timesteps,
-                encoder_hidden_states=encoder_hidden_states
-            )
-        out = unet_out.sample  # [B*6, C, H, W]
+                sample=lat_input,  # [B*F,15,H,W]
+                timestep=timesteps, # [B*F], sample (size B*F) and timesteps (size B*F) agree,
+                encoder_hidden_states=encoder_hidden_states, # [B*F, C_text]
+            ).sample  # or `.sample` / `.latent` depending on your version
 
-        # 5) reshape back → [B,6,C,H,W]
-        return out.view(B, F, *out.shape[1:])
+        # ─── 6) Un-flatten back to [B, F, ...] ───
+        out_ch = unet_out.shape[1]
+        unet_out = unet_out.view(B, F, out_ch, H, W)
+
+        return unet_out
 
