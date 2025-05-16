@@ -38,7 +38,7 @@ import bitsandbytes as bnb
 import wandb, psutil
 
 from accelerate import Accelerator
-from accelerate.utils import set_seed
+from accelerate.utils import set_seed, DistributedDataParallelKwargs
 from accelerate.utils import DeepSpeedPlugin
 from diffusers import StableDiffusionPipeline, DDPMScheduler
 
@@ -75,8 +75,12 @@ class CubeDiffTrainer:
         self.mixed_precision = mixed_precision
         self.model_dtype = torch.bfloat16 if mixed_precision == "bf16" else torch.float16
 
+        # 1) Create a DDP kwargs handler that turns on unused-parameter detection
+        ddp_handler = DistributedDataParallelKwargs(find_unused_parameters=True)
+
         self.accelerator = Accelerator(mixed_precision=mixed_precision,
                                        gradient_accumulation_steps=gradient_accumulation_steps,
+                                       kwargs_handlers=[ddp_handler], 
                                     )
 
         # optional offline-wandb
@@ -448,12 +452,15 @@ class CubeDiffTrainer:
                     lat = batch["latent"].to(self.accelerator.device, dtype=self.model_dtype)              # [B,6,4,64,64]
                     ids = batch["input_ids"].to(self.accelerator.device)
                     mask = batch["attention_mask"].to(self.accelerator.device)
-
+                    
+                    print(f"trainer.py - train() - after batch = accelerator.accumulate, lat shape is {lat.shape} and dtype is {lat.dtype}, ids shape is {ids.shape} and dtype is {ids.dtype}, mask shape is {mask.shape} and dtype is {mask.dtype}\n")
+                    
                     noise     = torch.randn_like(lat)
                     timesteps = torch.randint(0,
                                             self.noise_scheduler.config.num_train_timesteps,
                                             (lat.shape[0],), device=lat.device)
                     noisy_lat = self.noise_scheduler.add_noise(lat, noise, timesteps)
+                    print(f"trainer.py - train() - after batch = accelerator.accumulate, noisy_lat shape is {noisy_lat.shape} and dtype is {noisy_lat.dtype}\n")
 
                     with torch.no_grad():
                         txt_emb = self.text_encoder(ids, attention_mask=mask).last_hidden_state

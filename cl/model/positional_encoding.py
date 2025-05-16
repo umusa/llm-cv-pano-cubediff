@@ -139,7 +139,7 @@ from typing import Optional
 class CubemapPositionalEncoding(nn.Module):
     def __init__(self,
                  num_faces: int = 6,
-                 embedding_dim: int = 9,
+                 embedding_dim: int = 10,
                  max_resolution: int = None):
         super().__init__()
         # store params (max_resolution is only for API compatibility)

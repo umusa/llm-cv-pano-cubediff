@@ -180,7 +180,7 @@ class CubeDiffPipeline:
             device=self.device,
             dtype=model_dtype,
         )
-        latents = torch.cat([latents, mask], dim=2)  # → [1,6,5,H/8,W/8]
+        # latents = torch.cat([latents, mask], dim=2)  # → [1,6,5,H/8,W/8]
         print(f"pipeline.py - CubeDiffPipeline - generate() - before Denoise latents, latents shape is {latents.shape}, latents type is {type(latents)}\n")
 
         # Denoise latents
@@ -215,19 +215,27 @@ class CubeDiffPipeline:
         print(f"pipeline.py - CubeDiffPipeline - generate() - after Denoise latents, latents shape is {latents.shape}, latents type is {type(latents)}\n")
         
         # 5) Drop mask before decoding with VAE
-        with torch.no_grad():
-            cube_faces = []
-            for i in range(num_faces):
-                # keep only the 4 latent channels, drop the mask
-                # VAE decode: The VAE always expects exactly 4 latent channels; dropping the mask channel here prevents another shape mismatch.
-                face_latent = latents[0, i, :4].unsqueeze(0)     # → [1,4,H/8,W/8]
-                with torch.amp.autocast(enabled=True, device_type="cuda"):
-                    out = self.vae.decode(face_latent / 0.18215) 
-                cube_faces.append(out.sample[0])                 # → [3, h, w]
+        # with torch.no_grad():
+        #     cube_faces = []
+        #     for i in range(num_faces):
+        #         # keep only the 4 latent channels, drop the mask
+        #         # VAE decode: The VAE always expects exactly 4 latent channels; dropping the mask channel here prevents another shape mismatch.
+        #         face_latent = latents[0, i, :4].unsqueeze(0)     # → [1,4,H/8,W/8]
+        #         with torch.amp.autocast(enabled=True, device_type="cuda"):
+        #             out = self.vae.decode(face_latent / 0.18215) 
+        #         cube_faces.append(out.sample[0])                 # → [3, h, w]
 
-            # Stack cube faces
-            cube_faces = torch.stack(cube_faces, dim=0)  # [6, 3, H, W]
+        # Batch decode rather than Python loop for speed:
+        # assume latents: [1,6,5,H/8,W/8]
+        faces_lat = latents[0, :, :4]            # [6,4,H/8,W/8]
+        faces_lat = faces_lat / 0.18215          # (the standard LDM latent scaling) before decoding
+        with torch.no_grad(), torch.amp.autocast(device_type="cuda"):
+            out = self.vae.decode(faces_lat)     # [6,3,h,w]
+        cube_faces = [out.sample[i] for i in range(6)]
         
+        #     # Stack cube faces
+        cube_faces = torch.stack(cube_faces, dim=0)  # [6, 3, H, W]
+
         # Convert to PIL images
         if output_type == "latent":
             return latents

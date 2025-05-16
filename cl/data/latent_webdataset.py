@@ -144,8 +144,9 @@ def get_dataloader(wds_path, batch_size, data_size, num_workers=8):
 
     def collate_fn(batch):
         latents = torch.stack([b["latent"]         for b in batch], dim=0)  # [B,6,4,H,W]
-        input_ids      = torch.stack([b["input_ids"]      for b in batch], dim=0)
-        attention_mask = torch.stack([b["attention_mask"] for b in batch], dim=0)
+        print(f"latent_webdataset.py - get_dataloader - collate_fn - latents.shape: {latents.shape}")
+        input_ids      = torch.stack([b["input_ids"]      for b in batch], dim=0) # [B,seq_len]
+        attention_mask = torch.stack([b["attention_mask"] for b in batch], dim=0) # [B,seq_len]
         return {
             "latent":         latents,
             "input_ids":      input_ids,

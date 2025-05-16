@@ -82,7 +82,7 @@ class CubeDiffModel(nn.Module):
         k, s, p  = old_conv.kernel_size, old_conv.stride, old_conv.padding
 
         new_conv = nn.Conv2d(
-            in_channels=in_ch + mask_ch + uv_dim,
+            in_channels=in_ch + mask_ch + uv_dim, # in_ch is latent_channels, 4 + 1 + 10 = 15
             out_channels=out_ch,
             kernel_size=k,
             stride=s,
@@ -164,8 +164,8 @@ class CubeDiffModel(nn.Module):
         E = self.positional_encoding.embedding_dim  # your uv_dim
         print(f"architecture.py - cubediffmodel - forward - latents.shape is {latents.shape}, E = {E}, B = {B}, F = {F}, C = {C}, H = {H}, W = {W}")
         # collapse B×F to batch for conv_in
-        lat = latents.view(B * F, C, H, W)  # [B*F,4,H,W]
-        print(f"architecture.py - cubediffmodel - forward - lat.shape = {lat.shape}, which shoiuld be [B*F,4,H,W]")
+        # lat = latents.view(B * F, C, H, W)  # [B*F,4,H,W]
+        # print(f"architecture.py - cubediffmodel - forward - lat.shape = {lat.shape}, which shoiuld be [B*F,4,H,W]")
 
         # …then make sure timesteps and text embeddings are length B*F…
         if timesteps.ndim == 1 and timesteps.shape[0] == B:
@@ -175,18 +175,42 @@ class CubeDiffModel(nn.Module):
         
         # ——— tile text embeddings to B*F ———
         # if your encoder_hidden_states came in as [B, C_text]:
+        # handle both [B, C_text]  and  [B, seq_len, C_text]
         if encoder_hidden_states.ndim == 2 and encoder_hidden_states.shape[0] == B:
+            # single‐vector conditioning → repeat per face
             encoder_hidden_states = (
                 encoder_hidden_states
                 .unsqueeze(1)               # [B,1,C_text]
                 .expand(-1, F, -1)          # [B,F,C_text]
                 .reshape(B*F, -1)           # [B*F,C_text]
             )
+        elif encoder_hidden_states.dim() == 3 and encoder_hidden_states.shape[0] == B:
+            # per‐token conditioning → repeat per face
+            seq_len, C_text = encoder_hidden_states.shape[1], encoder_hidden_states.shape[2]
+            encoder_hidden_states = (
+                encoder_hidden_states
+                .unsqueeze(1)                           # [B,1,seq_len,C_text]
+                .expand(-1, F, -1, -1)                 # [B,F,seq_len,C_text]
+                .reshape(B*F, seq_len, C_text)         # [B*F,seq_len,C_text]
+            )
+        
             
         # ─── 1) Build the 1-channel mask ───
-        mask = torch.ones((B * F, 1, H, W),
-                        device=self.device,
-                        dtype=self.model_dtype)
+        # mask = torch.ones((B * F, 1, H, W),
+        #                 device=self.device,
+        #                 dtype=self.model_dtype)
+
+        lat_view = latents.view(B * F, C, H, W)
+        if C == 5:
+            # loader already gave us a [4 + 1] split
+            lat, mask = lat_view.split([4,1], dim=1)
+            print(f"architecture.py - cubediffmodel - forward - C = {C}, lat.shape = {lat.shape}, mask.shape = {mask.shape}")
+        else:
+            # fallback for pure‐latent input
+            # add a 1‐channel image-mask 
+            lat = lat_view
+            mask = torch.ones((B * F, 1, H, W), device=self.device, dtype=self.model_dtype)
+            print(f"architecture.py - cubediffmodel - forward - C = {C}, lat.shape = {lat.shape}, mask.shape = {mask.shape}")
 
         # ─── 2) Face-ID positional embedding ───
         # make a repeated 0,1,2..F-1 vector of length B*F
