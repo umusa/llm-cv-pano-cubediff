@@ -67,6 +67,11 @@ class CubeDiffModel(nn.Module):
         replace_group_norms(self.base_unet, in_place=True)
         assert not any(isinstance(m, nn.GroupNorm) for m in self.base_unet.modules()), \
             "GroupNorm still present!"
+        
+        # Ensure all other layers remain frozen; This guarantees nothing outside the intended layers is drifting.
+        for name, p in self.base_unet.named_parameters():
+            if "inflated_attn" not in name and "sync_group_norm" not in name:
+                p.requires_grad_(False)
 
         # — 5) Positional encoding (UV channels)
         self.positional_encoding = CubemapPositionalEncoding(
@@ -163,9 +168,12 @@ class CubeDiffModel(nn.Module):
         B, F, C, H, W = latents.shape
         E = self.positional_encoding.embedding_dim  # your uv_dim
         print(f"architecture.py - cubediffmodel - forward - latents.shape is {latents.shape}, E = {E}, B = {B}, F = {F}, C = {C}, H = {H}, W = {W}")
-        # collapse B×F to batch for conv_in
-        # lat = latents.view(B * F, C, H, W)  # [B*F,4,H,W]
-        # print(f"architecture.py - cubediffmodel - forward - lat.shape = {lat.shape}, which shoiuld be [B*F,4,H,W]")
+        
+        # 1) Add UV enc & flatten → [B*6, C+E, H, W]
+        # tiling of latents and encoder_hidden_states into a [B*F,…]
+        lat = self.positional_encoding(latents)
+        # get the UV embedding channels
+        uv  = lat[:, C:, :, :]              # [B*F, E, H, W]
 
         # …then make sure timesteps and text embeddings are length B*F…
         if timesteps.ndim == 1 and timesteps.shape[0] == B:
@@ -174,7 +182,7 @@ class CubeDiffModel(nn.Module):
             timesteps = timesteps.repeat_interleave(F)       # → [B*F]
         
         # ——— tile text embeddings to B*F ———
-        # if your encoder_hidden_states came in as [B, C_text]:
+        # if encoder_hidden_states came in as [B, C_text]:
         # handle both [B, C_text]  and  [B, seq_len, C_text]
         if encoder_hidden_states.ndim == 2 and encoder_hidden_states.shape[0] == B:
             # single‐vector conditioning → repeat per face
@@ -192,25 +200,13 @@ class CubeDiffModel(nn.Module):
                 .unsqueeze(1)                           # [B,1,seq_len,C_text]
                 .expand(-1, F, -1, -1)                 # [B,F,seq_len,C_text]
                 .reshape(B*F, seq_len, C_text)         # [B*F,seq_len,C_text]
-            )
-        
+            )        
             
         # ─── 1) Build the 1-channel mask ───
-        # mask = torch.ones((B * F, 1, H, W),
-        #                 device=self.device,
-        #                 dtype=self.model_dtype)
-
-        lat_view = latents.view(B * F, C, H, W)
-        if C == 5:
-            # loader already gave us a [4 + 1] split
-            lat, mask = lat_view.split([4,1], dim=1)
-            print(f"architecture.py - cubediffmodel - forward - C = {C}, lat.shape = {lat.shape}, mask.shape = {mask.shape}")
-        else:
-            # fallback for pure‐latent input
-            # add a 1‐channel image-mask 
-            lat = lat_view
-            mask = torch.ones((B * F, 1, H, W), device=self.device, dtype=self.model_dtype)
-            print(f"architecture.py - cubediffmodel - forward - C = {C}, lat.shape = {lat.shape}, mask.shape = {mask.shape}")
+        lat = latents.view(B * F, C, H, W)
+        # add a 1‐channel image-mask 
+        mask = torch.ones((B * F, 1, H, W), device=self.device, dtype=self.model_dtype)
+        print(f"architecture.py - cubediffmodel - forward - add a 1‐channel image-mask - C = {C}, lat.shape = {lat.shape}, mask.shape = {mask.shape}")
 
         # ─── 2) Face-ID positional embedding ───
         # make a repeated 0,1,2..F-1 vector of length B*F
@@ -221,14 +217,13 @@ class CubeDiffModel(nn.Module):
                 .view(-1)
         )  # [B*F]
         fe = self.face_emb(face_ids)               # [B*F, E]
-        fe = fe.view(B * F, E, 1, 1).expand(-1, -1, H, W)
-        # [B*F, E, H, W]
+        fe = fe.view(B * F, E, 1, 1).expand(-1, -1, H, W)  # [B*F, E, H, W]        
 
         # ─── 3) Spherical (u,v) embedding ───
         # build a single [H,W,2] UV grid on device
-        theta = (torch.arange(W, device=self.device) / W) * 2 * math.pi - math.pi
-        phi   = (torch.arange(H, device=self.device) / H) * math.pi
-        ph, th = torch.meshgrid(phi, theta, indexing="ij")  # both [H,W]
+        theta = (torch.arange(W, device=self.device) / W) * 2 * math.pi - math.pi # make theta [-pi , +pi]
+        phi   = (torch.arange(H, device=self.device) / H) * math.pi # make phi [0, pi]
+        ph, th = torch.meshgrid(phi, theta, indexing="ij")  # both [H,W], Spherical meshgrid
         coords = torch.stack([th, ph], dim=-1).view(-1, 2)   # [H*W,2]
 
         # cast them to BF16 so your MLP weights match
@@ -243,14 +238,15 @@ class CubeDiffModel(nn.Module):
         # expand to [B*F, E, H, W]
         sph = sph.unsqueeze(0).expand(B * F, -1, -1, -1)
 
+        print(f"architecture.py - cubediffmodel - forward - before uv += fe + sph  - uv.shape = {uv.shape}, sph.shape = {sph.shape}, fe.shape = {fe.shape}, lat.shape = {lat.shape}, mask.shape = {mask.shape}")
+        
         # ─── 4) Concatenate into a single 15‐channel tensor ───
-        # order: 4 latent + 1 mask + E faceID + E sph? 
-        # (If you only have one E block total, do latent+mask+fe+sph→ latent+mask+(fe+sph)=4+1+2E)
-        # 4 (latent) + 1 (mask) + E (uv channels)  = 4 + 1 + 9 = 14
-        uv = fe + sph                  # → [B*F, E, H, W]
+        # order: 4 latent + 1 mask + E (faceID emb + sphere emb + uv emb) 
+        # 4 (latent) + 1 (mask) + E (uv channels)  = 4 + 1 + 10 = 15 channels
+        uv += fe + sph                  # → [B*F, E, H, W]
         # now cat exactly 4+1+E channels
-        lat_input = torch.cat([lat, mask, uv], dim=1) # → shape: [B*F, 4 + 1 + E, H, W], where E=10, so 4 + 1  + 10 = 15 channels
-        print(f"architecture.py - cubediffmodel - forward - lat_input.shape = {lat_input.shape}, lat shape = {lat.shape}, mask shape = {mask.shape}, uv shape= {uv.shape}, fe shape = {fe.shape}, sph shape = {sph.shape}")
+        lat_input = torch.cat([lat, mask, uv], dim=1) # → shape: [B*F, 4 + 1 + E, H, W] ([12, 15, 64, 64]), where E=10, so 4 + 1  + 10 = 15 channels
+        print(f"architecture.py - cubediffmodel - forward - after uv += fe + sph and torch.cat([lat, mask, uv], dim=1)  - lat_input.shape = {lat_input.shape}, encoder_hidden_states.shape = {encoder_hidden_states.shape}")
         
         # ─── 5) Run UNet under mixed precision ───
         with torch.autocast("cuda", dtype=self.model_dtype):

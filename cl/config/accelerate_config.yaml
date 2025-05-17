@@ -8,7 +8,7 @@ compute_environment: LOCAL_MACHINE
 distributed_type: MULTI_GPU
 
 # 3) How many GPUs (processes) in total?
-num_processes: 1
+num_processes: 8
 
 # 4) How many machines, and which one is this?
 num_machines: 1

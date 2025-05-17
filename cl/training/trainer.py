@@ -412,12 +412,17 @@ class CubeDiffTrainer:
         global_batch = bs_per_gpu * accum_steps * world_size
         true_steps   = math.ceil(train_size * epochs / global_batch)
 
+        # LR schedule -------------------------------------
         # then override your config:
         # sched = CosineAnnealingLR(optim, T_max=true_steps)
         # sched = CosineAnnealingLR(optim, T_max=true_steps, eta_min=1e-6)
-        warmup     = self.config.get("warmup_steps", 1000)
+        # warmup     = self.config.get("warmup_steps", 1000)
         # optim, sched = self.accelerator.prepare(optim, sched)
-        sched = get_linear_schedule_with_warmup( optim,  num_warmup_steps=warmup, num_training_steps=true_steps)
+        # sched = get_linear_schedule_with_warmup( optim,  num_warmup_steps=warmup, num_training_steps=true_steps)
+        # ------------------------------------------------
+        sched = CosineAnnealingLR(optim, T_max=true_steps)
+        optim, sched = self.accelerator.prepare(optim, sched)
+        # ------------------------------------------------
 
         sample_prompts        = ["A beautiful mountain lake at sunset with snow-capped peaks"]
         print(f"trainer.py - CubeDiffTrainer - train - sample_prompts is {sample_prompts}\n")
@@ -508,14 +513,14 @@ class CubeDiffTrainer:
                     # rather than erroring out.
                     if noise.size(2) != pred.size(2):
                         noise = noise[:, :, : pred.size(2), :, :]
-                    mse_loss = F.mse_loss(pred.float(), noise.float())
+                    mse_loss = F.mse_loss(pred.float(), noise.float()).mean()
 
                     # boundary loss
                     # Without enough weight on seam and perceptual terms, the model ignores overlap learning; and running VGG in bf16 loses detail.
                     # boundary loss (upweight to 1.0 to really force seam consistency)
                     # it is faithful to CubeDiff’s paper (§3.2–3.4) and its ablations (A.11), 
                     # and they mesh with industry best practices in multi-view diffusion and low-rank adaptation.
-                    bdy = self.boundary_loss(pred) * self.config.get("boundary_weight", 1.0)
+                    bdy = self.boundary_loss(pred).mean() * self.config.get("boundary_weight", 1.0)
 
                     # ── Perceptual loss in FULL FP32 ──
                     # Disable autocast so VGG stays in FP32 and gradients are stable.
@@ -526,10 +531,11 @@ class CubeDiffTrainer:
                         # Perceptual features & L1 in FP32
                         fp = self.perceptual_net(pred_rgb)
                         ft = self.perceptual_net(true_rgb)
-                        perc = self.l1(fp, ft) * self.config.get("perceptual_weight", 0.1)
+                        perc = self.l1(fp, ft).mean() * self.config.get("perceptual_weight", 0.1)
 
                     # Ensure all three terms are FP32 before summing
                     loss = mse_loss.float() + bdy.float() + perc.float()
+                    # loss = mse_loss.float()
                     
                     # collect loss                    
                     self.accelerator.backward(loss)  # ← compute gradients
@@ -559,7 +565,7 @@ class CubeDiffTrainer:
                             avg_train_loss = (loss_sum / loss_count).item()
                             total_processed_samples = total_processed_samples.item()
                             train_losses.append((total_processed_samples, avg_train_loss))
-
+                            print(f"\t\tRank {rank} → Update done (sync_gradients={self.accelerator.sync_gradients}) for epoch {epoch}, global_iter {self.global_iter}, total_processed_samples is {total_processed_samples}")
                         # Log LoRA adapter weight stats to verify fine-tuning —
                         # if (self.global_iter%self.config["log_lora_every_n_steps"])==0:
                             # print(f"\t\tRank {rank} - trainer.py - CubeDiffTrainer - train - log lora - epoch {epoch} - self.global_iter is {self.global_iter}")
@@ -867,10 +873,10 @@ class CubeDiffTrainer:
                 # our `noise` still has 5 (4 + mask). Drop the mask so shapes align.
                 if noise.size(2) != pred.size(2):
                     noise = noise[:, :, : pred.size(2), :, :]
-                mse_loss = F.mse_loss(pred.float(), noise.float())
+                mse_loss = F.mse_loss(pred.float(), noise.float()).mean()
 
                 # 2) boundary (exact same boundary_loss as in train())
-                bdy = self.boundary_loss(pred.float()) * self.config.get("boundary_weight", 0.1)
+                bdy = self.boundary_loss(pred.float()).mean() * self.config.get("boundary_weight", 0.1)
                 # print(f"trainer.py - evaluate() - after pred = self.model, bdy is {bdy}\n")
 
                 # 3) perceptual
@@ -881,9 +887,10 @@ class CubeDiffTrainer:
                     true_rgb = self.decode_latents_to_rgb(noise)
                     fp = self.perceptual_net(pred_rgb)
                     ft = self.perceptual_net(true_rgb)
-                    perc = self.l1(fp, ft) * self.config.get("perceptual_weight", 0.1)
+                    perc = self.l1(fp, ft).mean() * self.config.get("perceptual_weight", 0.1)
 
-                loss = mse_loss + bdy + perc
+                loss = mse_loss.float() + bdy.float() + perc.float()
+                # loss = mse_loss.float()
                 total_loss   += loss.item() * lat.size(0)
                 total_samples+= lat.size(0)
                 # print(f"trainer.py - evaluate() - after pred = self.model, total_loss is {total_loss}, total_sample is {total_samples}\n")
