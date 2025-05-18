@@ -23,7 +23,8 @@ class CubeDiffPipeline:
         # Load base SD pipeline
         self.pipeline = StableDiffusionPipeline.from_pretrained(
             pretrained_model_name,
-            torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+            # torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+            torch_dtype=torch.bfloat16 if device == "cuda" else torch.float32,
         )
         self.pipeline.to(device)
         

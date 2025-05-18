@@ -76,11 +76,11 @@ class CubeDiffTrainer:
         self.model_dtype = torch.bfloat16 if mixed_precision == "bf16" else torch.float16
 
         # 1) Create a DDP kwargs handler that turns on unused-parameter detection
-        ddp_handler = DistributedDataParallelKwargs(find_unused_parameters=True)
+        # ddp_handler = DistributedDataParallelKwargs(find_unused_parameters=True)
 
         self.accelerator = Accelerator(mixed_precision=mixed_precision,
                                        gradient_accumulation_steps=gradient_accumulation_steps,
-                                       kwargs_handlers=[ddp_handler], 
+                                    #    kwargs_handlers=[ddp_handler], 
                                     )
 
         # optional offline-wandb
@@ -415,13 +415,13 @@ class CubeDiffTrainer:
         # LR schedule -------------------------------------
         # then override your config:
         # sched = CosineAnnealingLR(optim, T_max=true_steps)
-        # sched = CosineAnnealingLR(optim, T_max=true_steps, eta_min=1e-6)
-        # warmup     = self.config.get("warmup_steps", 1000)
-        # optim, sched = self.accelerator.prepare(optim, sched)
-        # sched = get_linear_schedule_with_warmup( optim,  num_warmup_steps=warmup, num_training_steps=true_steps)
-        # ------------------------------------------------
-        sched = CosineAnnealingLR(optim, T_max=true_steps)
+        sched = CosineAnnealingLR(optim, T_max=true_steps, eta_min=1e-6)
+        warmup     = self.config.get("warmup_steps", 1000)
         optim, sched = self.accelerator.prepare(optim, sched)
+        sched = get_linear_schedule_with_warmup( optim,  num_warmup_steps=warmup, num_training_steps=true_steps)
+        # ------------------------------------------------
+        # sched = CosineAnnealingLR(optim, T_max=true_steps)
+        # optim, sched = self.accelerator.prepare(optim, sched)
         # ------------------------------------------------
 
         sample_prompts        = ["A beautiful mountain lake at sunset with snow-capped peaks"]
@@ -566,14 +566,7 @@ class CubeDiffTrainer:
                             total_processed_samples = total_processed_samples.item()
                             train_losses.append((total_processed_samples, avg_train_loss))
                             print(f"\t\tRank {rank} → Update done (sync_gradients={self.accelerator.sync_gradients}) for epoch {epoch}, global_iter {self.global_iter}, total_processed_samples is {total_processed_samples}")
-                        # Log LoRA adapter weight stats to verify fine-tuning —
-                        # if (self.global_iter%self.config["log_lora_every_n_steps"])==0:
-                            # print(f"\t\tRank {rank} - trainer.py - CubeDiffTrainer - train - log lora - epoch {epoch} - self.global_iter is {self.global_iter}")
-                            # self.lora_logger.record_batch(self.model, self.accelerator, self.global_iter)
-                            # if self.accelerator.is_main_process:
-                                # self.lora_logger.plot_up_to(self.global_iter, total_processed_samples)
-                                # print(f"\t\tRank {rank} - train - self.lora_logger.record_batch done for epoch {epoch}, self.global_iter { self.global_iter}, plot_up_to done")
-
+                        
                         # 1) gradient clipping
                         self.accelerator.clip_grad_norm_(self.model.parameters(), 1.0)
 

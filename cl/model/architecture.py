@@ -47,8 +47,9 @@ class CubeDiffModel(nn.Module):
         self.base_unet = self.base_unet.to("cuda", dtype=self.model_dtype)
         self.device    = next(self.base_unet.parameters()).device
 
-        # — 3) Inflate only the UNet’s self‐attention layers
+        # — 3) Inflate Stable Diffusion’s (only the UNet’s self‐attention) layers → cross‐face Attention  
         for name, module in list(self.base_unet.named_modules()):
+            # Only inflate Stable Diffusion’s ention _self_-attention, skip text cross-attention
             if isinstance(module, Attention) and module.cross_attention_dim is None:
                 parent = self.base_unet
                 parts  = name.split(".")
@@ -59,7 +60,7 @@ class CubeDiffModel(nn.Module):
                     parts[-1],
                     inflate_attention_layer(
                         original_attn=module,
-                        skip_copy=skip_weight_copy
+                        skip_copy=skip_weight_copy # keep memory footprint low and training fast for 4 bit config at UNet2DConditionModel
                     )
                 )
 
@@ -94,15 +95,26 @@ class CubeDiffModel(nn.Module):
             padding=p,
             bias=(old_conv.bias is not None),
         )
-
+        
+        # -----------------------------------------------------------
         # copy the old latent weights & biases, zero‐init new channels
+        # with torch.no_grad():
+        #     if not skip_weight_copy:
+        #         new_conv.weight[:, :in_ch].copy_(old_conv.weight)
+        #     new_conv.weight[:, in_ch:].zero_()
+        #     if old_conv.bias is not None:
+        #         new_conv.bias.copy_(old_conv.bias)
+        # -----------------------------------------------------------
+        
+        # copy the old latent weights & biases, zero‐init new channels
+        # if no copy, the panorama will be noisy colors even trained for 12k+ data samples
         with torch.no_grad():
-            if not skip_weight_copy:
-                new_conv.weight[:, :in_ch].copy_(old_conv.weight)
+            # 1) copy original latent→feature weights
+            new_conv.weight[:, :in_ch].copy_(self.base_unet.conv_in.weight)
+            # 2) zero-init UV & mask weights so model can learn from scratch
             new_conv.weight[:, in_ch:].zero_()
-            if old_conv.bias is not None:
-                new_conv.bias.copy_(old_conv.bias)
-
+            new_conv.bias.copy_(self.base_unet.conv_in.bias)
+        
         # move the new conv to the same device/dtype
         new_conv = new_conv.to(device=self.device, dtype=self.model_dtype)
         self.base_unet.conv_in = new_conv
@@ -116,7 +128,7 @@ class CubeDiffModel(nn.Module):
                 m.padding_mode = "circular"
 
         # — 9) Face-ID & spherical embeddings
-        self.face_emb = nn.Embedding(num_faces,    uv_dim).to(self.device, self.model_dtype)
+        self.face_emb = nn.Embedding(num_faces, uv_dim).to(self.device, self.model_dtype)
         self.sph_emb  = nn.Sequential(
             nn.Linear(2, uv_dim),
             nn.SiLU(),
@@ -166,7 +178,7 @@ class CubeDiffModel(nn.Module):
 
         # unpack shapes
         B, F, C, H, W = latents.shape
-        E = self.positional_encoding.embedding_dim  # your uv_dim
+        E = self.positional_encoding.embedding_dim  # the uv_dim
         print(f"architecture.py - cubediffmodel - forward - latents.shape is {latents.shape}, E = {E}, B = {B}, F = {F}, C = {C}, H = {H}, W = {W}")
         
         # 1) Add UV enc & flatten → [B*6, C+E, H, W]
@@ -201,7 +213,9 @@ class CubeDiffModel(nn.Module):
                 .expand(-1, F, -1, -1)                 # [B,F,seq_len,C_text]
                 .reshape(B*F, seq_len, C_text)         # [B*F,seq_len,C_text]
             )        
-            
+        elif encoder_hidden_states.size(0) != B * F:
+            raise ValueError(f"architecture.py - architecture.py - Wrong embedding batch: got {encoder_hidden_states.size(0)}, expected {B*F}")
+        
         # ─── 1) Build the 1-channel mask ───
         lat = latents.view(B * F, C, H, W)
         # add a 1‐channel image-mask 

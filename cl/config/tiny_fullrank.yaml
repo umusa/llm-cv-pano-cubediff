@@ -22,7 +22,7 @@ boundary_weight:    1.0
 perceptual_weight:  0.1
 
 # --- training ---------------------------------------------
-num_epochs:          20 # 40 # 18 # 2
+num_epochs:         20 # 40 # 18 # 2
 log_loss_every_n_steps:    1 # 8 # batch_size * gradient_accum_steps
 log_lora_every_n_steps: 1 
 eval_every_n_samples: 50 # 8
@@ -39,4 +39,4 @@ seed:               1337
 # --- quantization / inflation tweaks ----------------------
 # When U-Net is 4-bit, skip copying pretrained weights into the inflated layers
 # (so we avoid all dequantize/view_as hacks).
-skip_weight_copy: true
+skip_weight_copy: false  # if no copy (old latent weights & biases from UNet2DConditionModel), the panorama will be noisy colors even trained for 12k+ data samples
