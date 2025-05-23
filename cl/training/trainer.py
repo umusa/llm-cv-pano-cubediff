@@ -1,5 +1,13 @@
 # -------------  cl/training/trainer.py  --------------------
+#─────────────────────────────────────────────────────────────────────────────
+# Monkey-patch for PyTorch < 2.2, providing get_default_device() so
+# diffusers/transformers pipelines don’t crash on torch.get_default_device()
 import torch
+if not hasattr(torch, "get_default_device"):
+    torch.get_default_device = lambda: ("cuda" if torch.cuda.is_available() else "cpu")
+#─────────────────────────────────────────────────────────────────────────────
+
+# import torch
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.allow_tf32 = True
@@ -29,7 +37,6 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 
 import torch.nn.functional as F
-from torch.optim.lr_scheduler import CosineAnnealingLR
 from torchvision import models
 import bitsandbytes as bnb
 
@@ -38,16 +45,14 @@ import bitsandbytes as bnb
 import wandb, psutil
 
 from accelerate import Accelerator
-from accelerate.utils import set_seed, DistributedDataParallelKwargs
-from accelerate.utils import DeepSpeedPlugin
+from accelerate.utils import set_seed
 from diffusers import StableDiffusionPipeline, DDPMScheduler
 
 from cl.data.latent_webdataset import get_dataloader
 from cl.model.architecture   import CubeDiffModel
 
 from diffusers import UNet2DConditionModel
-from transformers import get_linear_schedule_with_warmup
-# from peft import TaskType
+from transformers import get_cosine_schedule_with_warmup, get_wsd_schedule # (2025-5-18 this made LR be exactly 0 after 29 steps, why ?)
 import tarfile
 
 # -----------------------------------------------------------
@@ -93,45 +98,49 @@ class CubeDiffTrainer:
 
         # build model / VAE / text-enc once
         self.setup_model(pretrained_model_name)
+        print(f"trainer.py - CubeDiffTrainer - init - setup_model {pretrained_model_name} done\n")
+        
+        from torchvision.models import VGG16_Weights
 
-        # ── PERCEPTUAL & BOUNDARY LOSS SETUP ──
-        # Without enough weight on seam and perceptual terms, the model ignores overlap learning; and running VGG in bf16 loses detail.
-        # The VGG16 perceptual network, however, must stay in full precision to provide stable gradient signals for texture and seam consistency
-        # run VGG in full-precision for stable texture/perceptual gradients
-        # it is faithful to CubeDiff’s paper (§3.2–3.4) and its ablations (A.11), 
-        # and they mesh with industry best practices in multi-view diffusion and low-rank adaptation.
-        self.perceptual_net = models.vgg16(pretrained=True).features[:16].eval().to(torch.float32)
+        def safe_vgg16(pretrained=True, **kwargs):
+            # 1) try loading from local torchvision cache
+            try:
+                # new-style API will look in ~/.cache/torch/hub/checkpoints first
+                return models.vgg16(weights=VGG16_Weights.DEFAULT, **kwargs)
+            except Exception:
+                # 2) fallback to original pretrained=True (which may download)
+                return models.vgg16(pretrained=pretrained, **kwargs)
+
+        self.perceptual_net = safe_vgg16().features[:16].eval().to(torch.float32)
+
+
         for p in self.perceptual_net.parameters():
             p.requires_grad = False
         self.l1 = torch.nn.L1Loss()
-
-        # self.lora_logger = LoRALogger(
-        #     output_dir=Path(self.config["output_dir"]) / "lora_logs"
-        # )
+        print(f"trainer.py - CubeDiffTrainer - init - vgg16 loading done")
         self.global_iter = 0
     
-    # --------------------------------------------------
-    #  Model & tokenizer (unchanged except for LoRA hook)
-    # --------------------------------------------------
-        
     def setup_model(self, pretrained_model_name: str):
-        # Note: This import should be done only once
-        # Import the patching module - this applies the patches automatically
-        # filter out unneeded arguments for forward() of peft
-        # Note: This import should be done only once
-        # try:
-        #     print(f"trainer.py - CubeDiffTrainer - setup - importing peft_patch")
-        #     from cl.training import peft_patch  # This is the revised_peft_patch.py you created
-        # except ImportError:
-        #     print("⚠️ peft_patch module not found, continuing without patching")
-            
-        # 1) Load stable-diffusion pipeline just to grab VAE & text-encoder
-        pipe = StableDiffusionPipeline.from_pretrained(
+
+        def safe_pipeline_from_pretrained(repo_id, **kwargs):
+            # 1) try *only* local cache
+            try:
+                return StableDiffusionPipeline.from_pretrained(
+                    repo_id,
+                    local_files_only=True,
+                    **kwargs
+                )
+            except (OSError, ValueError):
+                # 2) fallback to the normal download→cache path
+                return StableDiffusionPipeline.from_pretrained(repo_id, **kwargs)
+
+        pipe = safe_pipeline_from_pretrained(
             pretrained_model_name,
             torch_dtype=torch.bfloat16,
-            # revision="fp16", # 2025-5-1 Invalid rev id: fp16.
             use_safetensors=True,
         )
+
+        print(f"trainer.py - CubeDiffTrainer - setup_model - StableDiffusionPipeline model ({pretrained_model_name}) loaded\n")
         # freeze VAE + text encoder
         self.vae          = pipe.vae.eval().requires_grad_(False)
         self.text_encoder = pipe.text_encoder.eval().requires_grad_(False)
@@ -150,20 +159,17 @@ class CubeDiffTrainer:
             pretrained_model_name,
             skip_weight_copy=self.config["skip_weight_copy"]
         )
-        # ─── Move the *entire* CubeDiffModel onto GPU ───
-        # This ensures positional_encoding, attention layers, etc. all live on self.device
-        # self.model = self.model.to(self.device)
-
+        
         # That will reproduce the CubeDiff authors’ ∼17 M trainable parameters and ensure meaningful gradients.
-        # — 3.A: drop LoRA; enable full-rank tuning on only the inflated-attn layers
+        #  enable full-rank tuning on only the inflated-attn layers
         for name, p in self.model.base_unet.named_parameters():
             # keep only the Q/K/V/O projections trainable
-            # UNet was loaded in 4-bit quantized form (int4/int8 tensors), and you then try to call p.requires_grad = True on those integer-typed weights. 
             # Only floating-point Tensors can track gradients.
             if p.dtype.is_floating_point and any(seg in name for seg in ("to_q", "to_k", "to_v", "to_out")):
                 p.requires_grad = True
             else:
                 p.requires_grad = False
+        print(f"trainer.py - CubeDiffTrainer - setup_model - UNet model parameters set to requires_grad for full rank tunning\n")
         # quick sanity check
         total, trainable = 0, 0
         for p in self.model.base_unet.parameters():
@@ -172,68 +178,6 @@ class CubeDiffTrainer:
                 trainable += p.numel()
         print(f"👉 Full-rank tuning: {trainable/1e6:.2f}M / {total/1e6:.1f}M params")
 
-        # -------------------------------------------------------
-        # 4) Inject LoRA *only* into the UNet backbone
-        # unet = self.model.base_unet
-
-        # # stub prepare_inputs_for_generation(sample, timestep, encoder_hidden_states)
-        # if not hasattr(unet, "prepare_inputs_for_generation"):
-        #     def _prepare_inputs_for_generation(self, sample, timestep, encoder_hidden_states, **kwargs):
-        #         return {
-        #             "sample": sample,
-        #             "timestep": timestep,
-        #             "encoder_hidden_states": encoder_hidden_states
-        #         }
-        #     unet.prepare_inputs_for_generation = types.MethodType(
-        #         _prepare_inputs_for_generation, unet
-        #     )
-
-        # # stub _prepare_encoder_decoder_kwargs_for_generation(decoder_input_ids, **kwargs)
-        # if not hasattr(unet, "_prepare_encoder_decoder_kwargs_for_generation"):
-        #     def _prepare_encoder_decoder_kwargs_for_generation(self, decoder_input_ids, **kwargs):
-        #         # for UNet, we don’t need extra kwargs—return empty dict
-        #         return {}
-        #     unet._prepare_encoder_decoder_kwargs_for_generation = types.MethodType(
-        #         _prepare_encoder_decoder_kwargs_for_generation, unet
-        #     )
-        # reassign back
-        # self.model.base_unet = unet
-        # — end stub —
-        # # -------------------------------------------------------
-
-        # CubeDiff authors fine-tune all ∼17 M inflated-attention weights directly, not adapters. 
-        # The LoRA stats (attach 4) show near-zero updates—which explains the seams and noise in panorama.
-        # 5) Inject PEFT‐LoRA adapters (Hu et al. 2021)
-        # lora_cfg = LoraConfig(
-        #     # If LoRA weight‐std plateaus ~0.02 but grads stay ~1e-6, increase its step size.
-        #     r=self.config.get("lora_r", 4),
-        #     # bump alpha to 32 for larger effective LR in LoRA subspace
-        #     lora_alpha=self.config.get("lora_alpha", 32),
-        #     # That will ensure I am actually injecting adapters into all the Q/K/V and output projections .
-        #     target_modules=[
-        #                     "to_q",       # matches every q-proj Linear/Conv
-        #                     "to_k",       # matches every k-proj
-        #                     "to_v",       # matches every v-proj
-        #                     "to_out.0",   # matches ONLY the Linear inside the ModuleList
-        #                     ],
-        #     lora_dropout=0.05,
-        #     bias="none"            
-        # ) ----------------------------------
-
-        # # PEFT-LoRA: target the first (Linear) element inside each ModuleList
-        # self.model.base_unet = get_peft_model(self.model.base_unet, lora_cfg)
-        # print(f"[LoRA] trainable params: {sum(p.numel() for p in self.model.parameters() if p.requires_grad)}")
-
-        # Ensure all model components use the same precision
-        # Cast all model components to the same dtype
-        # self.model.base_unet = self.model.base_unet.to(dtype=self.model_dtype)
-        # self.model.base_unet = UNet2DConditionModel.from_pretrained(
-        #     pretrained_model_name,
-        #     subfolder="unet",
-        #     torch_dtype=self.model_dtype,          # <— tell HF to load as fp16 or bf16/float32
-        #     revision=self.config.get("revision", None)
-        #     # remove any load_in_4bit / load_in_8bit flags here
-        # )
         self.text_encoder = self.text_encoder.to(dtype=self.model_dtype)
         self.vae = self.vae.to(dtype=self.model_dtype)
 
@@ -242,33 +186,27 @@ class CubeDiffTrainer:
             if isinstance(v, torch.Tensor):
                 setattr(self.noise_scheduler, k, v.to(self.model_dtype))
 
-        # Add debug info
         print(f"trainer.py - CubeDiffTrainer- CubeDiff Model components cast to {self.model_dtype}")
 
-        # cast the adapted UNet to bfloat16 for memory/speed
-        # self.model.base_unet = self.model.base_unet.to(torch.bfloat16)
-
-        # 5) Enable gradient checkpoints and circular padding
-        #   Enable gradient checkpointing on the U-Net backbone only
+        # Enable gradient checkpoints  on the U-Net backbone only and circular padding
+        # if diffusers>=0.18, which shards attention internals to slash peak usage.
         #    (saves ~30–40% memory at the cost of ~10–20% extra compute)
         print(f"trainer.py - CubeDiffTrainer - CubeDiff Model enabled gradient checkpointing\n")
         self.model.base_unet.enable_gradient_checkpointing()
-        # if diffusers>=0.18, which shards attention internals to slash peak usage.
+        
         print(f"trainer.py - CubeDiffTrainer - CubeDiff Model enabled xformers\n")
         self.model.base_unet.enable_xformers_memory_efficient_attention()
         for m in self.model.base_unet.modules():
             if isinstance(m, torch.nn.Conv2d):
                 m.padding_mode = "circular"
 
-        # report
         tot   = sum(p.numel() for p in self.model.parameters())
         train = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         print(f"trainer.py - CubeDiffTrainer - setup_model done - Total params {tot/1e6:.1f}M — LoRA trainable {train/1e6:.2f}M")
 
     # --------------------------------------------------
-    # ✱✱✱  New dataloader creator  (latents, no JPEG)  ✱✱✱
-    # --------------------------------------------------
-    
+    # New dataloader creator  (latents, no JPEG) 
+    # --------------------------------------------------    
     def build_dataloaders(self):
         print(f"trainer.py - CubeDiffTrainer - Building dataloaders with config: {self.config}")
 
@@ -388,41 +326,69 @@ class CubeDiffTrainer:
         total_samples   = self.train_size * num_epochs
         batch_size      = self.config["batch_size"]
         batch_num_per_rank = samples_per_rank // batch_size
+        self.epsion_mse_warmup = num_epochs * 0.1
 
         print(f"trainer.py - CubeDiffTrainer - train data - self.train_size is {self.train_size}, world_size is {world_size}, samples_per_rank is {samples_per_rank}, num_epochs is {num_epochs}, total_samples is {total_samples}, batch_size is {batch_size}, batch_num_per_rank is {batch_num_per_rank}\n")
         # only update the small LoRA adapter params
         lora_params = [p for p in self.model.parameters() if p.requires_grad]
         # ← switch from AdamW to 8-bit Adam for much smaller optimizer state
-        optim = bnb.optim.Adam8bit(
+        self.optimizer = bnb.optim.Adam8bit(
             lora_params,
             lr=self.config["learning_rate"],
             betas=(0.9, 0.95),
-            weight_decay=0.0
+            weight_decay=0.01  # Add weight decay for regularization
         )
         print(f"trainer.py - CubeDiffTrainer - train - optimizer Adam8bit created\n")
 
         # the LR will decay smoothly over exactly the number of updates you actually perform, 
         # instead of “waiting” through 700 steps that never happen
-        train_size    = self.train_size                          # e.g. 700
+        train_size    = self.train_size                          # e.g. 651
         world_size    = self.accelerator.num_processes           # 8
-        bs_per_gpu    = self.config["batch_size"]                # 2
+        # bs_per_gpu    = self.config["batch_size"]                # 2
         accum_steps   = self.config["gradient_accum_steps"]      # 4
-        epochs        = self.config["num_epochs"]                # 18
-
-        global_batch = bs_per_gpu * accum_steps * world_size
-        true_steps   = math.ceil(train_size * epochs / global_batch)
-
+        
         # LR schedule -------------------------------------
+        # 2) local per–GPU batch size
+        local_batch_size = self.train_dataloader.batch_size # 2
+
+        # → global batch size per update
+        global_batch = local_batch_size * world_size * accum_steps # = 64 
+
+        # → how many updates (optimizer.step calls) per epoch
+        self.updates_per_epoch = math.ceil(train_size / global_batch) # ≈11 = 651/64
+        true_steps   = math.ceil(train_size * self.config["num_epochs"] / global_batch) # 220
+
         # then override your config:
-        # sched = CosineAnnealingLR(optim, T_max=true_steps)
-        sched = CosineAnnealingLR(optim, T_max=true_steps, eta_min=1e-6)
-        warmup     = self.config.get("warmup_steps", 1000)
-        optim, sched = self.accelerator.prepare(optim, sched)
-        sched = get_linear_schedule_with_warmup( optim,  num_warmup_steps=warmup, num_training_steps=true_steps)
+        from torch.optim.lr_scheduler import CosineAnnealingLR # SequentialLR, LinearLR, ConstantLR, 
+        self.lr_scheduler  = CosineAnnealingLR(self.optimizer, T_max=true_steps)
+
+        # → total training updates over all epochs
+        self.total_updates = self.updates_per_epoch * self.config["num_epochs"] # ≈220 = 11*20
+
+        # compute the boundary warm-up length exactly as the scheduler
+        boundary_warmup = max(1, int(self.total_updates * 0.1))  # 10% of total updates
+
+        print(f"Scheduler: local_batch_size ={local_batch_size}, global_batch = {global_batch}, updates_per_epoch  = {self.updates_per_epoch}, true_steps  = {true_steps}")
+
+        # ─── DEBUG: print out the very first 50 LR values ───
+        if self.accelerator.is_main_process:
+            import copy
+            tmp = copy.deepcopy(self.lr_scheduler)
+            print(f"debug LR - step 0: {tmp.get_last_lr()[0]:.3e}")  # before any .step()
+
+            # print learning rates for all steps 
+            for i in range(1, true_steps + 1):
+                tmp.step()
+                # if i in check:
+                print(f"step {i:>3}: {tmp.get_last_lr()[0]:.3e}")
         # ------------------------------------------------
-        # sched = CosineAnnealingLR(optim, T_max=true_steps)
-        # optim, sched = self.accelerator.prepare(optim, sched)
-        # ------------------------------------------------
+        
+        # print(f"trainer.py - CubeDiffTrainer - train - lr_scheduler created - self.total_updates {self.total_updates}, num_warmup_steps {num_warmup_steps} - stable_steps {stable_steps} - decay_steps {decay_steps}\n")
+        # now wrap both optimizer and scheduler exactly once
+        self.optimizer, self.lr_scheduler = self.accelerator.prepare(
+            self.optimizer,
+            self.lr_scheduler
+        )        
 
         sample_prompts        = ["A beautiful mountain lake at sunset with snow-capped peaks"]
         print(f"trainer.py - CubeDiffTrainer - train - sample_prompts is {sample_prompts}\n")
@@ -450,8 +416,6 @@ class CubeDiffTrainer:
                     f"\tmicro-batch #{batch_indx}: {micro_bs} samples"
                 )
                 
-                # log_batch_memory(rank, epoch, batch_indx, batch, stage="BEFORE accelerator.accumulate")
-
                 start_tm = time.time()
                 with self.accelerator.accumulate(self.model):
                     lat = batch["latent"].to(self.accelerator.device, dtype=self.model_dtype)              # [B,6,4,64,64]
@@ -475,9 +439,9 @@ class CubeDiffTrainer:
                     # print(f"trainer.py - train() - before pred = self.model, lat shape is {lat.shape} and dtype is {lat.dtype}, noisy_lat shape is {noisy_lat.shape} type is {noisy_lat.dtype}, timesteps is {timesteps}, txt_emb shape is {txt_emb.shape}, type is {txt_emb.dtype}\n")
 
                     # CubeDiff requires randomly dropping each modality 10% of the time during training so the model learns text-only, image-only, 
-                    # and joint modes . Without this, it overfits to always having both conditions and fails to generalize.
+                    # and joint modes. Without this, it overfits to always having both conditions and fails to generalize.
                     # each micro-batch randomly drops text or image conditioning at 10 % each
-                    # — Classifier-Free Guidance drops (§4.5):
+                    # — Classifier-Free Guidance (CFG) drops (§4.5):
                     #   10% drop text, 10% drop image, 80% full cond
                     bs = txt_emb.size(0)
                     rnd = torch.rand(bs, device=txt_emb.device)
@@ -500,42 +464,19 @@ class CubeDiffTrainer:
                     # print(f"trainer.py - train() - after pred = self.model")
 
                     # ── NEW LOSS ──
-                    # The model predicts only the 4 “true” latent channels;
-                    # our `noise` still has 5 (4 + mask). Drop the mask so shapes align.
-                    # reasons: 
-                    # CubeDiff’s U-Net output (pred) has shape [B,6,4,H,W] (only the original 4 latent dims) 
-                    # noise was sampled to match the 5-channel input (latent + mask), giving [B,6,5,H,W].
-                    # By slicing off the last (mask) channel—noise[:, :, :pred.size(2), ...]—you restore a [B,6,4,H,W] tensor that 
-                    # lines up perfectly with pred for the mean-squared‐error.
-                    # benifits:
-                    # keeps your mask channel around for conditioning but prevents it from polluting your denoising loss. After this update, 
-                    # your MSE, boundary, and perceptual losses will all compute correctly, and you’ll begin to see your training curves converge 
-                    # rather than erroring out.
                     if noise.size(2) != pred.size(2):
                         noise = noise[:, :, : pred.size(2), :, :]
+                    
+                    # epsilon mse ------------------------------------------------------------
                     mse_loss = F.mse_loss(pred.float(), noise.float()).mean()
-
-                    # boundary loss
-                    # Without enough weight on seam and perceptual terms, the model ignores overlap learning; and running VGG in bf16 loses detail.
-                    # boundary loss (upweight to 1.0 to really force seam consistency)
-                    # it is faithful to CubeDiff’s paper (§3.2–3.4) and its ablations (A.11), 
-                    # and they mesh with industry best practices in multi-view diffusion and low-rank adaptation.
-                    bdy = self.boundary_loss(pred).mean() * self.config.get("boundary_weight", 1.0)
-
-                    # ── Perceptual loss in FULL FP32 ──
-                    # Disable autocast so VGG stays in FP32 and gradients are stable.
-                    with torch.amp.autocast(device_type="cuda", enabled=False):
-                        # Decode latents → RGB in FP32
-                        pred_rgb = self.decode_latents_to_rgb(pred).float()
-                        true_rgb = self.decode_latents_to_rgb(noise).float()
-                        # Perceptual features & L1 in FP32
-                        fp = self.perceptual_net(pred_rgb)
-                        ft = self.perceptual_net(true_rgb)
-                        perc = self.l1(fp, ft).mean() * self.config.get("perceptual_weight", 0.1)
-
-                    # Ensure all three terms are FP32 before summing
-                    loss = mse_loss.float() + bdy.float() + perc.float()
-                    # loss = mse_loss.float()
+                    if rank==0:
+                        print(f"rank {rank} - epoch {epoch} - gstep is {gstep} - epsion_mse_warmup is {self.epsion_mse_warmup}, mse_loss (mse_epsilon) is {mse_loss.item()}")
+                    
+                    loss = mse_loss.float()  / self.config["gradient_accum_steps"]
+                    
+                    if rank==0:
+                        # print(f"check-loss-terms - rank {rank} - epoch {epoch} - gstep is {gstep} - global_iter is {self.global_iter} - total loss is {loss.item()}, mse_loss is {mse_loss.item()}, bdy is {bdy.item()}, perc is {perc.item()}")
+                        print(f"check-loss-terms - rank {rank} - epoch {epoch} - gstep is {gstep} - global_iter is {self.global_iter} - total loss is {loss.item()}, mse_loss is {mse_loss.item()}")
                     
                     # collect loss                    
                     self.accelerator.backward(loss)  # ← compute gradients
@@ -545,6 +486,7 @@ class CubeDiffTrainer:
                     local_count = torch.tensor(processed_samples, device=self.accelerator.device)
                     total_processed_samples = self.accelerator.reduce(local_count, reduction="sum")
                 
+                    # 2) Only once per actual optimizer step (i.e. when sync_gradients=True):
                     if self.accelerator.sync_gradients:
                         # here all replicas have the fully synchronized, accumulated grads
                         # see each adapter’s true gradient (after accumulation + all‐GPU sync) exactly once per update, 
@@ -567,29 +509,35 @@ class CubeDiffTrainer:
                             train_losses.append((total_processed_samples, avg_train_loss))
                             print(f"\t\tRank {rank} → Update done (sync_gradients={self.accelerator.sync_gradients}) for epoch {epoch}, global_iter {self.global_iter}, total_processed_samples is {total_processed_samples}")
                         
-                        # 1) gradient clipping
-                        self.accelerator.clip_grad_norm_(self.model.parameters(), 1.0)
+                        # 4) Clip gradients
+                        # This prevents any single batch from sending the loss curve on a wild ride.
+                        # Gradient clipping (1.0) is standard in diffusion training to prevent occasional large updates, smoothing out your “bounces” .
+                        self.accelerator.clip_grad_norm_(self.model.parameters(), 0.5)
 
-                        # 2) step the optimizer (handles unscaling, all‐reduce, zero‐grad)
-                        optim.step()
+                        # 5) Apply optimizer update
+                        self.optimizer.step()
+
+                        # 6) Step the LR scheduler (once per real update)
+                        self.lr_scheduler.step()
+
+                        # 2d) Clear gradients for the next accumulation
+                        # zero gradients (optional - can be after or before step)
+                        self.optimizer.zero_grad()
+
+                         # 2e) Increment per‐rank step counter
+                        gstep += 1
                         
-                        # 3) then update your LR scheduler
-                        sched.step() 
+                        #–– print out the LR for the first few updates ––#
+                        if self.accelerator.is_main_process:
+                            lr = self.lr_scheduler.get_last_lr()[0]
+                            print(f"rank {rank}, LR at step {gstep}: {lr:.3e}")
 
-                        # 4) zero gradients (optional - can be after or before step)
-                        optim.zero_grad()   # ← now clear grad for next iteration        
                     # print(f"\t\tRank {rank} - train - after self.accelerator.sync_gradients - epoch {epoch} - self.global_iter is {self.global_iter}")
                     self.global_iter += 1
 
                 end_tm = time.time()
                 print(f"\tRank {rank} - epoch {epoch} - out of accumulate - batch_indx {batch_indx} cost {end_tm - start_tm:.2f} seconds")
-
-                # --- Log after computation ---
-                # log_batch_memory(rank, epoch, batch_indx, batch, stage="AFTER accelerate.accumulate")
-
-                # peak = torch.cuda.max_memory_allocated() / (1024 ** 3)
-                # print(f"\tRank {rank} epoch {epoch} - batch_indx {batch_indx} - gstep {gstep} - time: {end_tm - start_tm:.2f} seconds - Peak CUDA memory this batch: {peak:.2f} GB")
-                    
+    
                 # ---- logging & sampling ----------------              
                 epoch_processed += real_batch_size                
                 pct_epoch = epoch_processed / samples_per_rank * 100
@@ -611,7 +559,7 @@ class CubeDiffTrainer:
                     if eval_every_n_samples:
                         print(f"\tRank {rank} - epoch {epoch} - batch_indx {batch_indx} - eval_every_n_samples is {eval_every_n_samples} - evaluating ...")
                         temp_s_time = time.time()
-                        val_loss = self.evaluate(rank) # this cost some time
+                        val_loss = self.evaluate(rank, gstep, boundary_warmup) # this cost some time
                         temp_e_time = time.time()
                         if self.accelerator.is_main_process:
                             val_losses.append((total_processed_samples, val_loss))
@@ -623,58 +571,19 @@ class CubeDiffTrainer:
                 if self.accelerator.is_main_process:                    
                     # 1) log train loss every N steps
                     if gstep % self.config["log_loss_every_n_steps"] == 0:
-                        self._plot_loss_curves(total_processed_samples, train_losses, val_losses)
+                        self._plot_loss_curves(total_processed_samples, train_losses, val_losses, gstep, self.total_updates)
                         print(f"\tRank {rank} - epoch {epoch} - batch_indx {batch_indx} - plotted loss - gstep {gstep} - self.accelerator.is_main_process is {self.accelerator.is_main_process} - log_loss_every_n_steps is {self.config['log_loss_every_n_steps']} - global_iter is {self.global_iter-1} - batch_size is {batch_size}, samples {processed_samples:>4}  train-loss {loss.item():.4f}")
                     # 2) every `eval_every_n_samples`, first sync _all_ ranks…
                     #  eval + sample‐gen
                     if (eval_every_n_samples and processed_samples >= prev_evaL_at) or (batch_indx == batch_num_per_rank - 1):
-                        # generate panorama from current LoRA checkpoint
+                        # generate panorama from current checkpoints 
                         print(f"\tRank {rank} - epoch {epoch} - batch_indx {batch_indx} - generate_samples ...")
                         temp_s_time = time.time()
                         self.generate_samples(rank, sample_prompts, total_processed_samples)
                         temp_e_time = time.time()
                         print(f"\tRank {rank} - epoch {epoch} - batch_indx {batch_indx} - generate_samples done - cost {temp_e_time - temp_s_time:.2f} seconds")    
                         
-                        # 4) Verify your U-Net’s LoRA adapters are actually updating
-                        # Replace with this more robust version:
-                        unwrapped = self.accelerator.unwrap_model(self.model)
-                        # Check LoRA weights using a more robust approach
-                        try:
-                            # Try different ways to access LoRA parameters
-                            lora_params = None
-                            
-                            # Option 1: Modern PEFT structure
-                            if hasattr(unwrapped.base_unet, "modules_to_save"):
-                                for name, module in unwrapped.base_unet.named_modules():
-                                    if 'lora' in name.lower() and hasattr(module, 'weight') and module.weight.requires_grad:
-                                        lora_params = module.weight
-                                        print(f"\tRank {rank} - epoch {epoch} - batch_indx {batch_indx} - trainer.py - Verify U-Net’s LoRA are actually updating - Found LoRA weight in module: {name}")
-                                        break
-                            
-                            # Option 2: Original approach (fallback)
-                            elif hasattr(unwrapped.base_unet, "lora_layers") and len(unwrapped.base_unet.lora_layers) > 0:
-                                lora_params = unwrapped.base_unet.lora_layers[0].weight
-                                print(f"\tRank {rank} - epoch {epoch} - batch_indx {batch_indx} - trainer.py - Verify U-Net’s LoRA are actually updating - base_unet has lora_layers with size>0")
-
-                            # Option 3: Search for any LoRA-like parameters
-                            else:
-                                for name, param in unwrapped.base_unet.named_parameters():
-                                    if 'lora' in name.lower() and param.requires_grad:
-                                        lora_params = param
-                                        print(f"\tRank {rank} - epoch {epoch} - batch_indx {batch_indx} - Verify U-Net’s LoRA are actually updating - Found LoRA parameter: {name}")
-                                        break
-                            
-                            if lora_params is not None:
-                                w = lora_params.detach().cpu().view(-1)
-                                print(f"\tRank {rank} - epoch {epoch} - batch_indx {batch_indx} - trainer.py - Verify U-Net’s LoRA are actually updating - LoRA weight stats - mean: {w.mean():.6f}  std: {w.std():.6f}")
-                            else:
-                                print("\tRank {rank} - epoch {epoch} - batch_indx {batch_indx} - Warning: Could not find LoRA parameters for logging")
-                                
-                        except Exception as e:
-                            print(f"\tRank {rank} - epoch {epoch} - batch_indx {batch_indx} - train - Verify U-Net’s LoRA are actually updating - Error accessing LoRA parameters: {e}")
-                            print("\tRank {rank} - epoch {epoch} - batch_indx {batch_indx} - train - Verify U-Net’s LoRA are actually updating - Continuing training anyway...")
-
-                gstep += 1
+                # gstep += 1
             g_end_tm = time.time()
             # ----------------- end of training loop ----------------------
             print(f"Rank {rank} - epoch {epoch} - batch_indx {batch_indx} - out of the training loop - all steps done, gstep is {gstep}, self.global_iter is {self.global_iter}, cost {g_end_tm - g_start_tm:.2f} seconds\n")
@@ -779,10 +688,12 @@ class CubeDiffTrainer:
         pipe = CubeDiffPipeline(
             pretrained_model_name="runwayml/stable-diffusion-v1-5"
         )
+        print(f"\t\trank {rank} - generate_samples - got pipeline for runwayml/stable-diffusion-v1-5")
 
         # 2) read your U-Net weights back
         adapter_state = torch.load(tmp_ckpt, map_location="cuda")
-        
+        print(f"\t\trank {rank} - generate_samples - got adapter_state from tmp_ckpt {tmp_ckpt}")
+
         # 3) cast them to the same dtype as the pipeline’s U-Net
         unet_dtype = next(pipe.model.base_unet.parameters()).dtype
         for k, v in adapter_state.items():
@@ -806,11 +717,11 @@ class CubeDiffTrainer:
         print(f"\t\trank {rank} - generate_samples - gstep is {step},  unet tmp_ckpt {tmp_ckpt} was removed")
 
     # ---------------------------------------------------------------------
-    # ✱✱✱  New: run a full pass over val_dataloader and return avg loss. ✱✱✱
+    # New: run a full pass over val_dataloader and return avg loss.
     # reuse boundary_loss helper inside train()
     # and decode_latents_to_rgb + self.perceptual_net    
     
-    def evaluate(self, rank):
+    def evaluate(self, rank, gstep, boundary_warmup):
         """Compute avg. (MSE + boundary + perceptual) loss on the validation set."""
         if self.val_dataloader is None:
             return float("nan")
@@ -865,28 +776,13 @@ class CubeDiffTrainer:
                 # The model predicts only the 4 “true” latent channels;
                 # our `noise` still has 5 (4 + mask). Drop the mask so shapes align.
                 if noise.size(2) != pred.size(2):
-                    noise = noise[:, :, : pred.size(2), :, :]
+                    noise = noise[:, :, : pred.size(2), :, :]                
+
+                # epsilon mse loss 
                 mse_loss = F.mse_loss(pred.float(), noise.float()).mean()
-
-                # 2) boundary (exact same boundary_loss as in train())
-                bdy = self.boundary_loss(pred.float()).mean() * self.config.get("boundary_weight", 0.1)
-                # print(f"trainer.py - evaluate() - after pred = self.model, bdy is {bdy}\n")
-
-                # 3) perceptual
-                # with torch.cuda.amp.autocast(dtype=torch.bfloat16):  # Use the same dtype as the model
-                with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):  # Use the same dtype as the model
-                    # perceptual loss
-                    pred_rgb = self.decode_latents_to_rgb(pred)
-                    true_rgb = self.decode_latents_to_rgb(noise)
-                    fp = self.perceptual_net(pred_rgb)
-                    ft = self.perceptual_net(true_rgb)
-                    perc = self.l1(fp, ft).mean() * self.config.get("perceptual_weight", 0.1)
-
-                loss = mse_loss.float() + bdy.float() + perc.float()
-                # loss = mse_loss.float()
+                loss = mse_loss.float() #  / self.config["gradient_accum_steps"]
                 total_loss   += loss.item() * lat.size(0)
                 total_samples+= lat.size(0)
-                # print(f"trainer.py - evaluate() - after pred = self.model, total_loss is {total_loss}, total_sample is {total_samples}\n")
 
         # 1) make local-sum & count tensors
         device       = self.accelerator.device
@@ -907,11 +803,21 @@ class CubeDiffTrainer:
         self.model.train()        
         return avg
 
-    def _plot_loss_curves(self, total_processed_samples: int, train_losses, val_losses):
-        """Plot & save train/val losses up to `up_to` total_processed_samples."""
+    def _plot_loss_curves(self,
+        total_processed_samples: int,
+        train_losses, val_losses,
+        gstep: int,
+        total_updates: int):
+        """
+        train_losses: list of (samples, loss)
+        val_losses:   list of (samples, loss)
+        gstep:        current number of update steps done so far
+        total_updates: the total number of update steps you plan to run
+        """
         # unpack
         steps_tr, loss_tr = zip(*train_losses) if train_losses else ([],[])
         steps_va, loss_va = zip(*val_losses)   if val_losses   else ([],[])
+
         # coerce EVERY element to a host‐side Python scalar
         steps_tr = [
             int(s.item()) if torch.is_tensor(s) else int(s)
@@ -930,178 +836,43 @@ class CubeDiffTrainer:
             for l in loss_va
         ]
 
-        plt.figure(figsize=(6,4))
-        plt.plot(steps_tr, loss_tr, label="train")
+        fig, ax = plt.subplots(figsize=(6,4))
+        ax.plot(steps_tr, loss_tr, label="train")
         if steps_va:
-            plt.plot(steps_va, loss_va, label="val")
-        plt.title(f"Training & Validation Loss up to {total_processed_samples} samples")
-        plt.xlabel("samples")
-        plt.ylabel("loss")
-        plt.legend()
+            ax.plot(steps_va, loss_va, label="val")
+
+        ax.set_title(
+            f"Loss up to {total_processed_samples} samples\n"
+            f"(update steps so far: {gstep}/{total_updates})"
+        )
+        ax.set_xlabel("samples processed")
+        ax.set_ylabel("loss")
+        ax.legend()
+
+        # ─── mark the current gstep on the samples axis ───
+        if 1 <= gstep <= len(steps_tr):
+            sample_at_gstep = steps_tr[gstep-1]
+            # vertical line at that sample
+            ax.axvline(sample_at_gstep, color="black", linestyle="--", alpha=0.6)
+        else:
+            sample_at_gstep = None
+
+        # ─── now add a twin‐x to label the gstep ───
+        ax2 = ax.twiny()
+        ax2.set_xlim(ax.get_xlim())
+        if sample_at_gstep is not None:
+            ax2.set_xticks([sample_at_gstep])
+            ax2.set_xticklabels([f"gstep={gstep}"])
+        else:
+            # fallback: just show start and end
+            ax2.set_xticks([ax.get_xlim()[0], ax.get_xlim()[1]])
+            ax2.set_xticklabels([f"gstep=0", f"gstep={total_updates}"])
+        ax2.set_xlabel("update steps")
+
         plt.tight_layout()
-        out = self.output_dir / f"loss_curve_up_to_total_processed_examples.png"
+        out = self.output_dir / f"loss_curve_up_to_total_processed_samples.png"
         plt.savefig(out)
-        plt.close()
-        print(f"✔ live loss‐curve up to total_processed_samples {total_processed_samples} → {out}")
-
-import pandas as pd
-import matplotlib.pyplot as plt
-from pathlib import Path
-
-class LoRALogger:
-    def __init__(self, output_dir: str):
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        self._records = []  # will hold one dict per (iter, module)
-
-    def record_batch(self, model, accelerator, iteration: int):
-        """
-        Call once per optimizer.step(): captures all lora_* params in the UNet.
-        iteration: your global iteration counter (e.g. batch_idx + epoch*len(dataloader))
-        """
-        unet = accelerator.unwrap_model(model).base_unet
-        # 1) loop every LoRA param on GPU
-        for full_name, param in unet.named_parameters():
-            if not (param.requires_grad and ".lora_" in full_name):
-                continue
-            module_key = full_name.rsplit(".lora_", 1)[0]
-
-            # 2) local stats on device
-            p_data = param.detach()
-            flat_p = p_data.view(-1)
-            w_mean_t = flat_p.mean()
-            w_std_t  = flat_p.std(unbiased=False)
-
-            if param.grad is not None:
-                g_data = param.grad.detach()
-                flat_g = g_data.view(-1)
-                g_mean_t = flat_g.mean()
-                g_std_t  = flat_g.std(unbiased=False)
-            else:
-                # ensure a tensor for reduction
-                g_mean_t = torch.tensor(float("nan"), device=accelerator.device)
-                g_std_t  = torch.tensor(float("nan"), device=accelerator.device)
-
-            # 3) all-reduce across all GPUs (average)
-            w_mean = accelerator.reduce(w_mean_t, reduction="mean")
-            w_std  = accelerator.reduce(w_std_t,  reduction="mean")
-            g_mean = accelerator.reduce(g_mean_t, reduction="mean")
-            g_std  = accelerator.reduce(g_std_t, reduction="mean")
-
-            # 4) only record on the main process
-            if accelerator.is_main_process:
-                self._records.append({
-                    "iter":      iteration,
-                    "module":    module_key,
-                    "full_name": full_name,
-                    "W_mean":    w_mean.item(),
-                    "W_std":     w_std.item(),
-                    "G_mean":    g_mean.item(),
-                    "G_std":     g_std.item(),
-                })
-
-    def plot_up_to(self, iteration: int, total_processed_samples: int = None):
-        """
-        Re-compute the per-iteration aggregates up to “iteration” (inclusive)
-        and overwrite the four summary plots on disk.
-        """
-        df = pd.DataFrame(self._records)
-        df = df[df["iter"] <= iteration]
-
-        grp = df.groupby("iter")
-        summary = pd.DataFrame({
-            "wmean_mean": grp["W_mean"].mean(),
-            "wmean_std":  grp["W_mean"].std(),
-            "wstd_mean":  grp["W_std"].mean(),
-            "wstd_std":   grp["W_std"].std(),
-            "gmean_mean": grp["G_mean"].mean(),
-            "gmean_std":  grp["G_mean"].std(),
-            "gstd_mean":  grp["G_std"].mean(),
-            "gstd_std":   grp["G_std"].std(),
-        })
-        summary.index.name = "iter"
-        summary.reset_index(inplace=True)
-
-        plots = [
-            (["wmean_mean","wmean_std"], "Weight‐Mean stats", "W_mean"),
-            (["wstd_mean", "wstd_std"],  "Weight‐Std  stats", "W_std"),
-            (["gmean_mean","gmean_std"], "Grad‐Mean   stats", "G_mean"),
-            (["gstd_mean", "gstd_std"],  "Grad‐Std    stats", "G_std"),
-        ]
-        for i, (cols, title, ylabel) in enumerate(plots, 1):
-            fig, ax = plt.subplots(figsize=(8,3))
-            # ax.plot(summary["iter"], summary[cols[0]], label=cols[0])
-            # ax.plot(summary["iter"], summary[cols[1]], label=cols[1])
-            ax.plot(summary["iter"], summary[cols[0]], marker="o", label=cols[0])
-            ax.plot(summary["iter"], summary[cols[1]], marker="x", label=cols[1])
-            ax.set_title(f"{title} up to iter {iteration} with total_processed_samples {total_processed_samples}")
-            ax.set_xlabel("Iteration")
-            ax.set_ylabel(ylabel)
-            ax.legend(loc="upper right", fontsize="small")
-            plt.tight_layout()
-            out = self.output_dir / f"lora_live_plot_{i}.png"
-            fig.savefig(out)
-            plt.close(fig)
-
-    def finalize(self):
-        """Write CSV + four summary plots to disk."""
-        df = pd.DataFrame(self._records)
-        # 1) save raw history
-        csv_path = self.output_dir / "lora_full_history.csv"
-        df.to_csv(csv_path, index=False)
-        # print(f"[LoRALogger] raw history → {csv_path}")
-
-        # 2) compute per-iteration summary
-        grp = df.groupby("iter")
-        summary = pd.DataFrame({
-            "wmean_mean": grp["W_mean"].mean(),
-            "wmean_std":  grp["W_mean"].std(),
-            "wstd_mean":  grp["W_std"].mean(),
-            "wstd_std":   grp["W_std"].std(),
-            "gmean_mean": grp["G_mean"].mean(),
-            "gmean_std":  grp["G_mean"].std(),
-            "gstd_mean":  grp["G_std"].mean(),
-            "gstd_std":   grp["G_std"].std(),
-        })
-        summary.index.name = "iter"
-        summary.reset_index(inplace=True)
-        summary_csv = self.output_dir / "lora_final_summary.csv"
-        summary.to_csv(summary_csv, index=False)
-        print(f"[LoRALogger] summary → {summary_csv}")
-
-        # 3) four plots
-        plots = [
-            (["wmean_mean", "wmean_std"], "Weight‐Mean: mean & std over modules", "W_mean stats"),
-            (["wstd_mean",  "wstd_std"],  "Weight‐Std: mean & std over modules", "W_std stats"),
-            (["gmean_mean", "gmean_std"], "Grad‐Mean: mean & std over modules", "G_mean stats"),
-            (["gstd_mean",  "gstd_std"],  "Grad‐Std: mean & std over modules", "G_std stats"),
-        ]
-        for i, (cols, title, ylabel) in enumerate(plots, start=1):
-            fig, ax = plt.subplots(figsize=(8,3))
-            ax.plot(summary["iter"], summary[cols[0]], label=cols[0])
-            ax.plot(summary["iter"], summary[cols[1]], label=cols[1])
-            ax.set_title(title)
-            ax.set_xlabel("Iteration")
-            ax.set_ylabel(ylabel)
-            ax.legend(loc="upper right", fontsize="small")
-            plt.tight_layout()
-            out_png = self.output_dir / f"lora_final_plot_{i}.png"
-            fig.savefig(out_png)
-            print(f"[LoRALogger] saved {out_png}")
-            plt.close(fig)
-
-
-def log_batch_memory(rank, epoch, batch_indx, batch, stage="BEFORE"):
-    batch_size = batch["latent"].size(0)
-    print(f"\tRank {rank} - epoch {epoch} - Batch {batch_indx}: batch size is {batch_size} - log_batch_memory")
-    print(f"\t\tRank {rank} - latent shape: {batch['latent'].shape}")
-
-    allocated = torch.cuda.memory_allocated() / (1024 ** 3)
-    reserved = torch.cuda.memory_reserved() / (1024 ** 3)
-    cpu_mem = psutil.virtual_memory().used / (1024 ** 3)
-
-    print(f"\t\tRank {rank} - [{stage}] CUDA memory allocated: {allocated:.2f} GB")
-    print(f"\t\tRank {rank} - [{stage}] CUDA memory reserved:  {reserved:.2f} GB")
-    print(f"\t\tRank {rank} - [{stage}] CPU RAM used: {cpu_mem:.2f} GB")
+        plt.close(fig)
+        print(f"✔ saved loss curve → {out}")
 
 # EOF -------------------------------------------------------------------------

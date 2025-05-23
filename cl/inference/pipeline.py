@@ -21,28 +21,68 @@ class CubeDiffPipeline:
         self.device = device
         
         # Load base SD pipeline
-        self.pipeline = StableDiffusionPipeline.from_pretrained(
+        # self.pipeline = StableDiffusionPipeline.from_pretrained(
+        #     pretrained_model_name,
+        #     # torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+        #     torch_dtype=torch.bfloat16 if device == "cuda" else torch.float32,
+        # )
+        # self.pipeline.to(device)        
+
+        def safe_pipeline_from_pretrained(repo_id, **kwargs):
+            # 1) try *only* local cache
+            try:
+                return StableDiffusionPipeline.from_pretrained(
+                    repo_id,
+                    local_files_only=True,
+                    **kwargs
+                )
+            except (OSError, ValueError):
+                # 2) fallback to the normal download→cache path
+                return StableDiffusionPipeline.from_pretrained(repo_id, **kwargs)
+
+        self.pipeline = safe_pipeline_from_pretrained(
             pretrained_model_name,
-            # torch_dtype=torch.float16 if device == "cuda" else torch.float32,
             torch_dtype=torch.bfloat16 if device == "cuda" else torch.float32,
+            use_safetensors=True,
         )
-        self.pipeline.to(device)
-        
+        self.pipeline.to(device)   
+
+        print(f"pipeline.py - CubeDiffPipeline - __init__() - pipeline loaded from {pretrained_model_name} to {device}\n")
         # Extract components
         self.vae = self.pipeline.vae
         self.text_encoder = self.pipeline.text_encoder
         self.tokenizer = self.pipeline.tokenizer
         
         # Set up scheduler
-        self.scheduler = DDIMScheduler.from_pretrained(
-            pretrained_model_name,
+        # self.scheduler = DDIMScheduler.from_pretrained(
+        #     pretrained_model_name,
+        #     subfolder="scheduler",
+        # )
+        # self.scheduler.set_timesteps(50)  # Use 50 steps by default
+
+        def safe_sched_from_pretrained(repo_id, subfolder, **kwargs):
+            # 1) try *only* local cache
+            try:
+                return DDIMScheduler.from_pretrained(
+                    repo_id,
+                    local_files_only=True,
+                    subfolder=subfolder,
+                    **kwargs
+                )
+            except (OSError, ValueError):
+                # 2) fallback to the normal download→cache path
+                return DDIMScheduler.from_pretrained(repo_id, subfolder=subfolder, **kwargs)
+
+        self.scheduler = safe_sched_from_pretrained(
+            repo_id=pretrained_model_name,
             subfolder="scheduler",
         )
         self.scheduler.set_timesteps(50)  # Use 50 steps by default
-        
+        print(f"pipeline.py - CubeDiffPipeline - __init__() - DDIMScheduler loaded from {pretrained_model_name}\n")
+
         # Initialize CubeDiff model
         self.model = CubeDiffModel(pretrained_model_name)
-        
+        print(f"pipeline.py - CubeDiffPipeline - __init__() - CubeDiffModel loaded from {pretrained_model_name}\n")
         # Load checkpoint if provided
         if checkpoint_path:
             state_dict = torch.load(checkpoint_path, map_location="cpu")
@@ -66,7 +106,8 @@ class CubeDiffPipeline:
         
         # Apply fixes for mixed precision inference
         self._fix_for_mixed_precision()
-
+        print(f"pipeline.py - CubeDiffPipeline - __init__() - CubeDiffPipeline initialized\n")
+        
     def _fix_for_mixed_precision(self):
         """
         Apply fixes to handle mixed precision during inference.

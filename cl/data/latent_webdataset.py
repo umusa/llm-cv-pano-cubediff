@@ -114,7 +114,16 @@ import os, io, torch, webdataset as wds
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
-tokenizer = AutoTokenizer.from_pretrained("openai/clip-vit-base-patch32")
+# tokenizer = AutoTokenizer.from_pretrained("openai/clip-vit-base-patch32")
+CLIP_MODEL = "openai/clip-vit-base-patch32"
+
+try:
+    # first try the “normal” online→cache→download path
+    tokenizer = AutoTokenizer.from_pretrained(CLIP_MODEL)
+except OSError:
+    # usually Errno 101 or timeout → load *only* from ~/.cache/huggingface
+    tokenizer = AutoTokenizer.from_pretrained(CLIP_MODEL, local_files_only=True)
+
 MAX_LEN  = tokenizer.model_max_length
 
 def get_dataloader(wds_path, batch_size, data_size, num_workers=8):

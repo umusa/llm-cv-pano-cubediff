@@ -6,39 +6,34 @@ It simply:
   • instantiates CubeDiffTrainer,
   • calls trainer.train().
 """
+# --- Patch HF bug: rename Replicate() → ReplicateParallel() in tensor_parallel.py ---
+import os, re, transformers
+
+tp_path = os.path.join(
+    os.path.dirname(transformers.__file__),
+    "integrations",
+    "tensor_parallel.py",
+)
+
+# Read the file
+with open(tp_path, "r", encoding="utf-8") as f:
+    src = f.read()
+
+# Replace any occurrence of Replicate(   ) with ReplicateParallel()
+patched = re.sub(r"Replicate\s*\(\s*\)", "ReplicateParallel()", src)
+
+# Write back only if we made a change
+if patched != src:
+    with open(tp_path, "w", encoding="utf-8") as f:
+        f.write(patched)
+# ------------------------------------------------------------------------------
 import torch
 import torch.multiprocessing as _mp
 _mp.set_sharing_strategy("file_system")   # <— avoid /dev/shm exhaustion on many workers
 
-import fix_attention_dtype
-# Import and apply fixes first, before ANY other imports
-# import fix_pytorch_issues 
-
-# import fix_xformers_compat
-# import fix_xformers_arguments
-# import fix_disable_dyanmo_patch_unet
-# # Apply fixes explicitly
-# fix_disable_dyanmo_patch_unet.disable_dynamo_thoroughly()
-# fix_disable_dyanmo_patch_unet.patch_unet_directly()
-
-# # Add this import near the top of your script
-# from fix_unet_xformers_verify import verify_patching
-
-# # Call this function before starting training
-# patch_status = verify_patching()
-
-# # Check the results
-# if all(patch_status.values()):
-#     print("All patches are working correctly!")
-# else:
-#     print("Warning: Some patches are not applied correctly")
-
-# =======================================================================
-
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.allow_tf32 = True
-
 
 import ctypes
 # adjust to your actual path if needed
@@ -50,13 +45,9 @@ os.environ["LD_LIBRARY_PATH"] = "/usr/local/nvidia/lib64:" + os.environ.get("LD_
 # Set torch compile backend
 os.environ["TORCH_COMPILE_BACKEND"] = "inductor"
 
-
 import argparse
 import yaml
 import pathlib
-import inspect  # Added this import to fix the NameError
-import traceback
-import sys
 
 # Add enhanced debugging for PyTorch modules
 import torch
@@ -64,10 +55,7 @@ import torch
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
-import webdataset as wds
-
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
-
 
 import argparse, yaml, pathlib
 from cl.training.trainer import CubeDiffTrainer           # <- the class you already have
@@ -96,6 +84,7 @@ def main():
                 output_dir = cfg.get("output_dir", "outputs/cubediff_run"),
                 mixed_precision = "bf16",
                 gradient_accumulation_steps = cfg.get("gradient_accum_steps", 1))
+    print(f"train_cubediff.py - trainer is {trainer}")
     trainer.train()                       # ← generates samples & checkpoints
 
 if __name__ == "__main__":
